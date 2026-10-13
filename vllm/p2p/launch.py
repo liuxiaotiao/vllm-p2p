@@ -5,6 +5,7 @@
     python3 vllm/p2p/launch.py start  gsm8k-0          # 按 channels.json 在各级节点上后台启动
     python3 vllm/p2p/launch.py status gsm8k-0          # 进程在不在、API 健康检查通没通、KV 容量
     python3 vllm/p2p/launch.py logs   gsm8k-0 [-n 40]  # 各级日志的最后几行
+    python3 vllm/p2p/launch.py errors gsm8k-0          # 各级日志里的错误行（找根因用）
     python3 vllm/p2p/launch.py stop   gsm8k-0          # 停掉
     python3 vllm/p2p/launch.py status all              # 所有通道
 
@@ -63,6 +64,22 @@ def remote_start(cmd: str, channel: str, node: str, env: dict[str, str]) -> str:
 
 def remote_running(channel: str) -> str:
     return f"pgrep -f -- {shlex.quote(match_pattern(channel))} || true"
+
+
+ERROR_RE = (r"(Error|ERROR|Exception|error:|Traceback|Killed|out of memory|OutOfMemory|"
+            r"[Tt]imed? ?out|NCCL WARN|refused|Unable|cannot|Cannot|not found|No such)")
+
+
+def remote_errors(channel: str, node: str, n: int = 40) -> str:
+    """日志里的错误行（去掉调用栈里的 `File "…"` 帧，只留真正说明原因的那些行）。
+
+    vLLM 多进程启动失败时，API 服务器最后打印的永远是同一句
+    `Engine core initialization failed. See root cause above` —— 根因在更前面，
+    而且常常在**别的**级（headless worker）的日志里。所以要每一级都筛一遍。
+    """
+    log = shlex.quote(log_path(channel, node))
+    return (f"[ -f {log} ] || {{ echo '  （没有日志）'; exit 0; }}; "
+            f"grep -n -E {shlex.quote(ERROR_RE)} {log} | grep -v -E 'File \"' | head -n {int(n)}")
 
 
 def remote_stop(channel: str) -> str:
@@ -138,9 +155,10 @@ def cmd_start(c: dict, user: str, env: dict[str, str], wait: float) -> int:
             return 0
         for st in c["commands"]:
             if not _ssh(st["host"], user, remote_running(name)).stdout.strip():
-                print(f"  ✗ {st['node']} 上的进程退出了 —— 看日志：")
-                print(_ssh(st["host"], user,
-                           f"tail -25 {shlex.quote(log_path(name, st['node']))}").stdout)
+                print(f"  ✗ {st['node']} 上的进程退出了。各级日志里的错误行（根因往往在最早的几行、"
+                      f"也可能在别的级）：")
+                cmd_errors(c, user, 25)
+                print(f"  完整日志：python3 {sys.argv[0]} logs {name} -n 300")
                 return 1
         time.sleep(10)
     print(f"  ✗ {wait:.0f}s 内没就绪 —— python3 {sys.argv[0]} logs {name}")
@@ -172,6 +190,14 @@ def cmd_logs(c: dict, user: str, n: int) -> int:
     return 0
 
 
+def cmd_errors(c: dict, user: str, n: int) -> int:
+    for st in c["commands"]:
+        print(f"----- {c['name']} / {st['node']} @ {st['host']}")
+        r = _ssh(st["host"], user, remote_errors(c["name"], st["node"], n))
+        print(r.stdout.rstrip() or "  （没有错误行）")
+    return 0
+
+
 def cmd_stop(c: dict, user: str) -> int:
     for st in c["commands"]:
         _ssh(st["host"], user, remote_stop(c["name"]), timeout=60)
@@ -182,7 +208,7 @@ def cmd_stop(c: dict, user: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("start", "status", "logs", "stop"))
+    ap.add_argument("action", choices=("start", "status", "logs", "errors", "stop"))
     ap.add_argument("channel", help="通道名（如 gsm8k-0），或 all")
     ap.add_argument("--channels", default=DEFAULT_CHANNELS, help="layout.py 生成的 channels.json")
     ap.add_argument("--user", default="ubuntu", help="ssh 用户")
@@ -202,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             rc |= cmd_status(c, a.user)
         elif a.action == "logs":
             rc |= cmd_logs(c, a.user, a.n)
+        elif a.action == "errors":
+            rc |= cmd_errors(c, a.user, a.n)
         else:
             print(f"== 停止 {c['name']}")
             rc |= cmd_stop(c, a.user)
