@@ -698,8 +698,13 @@ def main(argv: list[str] | None = None) -> int:
     # 所有引擎都在这台机器上（每个 world_size=1）：分布式初始化一律走回环。
     # 不设的话 vLLM 自己挑地址（可能是公网 IPv6、可能是 hostname 解析出的 127.0.1.1），
     # 在有防火墙 / 多网卡的节点上会卡在 TCPStore 连接上（10-13 实测）。已设的不覆盖。
+    #
+    # 引擎进程用 spawn 起，不用 vLLM 默认的 fork：本进程先用 torch 在 CPU 上生成了微型
+    # checkpoint，torch 的 OpenMP 线程池已经起来了；fork 出来的子进程里第一次走到并行的
+    # CPU 算子（runner 初始化时 torch.zeros 一个 ~1 MB 的 pinned 缓冲）就永远等不到那些
+    # 线程 —— 10-13 实测卡在 CpuGpuBuffer.__init__（py-spy）。
     for k, v in (("VLLM_HOST_IP", "127.0.0.1"), ("GLOO_SOCKET_IFNAME", "lo"),
-                 ("NCCL_SOCKET_IFNAME", "lo")):
+                 ("NCCL_SOCKET_IFNAME", "lo"), ("VLLM_WORKER_MULTIPROC_METHOD", "spawn")):
         os.environ.setdefault(k, v)
     return asyncio.run(_run(a))
 
