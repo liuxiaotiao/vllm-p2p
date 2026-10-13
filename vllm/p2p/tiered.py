@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import itertools
 import json
+import os
 import random
 import sys
 import tempfile
@@ -694,6 +695,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
+    # 所有引擎都在这台机器上（每个 world_size=1）：分布式初始化一律走回环。
+    # 不设的话 vLLM 自己挑地址（可能是公网 IPv6、可能是 hostname 解析出的 127.0.1.1），
+    # 在有防火墙 / 多网卡的节点上会卡在 TCPStore 连接上（10-13 实测）。已设的不覆盖。
+    for k, v in (("VLLM_HOST_IP", "127.0.0.1"), ("GLOO_SOCKET_IFNAME", "lo"),
+                 ("NCCL_SOCKET_IFNAME", "lo")):
+        os.environ.setdefault(k, v)
     return asyncio.run(_run(a))
 
 
