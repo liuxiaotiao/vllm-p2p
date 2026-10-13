@@ -3,9 +3,13 @@
 #
 #     bash /home/ubuntu/vllm-p2p/p2p_install.sh
 #
-# 做的事：在 p2p-framework 的 moe 环境之上建 venv（复用 moe 里的 CUDA 12 库，moe 本身不改），
-# 装 torch 2.9.1，再以「可编辑」方式安装本目录 —— Python 代码直接用本目录的（含部分专家模型、
-# vllm/p2p/），只从官方 0.14.0 wheel 里取编译好的 CUDA 扩展（.so），不在节点上编译。
+# 做的事：用 moe 环境的 Python 解释器建一个**完全独立**的 venv（不复用 moe 的任何包，moe 本身不改），
+# 装 torch 2.9.1（连同它的 CUDA 12 库），再以「可编辑」方式安装本目录 —— Python 代码直接用本目录的
+# （含部分专家模型、vllm/p2p/），只从官方 0.14.0 wheel 里取编译好的 CUDA 扩展（.so），不在节点上编译。
+#
+# 为什么不复用 moe 里已有的 CUDA 库（--system-site-packages）：torch 找 libcublas / libcusparseLt 等
+# 靠的是写在 .so 里的相对路径 $ORIGIN/../../nvidia/*/lib —— 必须和 torch 装在同一个 site-packages。
+# venv 里的 torch 2.9.1 找不到 moe 目录下的库（ImportError: libcusparseLt.so.0），实测踩过。
 #
 # 可覆盖的变量（一般不用改）：
 #   SRC      本目录（修改后的 vLLM）          默认 /home/ubuntu/vllm-p2p
@@ -37,19 +41,24 @@ awk -v v="$glibc" 'BEGIN{split(v,a,"."); exit !(a[1]>2 || (a[1]==2 && a[2]>=31))
 echo "  glibc $glibc ✓"
 d=$(dirname "$VENV"); while [ ! -d "$d" ]; do d=$(dirname "$d"); done   # 第一次跑时 venvs/ 还不存在
 free_gb=$(df -Pk "$d" | awk 'NR==2{printf "%d", $4/1048576}')
-[ "${free_gb:-0}" -ge 8 ] || die "$d 只剩 ${free_gb}GB，至少要 8GB"
+[ "${free_gb:-0}" -ge 12 ] || die "$d 只剩 ${free_gb}GB，至少要 12GB（装完约 10GB）"
 echo "  磁盘剩 ${free_gb}GB ✓"
 command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/  GPU /'
 
-say "1/6 建 venv（基于 moe，--system-site-packages）"
+say "1/6 建独立 venv（只借 moe 的 Python 解释器，不读 moe 的包）"
 mkdir -p "$(dirname "$VENV")"
-[ -x "$VENV/bin/python" ] || "$MOE_PY" -m venv --system-site-packages "$VENV"
+if [ -f "$VENV/pyvenv.cfg" ] && grep -qiE '^include-system-site-packages *= *true' "$VENV/pyvenv.cfg"; then
+  echo "  $VENV 是旧的 --system-site-packages 版本（会找不到 CUDA 库）—— 删掉重建"
+  rm -rf "$VENV"
+fi
+[ -x "$VENV/bin/python" ] || "$MOE_PY" -m venv "$VENV"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 [ "$(python -c 'import sys; print(sys.prefix)')" = "$VENV" ] || die "venv 没激活成功"
 export PIP_NO_CACHE_DIR=1
+pip install -q --upgrade pip
 
-say "2/6 torch 2.9.1（vLLM 0.14 钉死这个版本；moe 里的 2.9.0 不动）"
+say "2/6 torch 2.9.1 + CUDA 12 库（vLLM 0.14 钉死这个版本；moe 里的 2.9.0 不动）"
 pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1
 
 say "3/6 构建工具（关了构建隔离，所以要自己装）"
@@ -73,14 +82,17 @@ VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
 say "6/6 验证"
 cd /
 python - <<'PY'
+import sys
 import torch, vllm
 from vllm import ModelRegistry
 print(f"  torch {torch.__version__}  ←  {torch.__file__}")
 print(f"  vllm  {vllm.__version__}  ←  {vllm.__file__}")
 assert torch.__version__.startswith("2.9.1"), "用到的不是 venv 里的 torch 2.9.1"
 assert "/site-packages/" not in vllm.__file__, "import 到的不是本目录的 vllm"
+assert torch.__file__.startswith(sys.prefix), "torch 不是 venv 里的那份"
 assert "Qwen3MoePartialForCausalLM" in ModelRegistry.get_supported_archs(), "部分专家模型没注册上"
 import vllm._C  # noqa: F401  —— 编译好的扩展能加载
+import vllm._moe_C  # noqa: F401
 print("  Qwen3MoePartialForCausalLM 已注册，vllm._C 可加载 ✓")
 print(f"  CUDA 可用: {torch.cuda.is_available()}" + (f"，{torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else ""))
 PY

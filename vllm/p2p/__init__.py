@@ -16,9 +16,10 @@
 
     bash /home/ubuntu/vllm-p2p/p2p_install.sh
 
-它在 p2p-framework 的 moe 环境之上建 venv（/home/ubuntu/venvs/vllm-p2p，复用 moe 里的 CUDA 12
-库，约省 4.4 GiB；moe 本身不改），装 torch 2.9.1 与构建工具，再以可编辑方式安装本目录，
-最后验证。核心一步等价于::
+它用 moe 环境的 Python 解释器建一个**独立** venv（/home/ubuntu/venvs/vllm-p2p，不复用 moe 的包，
+moe 本身不改；装完约 10 GiB），装 torch 2.9.1（含 CUDA 12 库）与构建工具，再以可编辑方式安装
+本目录，最后验证。不用 --system-site-packages 复用 moe 的 CUDA 库：torch 按 .so 里的相对路径
+（$ORIGIN/../../nvidia/*/lib）找库，库必须和 torch 在同一个 site-packages。核心一步等价于::
 
     VLLM_VERSION_OVERRIDE=0.14.0 VLLM_USE_PRECOMPILED=1 \
     VLLM_PRECOMPILED_WHEEL_LOCATION=<官方 vllm-0.14.0 wheel> \
@@ -32,9 +33,7 @@
 * `--no-build-isolation` —— 构建依赖里有 `torch==2.9.1`，隔离构建会在临时目录里再下一整套
   torch + CUDA 库（约 4 GiB）。先装好 torch 再关掉隔离就不会。
 
-venv 单向依赖 moe：**不要在 moe 里升级 / 卸载 nvidia-*-cu12**，那是 venv 在用的。
-`pip install` 时看到 “Not uninstalling torch at …/envs/moe/…, outside environment” 是正常的
-（venv 里另装 2.9.1 覆盖，moe 的 2.9.0 不动）。ssh 非交互 shell 不会 activate venv，
+venv 只借用 moe 的 Python 解释器（不读它的包），所以不要删 moe 环境。ssh 非交互 shell 不会 activate venv，
 所以 `vllm/p2p/layout.py` 生成命令时用 `--vllm-bin /home/ubuntu/venvs/vllm-p2p/bin/vllm`。
 
 本包刻意不在 `__init__` 里 import 任何东西 —— `layout.py` 要能在没有 torch 的控制机上跑。
