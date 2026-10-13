@@ -10,11 +10,16 @@
 * `vllm/p2p/layout.py` —— p2p 部署清单 → 每条静态通道的切层、逐层专家（`--hf-overrides`）
   与逐节点 `vllm serve` 命令。纯 Python，控制机上不装 vLLM 也能按文件路径直接跑。
 * `vllm/p2p/parity.py` —— 单卡对拍（vLLM 原生 / 部分专家模型 / p2p-framework 参考实现）。
+* `vllm/p2p/envcheck.py` —— 安装脚本每一步的「就绪了吗」检查。
 * `tests/p2p/` —— `layout.py` 的单测。
 
-在集群上安装：本目录同步到每台节点的 /home/ubuntu/vllm-p2p 后，每台执行一次
+在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）
 
-    bash /home/ubuntu/vllm-p2p/p2p_install.sh
+    bash /home/ubuntu/vllm-p2p/p2p_install.sh       # 逐步检查，缺哪步补哪步；可重复运行
+
+再在这台上把其余节点一起装好（建本地 wheel 仓库 → 推代码 + 仓库 → 各节点离线补装）::
+
+    bash /home/ubuntu/vllm-p2p/p2p_distribute.sh
 
 它用 moe 环境的 Python 解释器建一个**独立** venv（/home/ubuntu/venvs/vllm-p2p，不复用 moe 的包，
 moe 本身不改；装完约 10 GiB），装 torch 2.9.1（含 CUDA 12 库）与构建工具，再以可编辑方式安装

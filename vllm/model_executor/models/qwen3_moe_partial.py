@@ -48,7 +48,6 @@ vLLM 的加载器是严格的（`default_loader.py`：每个参数都要有权�
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -64,7 +63,12 @@ from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import qwen3_moe as _q
 from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index
-from vllm.p2p.layout import LayoutError, localize_expert_name, parse_layer_experts
+from vllm.p2p.layout import (
+    LayoutError,
+    expert_key,
+    localize_expert_name,
+    parse_layer_experts,
+)
 
 logger = init_logger(__name__)
 
@@ -72,9 +76,6 @@ __all__ = ["Qwen3MoePartialForCausalLM", "PartialQwen3MoeSparseMoeBlock",
            "SUPPORTED_MISS_POLICIES"]
 
 SUPPORTED_MISS_POLICIES = ("local_topk",)
-
-# 本级加载到的专家权重名（已换成本地号）→ (层, 本地专家号, gate/up/down)，逐专家核对用
-_EXPERT = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.")
 # TODO(drop / drop_noscale)：全量 softmax 取 top-k、缺失的权重置 0（drop_noscale）或
 # 再重归一（drop）。走 FusedMoE 的 custom_routing_function，把全局专家号映射成本地号、
 # 缺失的映到任一本地专家且权重为 0。实验没用到，先不做。
@@ -245,9 +246,9 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
                 new = localize_expert_name(name, le)
                 if new is None:
                     continue              # 不驻留的专家：不读进显存
-                m = _EXPERT.match(new)
-                if m is not None and lo <= int(m.group(1)) < hi:
-                    seen[int(m.group(1))].add((int(m.group(2)), m.group(3)))
+                k = expert_key(new)        # 已换成本地号：(层, 本地专家号, 投影)
+                if k is not None and lo <= k[0] < hi:
+                    seen[k[0]].add((k[1], k[2]))
                 yield new, w
 
         loaded = super().load_weights(localized())

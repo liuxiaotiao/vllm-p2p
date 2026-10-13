@@ -39,14 +39,14 @@ import json
 import re
 import shlex
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
 __all__ = [
     "ARCH", "Stage", "Channel", "HostInfo", "LayoutError",
     "load_plan", "pair_static", "channels_from_plan", "parse_hosts",
-    "parse_layer_experts", "localize_expert_name", "channel_dtype",
+    "parse_layer_experts", "localize_expert_name", "expert_key", "channel_dtype",
 ]
 
 ARCH = "Qwen3MoePartialForCausalLM"
@@ -342,6 +342,21 @@ def parse_layer_experts(raw: Mapping | None, n_layers: int,
 
 # 前缀可有可无：checkpoint 里是 model.layers.…，vLLM 的 AutoWeightsLoader 往下传时会剥成 layers.…
 _EXPERT_KEY = re.compile(r"^((?:.*\.)?layers\.(\d+)\.mlp\.experts\.)(\d+)(\..*)$")
+
+
+_EXPERT_PROJ = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.")
+
+
+def expert_key(name: str) -> tuple[int, int, str] | None:
+    """专家权重名 → (层, 专家号, gate_proj/up_proj/down_proj)；不是专家权重返回 None。
+
+    用 `search` 而不是 `match`：checkpoint 里的名字带 `model.` 前缀，vLLM 往下传时又可能
+    剥掉 —— 两种都要认。（插件第一版用了 `match`，带前缀的名字一个都没认出来，
+    逐专家核对因此把所有专家都报成了缺失。）
+    """
+    m = _EXPERT_PROJ.search(name)
+    return None if m is None else (int(m.group(1)), int(m.group(2)), m.group(3))
 
 
 def localize_expert_name(name: str,

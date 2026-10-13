@@ -20,6 +20,7 @@ from vllm.p2p.layout import (
     LayoutError,
     channel_dtype,
     channels_from_plan,
+    expert_key,
     load_plan,
     localize_expert_name,
     main as layout_main,
@@ -279,3 +280,31 @@ def test_restricted_softmax_topk_equals_local_topk(n_res, k) -> None:
 
     assert np.array_equal(res[loc_i], ref_i)          # 选的是同一批全局专家
     assert np.allclose(loc_w, ref_w, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("name,want", [
+    ("model.layers.0.mlp.experts.0.gate_proj.weight", (0, 0, "gate_proj")),    # 带 model. 前缀
+    ("layers.8.mlp.experts.37.up_proj.weight", (8, 37, "up_proj")),            # 剥了前缀
+    ("model.layers.47.mlp.experts.127.down_proj.weight", (47, 127, "down_proj")),
+    ("model.layers.8.mlp.gate.weight", None),                                  # 路由器
+    ("model.layers.8.self_attn.q_proj.weight", None),
+    ("model.embed_tokens.weight", None),
+])
+def test_expert_key(name, want) -> None:
+    assert expert_key(name) == want
+
+
+def test_expert_key_sees_every_localized_expert() -> None:
+    """模型的逐专家核对就是「本地化后的名字 → expert_key」。全集走一遍，一个都不能漏 ——
+    第一版用 re.match，带 model. 前缀的名字全漏了，核对把所有专家报成缺失。"""
+    le = {2: (1, 4, 6), 3: (0, 7)}
+    seen = set()
+    for l in range(4):
+        for e in range(8):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                new = localize_expert_name(f"model.layers.{l}.mlp.experts.{e}.{proj}.weight", le)
+                if new is not None:
+                    seen.add(expert_key(new))
+    want = {(l, i, p) for l in range(4) for i in range(len(le.get(l, range(8))))
+            for p in ("gate_proj", "up_proj", "down_proj")}
+    assert seen == want
