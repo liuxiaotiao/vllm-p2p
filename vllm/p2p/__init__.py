@@ -20,6 +20,15 @@
   逐请求切分在 `vllm/v1/worker/gpu_model_runner.py` 的两处钩子（`p2p_stats`）。
 * `vllm/entrypoints/openai/serving_completion.py` —— 网关发来的请求在最后的 usage 块里附
   引擎侧的逐请求时间（`p2p_metrics`：排队 / prefill / decode）。
+* `vllm/p2p/stage.py` —— B-1 分段引擎（前段 = 前 L₀ 层、后段 = 其余层，各是一个独立的 vLLM
+  引擎）的协议与公共件；`hf_overrides` 里有 `p2p_stage` 才生效。引擎内的改动：
+  模型（`qwen3_moe_partial.py`：只建本段的层、前段交出残差流、后段零 embed）、调度器
+  （`v1/core/sched/scheduler.py`：后段按「已收到 hidden 的位置」设门、前段随调度结果送输入
+  token、`p2p_append` / `p2p_feed`）、EngineCore（`v1/engine/core.py`：两个 utility、
+  等输入时不空转）、runner（`v1/worker/gpu_model_runner.py`：前段不采样、后段按位置喂 hidden），
+  以及 `EngineCoreOutput` / `ModelRunnerOutput` / `SchedulerOutput` / `Request` 上各一个字段。
+* `vllm/p2p/tiered.py` —— B-1 的协调器（按请求绑定后段、两个方向搬 token / hidden）与 B0
+  原型（1 前段 + 2 同 task 后段，单卡微型 checkpoint，对拍整模型 + 开销）。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）

@@ -321,6 +321,14 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    # P2P B-1 分段引擎的两个 utility（协调器经 call_utility 发来，见 vllm/p2p/stage.py）。
+    # 成批发：一次调用带一个引擎这一轮要收的全部请求。
+    def p2p_append(self, items: list) -> int:
+        return self.scheduler.p2p_append(items)
+
+    def p2p_feed(self, items: list) -> int:
+        return self.scheduler.p2p_feed(items)
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -998,7 +1006,16 @@ class EngineCoreProc(EngineCore):
         # background threads (like NIXL handshake) to make progress.
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
-            time.sleep(0.001)
+            if getattr(self.scheduler, "p2p_role", None):
+                # P2P 分段引擎「有请求但没东西可算」= 在等另一段送 token / hidden 来：
+                # 阻塞等输入（来了马上处理、马上下一步），不按 1ms 空转。
+                try:
+                    req = self.input_queue.get(timeout=0.05)
+                except queue.Empty:
+                    return model_executed
+                self._handle_client_request(*req)
+            else:
+                time.sleep(0.001)
 
         return model_executed
 

@@ -58,6 +58,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.p2p import stage as p2p_stage
 
 logger = init_logger(__name__)
 
@@ -224,6 +225,8 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        # P2P B-1 分段引擎（vllm/p2p/stage.py）：None / "front" / "back"
+        self._init_p2p_stage(vllm_config)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -307,6 +310,11 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            if request.p2p_ready is not None:
+                # P2P B-1 后段：只排已经收到前段 hidden 的位置（没收到 → 0，下面跳过）
+                num_new_tokens = max(
+                    0, min(num_new_tokens, request.p2p_ready - request.num_computed_tokens)
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -580,6 +588,12 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if request.p2p_ready is not None:
+                        # P2P B-1 后段：抢占后重算也只算到已收到 hidden 的位置。
+                        # 等待队列里的请求至少还有 prompt 可算，上限必为正。
+                        cap = request.p2p_ready - num_computed_tokens
+                        if cap > 0:
+                            num_new_tokens = min(num_new_tokens, cap)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -775,6 +789,9 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
+        if self._p2p_pending:
+            scheduler_output.p2p_feed = self._p2p_pending
+            self._p2p_pending = {}
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -866,7 +883,9 @@ class Scheduler(SchedulerInterface):
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
-            if self.use_pp:
+            # P2P B-1 前段不采样：输入 token 是协调器 p2p_append 进来的，runner 不知道，
+            # 和 PP 一样随调度结果送过去
+            if self.use_pp or self.p2p_role == "front":
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
@@ -1098,6 +1117,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        p2p_hidden = model_runner_output.p2p_hidden
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1242,7 +1262,13 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            p2p_item = p2p_hidden.get(req_id) if p2p_hidden else None
+            if (
+                new_token_ids
+                or pooler_output is not None
+                or kv_transfer_params
+                or p2p_item is not None
+            ):
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1259,6 +1285,8 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        p2p_pos=-1 if p2p_item is None else p2p_item[0],
+                        p2p_hidden=None if p2p_item is None else p2p_item[1],
                     )
                 )
             else:
@@ -1443,7 +1471,63 @@ class Scheduler(SchedulerInterface):
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
 
+    # ------------------------------------------------------------------ #
+    # P2P B-1 分段引擎（vllm/p2p/stage.py）。经 EngineCore 的 utility 调用进来，
+    # 在两步之间执行（与 add_request / abort 同一个线程），不会与 schedule() 并发。
+    # ------------------------------------------------------------------ #
+    def _init_p2p_stage(self, vllm_config: VllmConfig) -> None:
+        mc = vllm_config.model_config
+        self.p2p_role: str | None = (
+            p2p_stage.role_of(mc.hf_config) if mc is not None else None
+        )
+        self._p2p_pending: dict[str, list] = {}
+        self._p2p_width = mc.get_hidden_size() if self.p2p_role else 0
+        if self.p2p_role and self.scheduler_config.async_scheduling:
+            raise ValueError(
+                "P2P 分段引擎不支持 async scheduling（要按「上一步的输出」决定下一步）："
+                "加 --no-async-scheduling"
+            )
+        if self.p2p_role and self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "P2P 分段引擎不支持 prefix caching（后段的 prompt 是 embedding，"
+                "前段的 KV 也不该跨请求复用）：加 --no-enable-prefix-caching"
+            )
+        if self.p2p_role and self.vllm_config.speculative_config is not None:
+            raise ValueError("P2P 分段引擎不支持投机解码")
+
+    def p2p_append(self, items: list) -> int:
+        """前段：[[req_id, [token, …]], …] —— 后段采样出的 token，作为前段的下一个输入。"""
+        if self.p2p_role != "front":
+            raise RuntimeError("p2p_append 只能发给前段引擎")
+        n = 0
+        for req_id, token_ids in items:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue  # 已经 abort（后段先结束、客户端断开）
+            request.append_output_token_ids(list(token_ids))
+            n += 1
+        return n
+
+    def p2p_feed(self, items: list) -> int:
+        """后段：[[req_id, pos, n, dtype, bytes], …] —— 前段算出的 [pos, pos+n) 的 hidden。"""
+        if self.p2p_role != "back":
+            raise RuntimeError("p2p_feed 只能发给后段引擎")
+        n = 0
+        for item in items:
+            req_id, pos, rows = p2p_stage.unpack_rows(item, self._p2p_width)
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            assert request.p2p_ready is not None
+            request.p2p_ready = max(request.p2p_ready, pos + rows.shape[0])
+            self._p2p_pending.setdefault(req_id, []).append((pos, rows))
+            n += 1
+        return n
+
     def add_request(self, request: Request) -> None:
+        if self.p2p_role == "back":
+            # 后段：prompt 的 hidden 随请求一起来（prompt_embeds），之后的位置要等 p2p_feed
+            request.p2p_ready = request.num_prompt_tokens
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:

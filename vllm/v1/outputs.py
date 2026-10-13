@@ -187,6 +187,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # P2P B-1 前段引擎：req_id -> (起始位置, [n, hidden_size] CPU 张量)。前段不采样，
+    # 交出的是每个被调度位置的残差流 hidden（见 vllm/p2p/stage.py）。
+    p2p_hidden: dict[str, tuple[int, torch.Tensor]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

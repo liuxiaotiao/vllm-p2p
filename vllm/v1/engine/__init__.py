@@ -144,6 +144,9 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # P2P B-1 前段引擎：本步各位置的残差流 hidden（[n, hidden_size]），从位置 p2p_pos 起。
+    p2p_pos: int = -1
+    p2p_hidden: torch.Tensor | None = None
 
     @property
     def finished(self) -> bool:

@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm._bc_linter import bc_linter_include
 
@@ -237,6 +237,10 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # P2P B-1 后段引擎：上一步以来协调器送进来的前段 hidden，
+    # req_id -> [(起始位置, [n, hidden_size] CPU 张量), …]。runner 存起来，按位置喂给模型。
+    p2p_feed: dict[str, list[tuple[int, Any]]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

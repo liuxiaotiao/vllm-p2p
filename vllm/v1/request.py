@@ -96,6 +96,9 @@ class Request:
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
+        # P2P B-1 后段引擎：已经收到前段 hidden 的位置数（调度时 num_new_tokens 以它为上限）。
+        # None = 不设门（普通请求、前段引擎）。见 vllm/p2p/stage.py。
+        self.p2p_ready: int | None = None
         # Used in forced preemption (reset_prefix_cache) with async scheduling.
         self.discard_latest_async_tokens = False
 

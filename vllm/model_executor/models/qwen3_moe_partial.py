@@ -46,6 +46,13 @@ A5 统计钩子（hf_overrides 里有 `p2p_stats` 才开）
 是黑盒、在 CUDA Graph 里随图重放，所以开着钩子也能用 CUDA Graph。逐请求的切分与落盘在
 model runner 里做（见 `stats.py`）。
 
+B-1 分段引擎（hf_overrides 里有 `p2p_stage` 才开）
+----------------------------------------------
+`{"role": "front"|"back", "layers": [lo, hi]}`：本引擎只建 [lo, hi) 这些层（再按 PP 切给各级，
+层号仍是全局的，权重按原名加载）。前段：final norm 换成 `AddResidual`（交出残差流）、没有
+lm_head；后段：embed_tokens 换成 `ZeroEmbed`（每个位置都由前段的 hidden 喂入）。
+协议与调度见 `vllm/p2p/stage.py`。
+
 逐专家核对
 ----------
 严格检查是**按参数**的：`experts.w13_weight` 是 n 个专家堆在一起的一个参数，只要其中
@@ -70,7 +77,12 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import qwen3_moe as _q
-from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    extract_layer_index,
+    maybe_offload_to_cpu,
+)
+from vllm.p2p import stage as _p2p_stage
 from vllm.p2p import stats as _p2p_stats
 from vllm.p2p.layout import (
     LayoutError,
@@ -246,6 +258,34 @@ def _partial_blocks():
         _q.Qwen3MoeSparseMoeBlock = orig
 
 
+@contextmanager
+def _stage_layers(stage: "_p2p_stage.StageSpec | None"):
+    """B-1：构造期间让 `Qwen3MoeModel` 只建本段（再按 PP 切）的层。
+
+    同 `_partial_blocks` 的手法：`Qwen3MoeModel.__init__` 按模块全局名调 `make_layers`。
+    段外的层是 `PPMissingLayer` —— vLLM 的 forward（islice start..end）、权重加载
+    （is_pp_missing_parameter）、KV 缓存分配（只给建出来的 Attention）都已经认它。"""
+    if stage is None:
+        yield
+        return
+    orig = _q.make_layers
+
+    def make_layers(num_hidden_layers, layer_fn, prefix):
+        pp = get_pp_group()
+        s, e = _p2p_stage.stage_layer_range(stage, pp.rank_in_group, pp.world_size)
+        modules = nn.ModuleList(
+            [PPMissingLayer() for _ in range(s)]
+            + [maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{i}")) for i in range(s, e)]
+            + [PPMissingLayer() for _ in range(e, num_hidden_layers)])
+        return s, e, modules
+
+    _q.make_layers = make_layers
+    try:
+        yield
+    finally:
+        _q.make_layers = orig
+
+
 # --------------------------------------------------------------------------- #
 class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
 
@@ -258,12 +298,17 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
             self_le = _layer_experts_of(config)
         except LayoutError as e:
             raise ValueError(f"hf_overrides 的 p2p_layer_experts 有误：{e}") from e
+        try:
+            stage = _p2p_stage.stage_of(config)
+        except ValueError as e:
+            raise ValueError(f"hf_overrides 的 p2p_stage 有误：{e}") from e
         st = self._make_stats(vllm_config, config)
         _p2p_stats.set_collector(st)
-        with _partial_blocks():
+        with _partial_blocks(), _stage_layers(stage):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.p2p_layer_experts = self_le
         self.p2p_miss_policy = policy
+        self.p2p_stage = stage
         if st is not None:
             sc = vllm_config.scheduler_config
             cc = vllm_config.compilation_config
@@ -286,6 +331,20 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
                 self.lm_head = PPMissingLayer()
         if not pp.is_last_rank:
             self.model.norm = PPMissingLayer()
+        if stage is not None and stage.role == "front":
+            # 前段不出 logits：交出残差流（h + r），lm_head 不建
+            if pp.is_last_rank:
+                self.model.norm = _p2p_stage.AddResidual()
+            self.lm_head = PPMissingLayer()
+        if stage is not None and stage.role == "back" and pp.is_first_rank:
+            if tied:
+                raise ValueError("后段不能用 tie_word_embeddings 的模型（lm_head 借的是 embed 权重）")
+            self.model.embed_tokens = _p2p_stage.ZeroEmbed(
+                config.hidden_size, vllm_config.model_config.dtype)
+        if stage is not None:
+            logger.info("p2p 分段引擎：%s，本段全局层 [%d, %d)，本 PP 级 [%d, %d)",
+                        stage.role, stage.lo, stage.hi,
+                        self.model.start_layer, self.model.end_layer)
 
         here = range(self.model.start_layer, self.model.end_layer)
         part = [l for l in here if l in self_le]
@@ -318,8 +377,15 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
         lo, hi = self.model.start_layer, self.model.end_layer
         seen: dict[int, set[tuple[int, str]]] = defaultdict(set)
 
+        stage = self.p2p_stage
+        # 分段引擎换掉了的模块：checkpoint 里有，但本段不收（norm/lm_head 在后段，embed 在前段）
+        skip = (() if stage is None else
+                ("model.norm.", "lm_head.") if stage.role == "front" else ("model.embed_tokens.",))
+
         def localized():
             for name, w in weights:
+                if skip and name.startswith(skip):
+                    continue
                 new = localize_expert_name(name, le)
                 if new is None:
                     continue              # 不驻留的专家：不读进显存

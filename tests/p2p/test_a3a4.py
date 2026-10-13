@@ -319,3 +319,25 @@ def test_small_helpers() -> None:
     assert rows[0]["stats"]["miss_rate"] == round(3 / 63, 4)
     assert [s["pp_rank"] for s in rows[0]["stats"]["stages"]] == [0, 1]
     assert "_front_layers" in rows[0] and "stats" not in rows[1]
+
+
+def test_compare_two_runs(world, tmp_path) -> None:
+    """A2 验收脚本：两份结果按 case_id 配对、按 token 比前缀；改掉一条的输出要被抓到。"""
+    import compare as C
+
+    gw = gateway(world, "oracle")
+    a = run_bench(world, gw, tmp_path / "a.json")
+    b = json.loads(json.dumps(a))
+    b["requests"] = list(reversed(b["requests"]))              # 顺序不同也要配得上
+    b["requests"][0]["text"] = "完全不同的输出 " + b["requests"][0]["text"]
+    (tmp_path / "b.json").write_text(json.dumps(b), encoding="utf-8")
+    rc = C.main(["--a", str(tmp_path / "a.json"), "--b", str(tmp_path / "b.json"),
+                 "--model-dir", str(world["ckpt"]), "--p2p-framework", str(FW),
+                 "--out", str(tmp_path / "cmp.json")])
+    res = json.loads((tmp_path / "cmp.json").read_text(encoding="utf-8"))
+    assert res["all"]["n"] == 9
+    assert res["all"]["prefix64_agree"] == round(8 / 9, 4) and rc == 1      # 8/9 < 95%
+    assert len(res["diverged"]) == 1 and res["diverged"][0]["cp"] == 0
+    pairs, ma, mb = C.pair_rows(a["requests"], a["requests"][:5])
+    assert len(pairs) == 5 and ma == 4 and mb == 0
+    assert C.common_prefix([1, 2, 3], [1, 2, 4]) == 2

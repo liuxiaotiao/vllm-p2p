@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.attention.layer import Attention, MLAAttention
+from vllm.p2p import stage as p2p_stage  # P2P B-1：分段引擎（默认关）
 from vllm.p2p import stats as p2p_stats  # P2P 移植 A5：逐请求路由统计（默认关）
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -686,6 +687,15 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
+        # P2P B-1 分段引擎（vllm/p2p/stage.py）：前段不采样、交出残差流；
+        # 后段 prompt 之后的每个位置用协调器送来的前段 hidden 作输入
+        self._p2p_role = p2p_stage.role_of(self.model_config.hf_config)
+        self._p2p_ext: dict[str, p2p_stage.RowBuffer] = {}
+        if self._p2p_role == "back" and not self.enable_prompt_embeds:
+            raise ValueError("P2P 后段引擎要 --enable-prompt-embeds（prompt 以 hidden 送入）")
+        if self._p2p_role and self.use_async_scheduling:
+            raise ValueError("P2P 分段引擎不支持 async scheduling：加 --no-async-scheduling")
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:
@@ -853,6 +863,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._p2p_ext.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -946,7 +957,8 @@ class GPUModelRunner(
             reqs_to_add.append(req_state)
 
         # Update the states of the running/resumed requests.
-        is_last_rank = get_pp_group().is_last_rank
+        # P2P 前段不采样，输入 token 由调度器随 new_token_ids 送来 —— 按非末级 PP 的路子收
+        is_last_rank = get_pp_group().is_last_rank and self._p2p_role != "front"
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
@@ -1066,6 +1078,9 @@ class GPUModelRunner(
         for request in reqs_to_add:
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
+
+        if scheduler_output.p2p_feed:
+            self._p2p_store_feed(scheduler_output.p2p_feed)
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
@@ -1461,6 +1476,9 @@ class GPUModelRunner(
                     ].copy_(req_embeds[start_pos:actual_end])
 
                 output_idx += num_sched
+
+        if self._p2p_ext:
+            self._p2p_fill_inputs(num_reqs, num_scheduled_tokens)
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
@@ -3111,6 +3129,63 @@ class GPUModelRunner(
                 self.layerwise_nvtx_hooks_registered = True
 
     @torch.inference_mode()
+    # ------------------------------------------------------------------ #
+    # P2P B-1 分段引擎（vllm/p2p/stage.py）
+    # ------------------------------------------------------------------ #
+    def _p2p_store_feed(self, feed: dict[str, list]) -> None:
+        """后段：把协调器送来的前段 hidden 存进逐请求缓冲（下标 = 位置 − prompt 长度）。"""
+        for req_id, items in feed.items():
+            st = self.requests.get(req_id)
+            if st is None:
+                continue  # 已经结束
+            n_prompt = st.num_prompt_tokens
+            for pos, rows in items:
+                if pos < n_prompt:
+                    raise ValueError(f"p2p_feed：{req_id} 的位置 {pos} 落在 prompt 里"
+                                     f"（prompt {n_prompt}）—— prompt 的 hidden 应随请求一起来")
+                buf = self._p2p_ext.get(req_id)
+                if buf is None:
+                    buf = self._p2p_ext[req_id] = p2p_stage.RowBuffer(
+                        rows.shape[1], self.inputs_embeds.cpu.dtype)
+                buf.put(pos - n_prompt, rows)
+
+    def _p2p_fill_inputs(self, num_reqs: int, num_scheduled_tokens: np.ndarray) -> None:
+        """后段：prompt 之后的位置，输入 embedding 换成前段 hidden，并标成「不是 token id」
+        （`_preprocess` 只对 is_token_ids 的位置查 embed_tokens）。调度器保证排到的位置都已送到。"""
+        out = 0
+        for i in range(num_reqs):
+            n = int(num_scheduled_tokens[i])
+            buf = self._p2p_ext.get(self.input_batch.req_ids[i])
+            if buf is not None and n > 0:
+                base = int(self.input_batch.num_prompt_tokens[i])
+                s0 = int(self.input_batch.num_computed_tokens_cpu[i])
+                lo, hi = max(s0, base), s0 + n
+                if hi > lo:
+                    self.inputs_embeds.cpu[out + lo - s0: out + hi - s0].copy_(
+                        buf.get(lo - base, hi - base))
+                    self.is_token_ids.cpu[out + lo - s0: out + hi - s0] = False
+            out += n
+
+    def _p2p_front_output(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens_np: np.ndarray,
+        num_tokens: int,
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> ModelRunnerOutput:
+        """前段：本步每条请求的 [起点, 起点+n) 位置的残差流，一次拷回 CPU 再按请求切。"""
+        num_reqs = self.input_batch.num_reqs
+        req_ids = list(self.input_batch.req_ids[:num_reqs])
+        starts = self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
+        rows = hidden_states[:num_tokens].to("cpu")
+        parts = torch.split(rows, num_scheduled_tokens_np[:num_reqs].tolist())
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            kv_connector_output=kv_connector_output,
+            p2p_hidden={r: (int(s0), h) for r, s0, h in zip(req_ids, starts, parts)},
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3306,6 +3381,12 @@ class GPUModelRunner(
             _p2p.on_step(
                 req_ids[:num_reqs], num_scheduled_tokens_np,
                 self.positions.np[:num_tokens_unpadded].copy(), self.requests)
+
+        if self._p2p_role == "front" and get_pp_group().is_last_rank:
+            # P2P 前段：不出 logits、不采样，交出每个被调度位置的残差流
+            return self._p2p_front_output(
+                model_output, num_scheduled_tokens_np, num_tokens_unpadded,
+                kv_connector_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4549,6 +4630,9 @@ class GPUModelRunner(
 
         if supports_mm_encoder_only(self.model):
             # MM Encoder only model no need to run sampler.
+            return torch.tensor([])
+        if self._p2p_role == "front":
+            # P2P 前段没有 lm_head、从不采样
             return torch.tensor([])
 
         hidden_states = torch.rand_like(hidden_states)
