@@ -344,3 +344,16 @@ def test_gpu_mem_node_stats_and_prefix_caching(tmp_path) -> None:
     cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
     assert not any("--no-enable-prefix-caching" in x["cmd"]
                    for c in cj["channels"] for x in c["commands"])
+
+
+def test_max_num_seqs_is_passed_to_every_rank(tmp_path) -> None:
+    if not (PLAN.exists() and HOSTS.exists()):
+        pytest.skip("清单或 hosts 不在")
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--max-num-seqs", "128"]) == 0
+    cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
+    assert all("--max-num-seqs 128 " in x["cmd"] for c in cj["channels"] for x in c["commands"])
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out)]) == 0
+    cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
+    assert not any("--max-num-seqs" in x["cmd"] for c in cj["channels"] for x in c["commands"])

@@ -121,3 +121,40 @@ def test_ident_command_uses_the_channel_venv(tmp_path) -> None:
     assert "--tasks gsm8k=1,mbpp=1" in c and "--l0 8" in c and "--model-dir /w/q3" in c
     assert L.venv_of(c) == "/home/ubuntu/venvs/vllm-p2p"
     assert "[-]-p2p-identifier" in L.ident_running()
+
+
+def test_stop_kills_the_whole_process_group(tmp_path) -> None:
+    """vllm 起的子进程（EngineCore / worker）命令行里没有 --served-model-name，只按命令行
+    pkill 会漏掉它们 —— 它们占着显存，下一次启动在预热时 OOM。stop 要按进程组杀。"""
+    marker = f"p2p-orphan-{os.getpid()}"
+    child = f"import time; time.sleep(120)  # {marker}"
+    pat = "[" + marker[0] + "]" + marker[1:]           # 不让 pgrep 匹配到查询它的那个 shell
+    fake = (f"VLLM_PP_LAYER_PARTITION=8 {sys.executable} -c "
+            f"'import subprocess,sys,time; subprocess.Popen([sys.executable, \"-c\", \"{child}\"]); "
+            f"time.sleep(120)' {FLAG} {NAME}")
+    try:
+        _sh(L.remote_start(fake, NAME, "N01", {}))
+        for _ in range(50):
+            if _sh(f"pgrep -f -- '{pat}' || true").stdout.strip():
+                break
+            time.sleep(0.1)
+        assert _sh(f"pgrep -f -- '{pat}' || true").stdout.strip(), "子进程没起来"
+        _sh(L.remote_stop(NAME))
+        time.sleep(0.5)
+        assert _sh(f"pgrep -f -- '{pat}' || true").stdout.strip() == "", "子进程成了孤儿"
+        assert _sh(L.remote_running(NAME)).stdout.split() == []
+    finally:
+        _sh(f"pkill -f -- '{pat}' || true")
+        _sh(L.remote_stop(NAME))
+        if os.path.exists(L.log_path(NAME, "N01")):
+            os.remove(L.log_path(NAME, "N01"))
+
+
+def test_parse_gpu() -> None:
+    out = ("23500, 24576\n---\n1234, 20000, /home/ubuntu/venvs/vllm-p2p/bin/python3\n---\n"
+           " 1234    01:02:03 python3 -c from multiprocessing.spawn import spawn_main\n")
+    g = L.parse_gpu(out)
+    assert g["used_mb"] == 23500 and g["total_mb"] == 24576
+    assert g["apps"] == [(1234, 20000, "/home/ubuntu/venvs/vllm-p2p/bin/python3")]
+    assert "spawn_main" in g["ps"][0]
+    assert L.parse_gpu("")["used_mb"] is None

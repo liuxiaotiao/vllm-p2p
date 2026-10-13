@@ -407,6 +407,7 @@ def serve_commands(
     gpu_mem_node: Mapping[str, float] | None = None,
     attention_backend: str | None = "TRITON_ATTN",
     prefix_caching: bool = False,
+    max_num_seqs: int | None = None,
     extra: Sequence[str] = (),
 ) -> list[tuple[str, str]]:
     """逐节点的启动命令 → [(节点, 命令)]，按 node_rank 排。
@@ -437,6 +438,7 @@ def serve_commands(
             "--max-model-len", str(max_model_len),
             "--gpu-memory-utilization", f"{(gpu_mem_node or {}).get(v, gpu_mem):g}",
             *([] if prefix_caching else ["--no-enable-prefix-caching"]),
+            *(["--max-num-seqs", str(max_num_seqs)] if max_num_seqs else []),
             *extra,
         ]
         if attention_backend:
@@ -514,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
                          "（A4 的识别服务与 N01 的前段同卡时给它让显存）")
     ap.add_argument("--prefix-caching", action="store_true",
                     help="开 vLLM 的前缀缓存（默认关：本框架没有前缀缓存，开了 TTFT 不可比）")
+    ap.add_argument("--max-num-seqs", type=int, default=None,
+                    help="每条通道同时调度的请求数上限（vLLM 默认 256）。显存压得很紧的末级"
+                         "（N05/N07/N08/N13）在采样器预热（按这个数造假请求）时可能 OOM，降到 128 能省出几百 MB")
     ap.add_argument("--stats", action="store_true",
                     help="开 A5 统计钩子：逐请求的全量路由 top-k、后段 miss、前 L₀ 层 LR 特征，"
                          "落到各节点的 $VLLM_P2P_STATS_DIR（默认 /tmp/p2p_stats）")
@@ -586,7 +591,8 @@ def main(argv: list[str] | None = None) -> int:
                                   max_model_len=args.max_model_len, gpu_mem=args.gpu_mem,
                                   gpu_mem_node=gmn,
                                   attention_backend=args.attention_backend or None,
-                                  prefix_caching=args.prefix_caching)
+                                  prefix_caching=args.prefix_caching,
+                                  max_num_seqs=args.max_num_seqs)
             entry["api"] = f"http://{hosts[ch.nodes[0]].host}:{args.port}/v1"
             entry["commands"] = [{"node": v, "host": hosts[v].host, "cmd": c} for v, c in cmds]
             sh = args.out / f"{ch.name}.sh"

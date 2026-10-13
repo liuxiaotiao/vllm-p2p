@@ -6,7 +6,8 @@
     python3 vllm/p2p/launch.py status gsm8k-0          # 进程在不在、API 健康检查通没通、KV 容量
     python3 vllm/p2p/launch.py logs   gsm8k-0 [-n 40]  # 各级日志的最后几行
     python3 vllm/p2p/launch.py errors gsm8k-0          # 各级日志里的错误行（找根因用）
-    python3 vllm/p2p/launch.py stop   gsm8k-0          # 停掉
+    python3 vllm/p2p/launch.py stop   gsm8k-0          # 停掉（按进程组，连子进程一起）
+    python3 vllm/p2p/launch.py gpu    gsm8k-0          # 各级卡上的显存与占用进程
     python3 vllm/p2p/launch.py status all              # 所有通道
 
     # A4 的识别服务（前 L₀ 层 + LR）：起在一台前段节点上（它本地有层 1..L₀ 的全专家权重）
@@ -102,8 +103,11 @@ def remote_start(cmd: str, channel: str, node: str, env: dict[str, str],
     inner = f"{exports}exec env {cmd}"
     # 注意是 `cd /tmp;` 不是 `cd /tmp &&`：`A && B &` 会把整个 `A && B` 放进一个后台子 shell，
     # 它一直占着 ssh 的输出管道，ssh 就要等到 vllm 退出才返回（实测卡死过）。
-    return (f"cd /tmp || exit 1; {net}nohup bash -c {shlex.quote(inner)} > {shlex.quote(log)} 2>&1 "
-            f"< /dev/null & echo $!")
+    # setsid：vllm 自成一个进程组（pgid = 它的 pid）。它起的 EngineCore / worker 子进程都在这个组里，
+    # stop 时按组杀 —— 只按命令行 pkill 的话，子进程（命令行里没有 --served-model-name）可能
+    # 变成孤儿、继续占着显存，下一次启动就在预热时 OOM（10-13 实测踩到）。
+    return (f"cd /tmp || exit 1; {net}setsid nohup bash -c {shlex.quote(inner)} > {shlex.quote(log)} "
+            f"2>&1 < /dev/null & echo $!")
 
 
 def remote_running(channel: str) -> str:
@@ -127,9 +131,47 @@ def remote_errors(channel: str, node: str, n: int = 40) -> str:
 
 
 def remote_stop(channel: str) -> str:
+    """按**进程组**停：vllm 主进程连同它的子进程（EngineCore、worker）一起。"""
     pat = shlex.quote(match_pattern(channel))
-    return (f"pkill -TERM -f -- {pat}; for i in $(seq 20); do pgrep -f -- {pat} >/dev/null || exit 0; "
-            f"sleep 1; done; pkill -KILL -f -- {pat}; true")
+    return (f"pids=$(pgrep -f -- {pat}); [ -n \"$pids\" ] || exit 0; "
+            f"pg=$(ps -o pgid= -p $(echo $pids | tr ' ' ,) | tr -d ' ' | sort -u); "
+            f"for g in $pg; do kill -TERM -- -$g 2>/dev/null; done; pkill -TERM -f -- {pat}; "
+            f"for i in $(seq 25); do a=0; for g in $pg; do pgrep -g $g >/dev/null && a=1; done; "
+            f"pgrep -f -- {pat} >/dev/null && a=1; [ $a = 0 ] && exit 0; sleep 1; done; "
+            f"for g in $pg; do kill -KILL -- -$g 2>/dev/null; done; pkill -KILL -f -- {pat}; true")
+
+
+GPU_Q = ("nvidia-smi -i 0 --query-gpu=memory.used,memory.total --format=csv,noheader,nounits; "
+         "echo ---; nvidia-smi -i 0 --query-compute-apps=pid,used_memory,process_name "
+         "--format=csv,noheader,nounits; echo ---; "
+         "for p in $(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader); do "
+         "ps -o pid=,etime=,args= -p $p 2>/dev/null | cut -c1-160; done")
+
+
+def parse_gpu(out: str) -> dict:
+    """GPU_Q 的输出 → {used_mb, total_mb, apps: [(pid, mb, name)], ps: [行]}。"""
+    parts = (out + "\n---\n---").split("---")
+    used = total = None
+    for ln in parts[0].splitlines():
+        xs = [x.strip() for x in ln.split(",")]
+        if len(xs) >= 2 and xs[0].isdigit():
+            used, total = int(xs[0]), int(xs[1])
+    apps = []
+    for ln in parts[1].splitlines():
+        xs = [x.strip() for x in ln.split(",")]
+        if len(xs) >= 3 and xs[0].isdigit():
+            apps.append((int(xs[0]), int(xs[1]) if xs[1].isdigit() else 0, xs[2]))
+    return {"used_mb": used, "total_mb": total, "apps": apps,
+            "ps": [ln.strip() for ln in parts[2].splitlines() if ln.strip()]}
+
+
+def gpu_line(node: str, host: str, g: dict) -> str:
+    if g["used_mb"] is None:
+        return f"    {node:4s} {host:15s} 读不到 nvidia-smi"
+    s = f"    {node:4s} {host:15s} 已用 {g['used_mb']:>6} / {g['total_mb']} MiB"
+    if g["apps"]:
+        s += "  进程 " + ", ".join(f"{p}({mb}MiB)" for p, mb, _ in g["apps"])
+    return s
 
 
 # --------------------------------------------------------------------------- #
@@ -172,12 +214,31 @@ def _kv_lines(host: str, user: str, channel: str, node: str) -> list[str]:
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
 
 
-def cmd_start(c: dict, user: str, env: dict[str, str], wait: float) -> int:
+def cmd_start(c: dict, user: str, env: dict[str, str], wait: float,
+              force: bool = False) -> int:
     name = c["name"]
     for st in c["commands"]:
         r = _ssh(st["host"], user, remote_running(name))
         if r.stdout.strip():
             print(f"  ✗ {st['node']} 上 {name} 已经在跑（pid {r.stdout.split()}）—— 先 stop")
+            return 1
+    # 显存预检：卡上已经有别的进程（上一次没停干净的 worker、识别服务、对拍……）时，vLLM 照样按
+    # 「比例 × 整卡」算 KV，然后在预热时 OOM —— 报错只说 OOM，不说是谁占的。这里先查出来。
+    busy = []
+    for st in c["commands"]:
+        g = parse_gpu(_ssh(st["host"], user, GPU_Q).stdout)
+        if g["used_mb"] is not None and g["used_mb"] > 1024:
+            busy.append((st, g))
+    if busy:
+        print("  ⚠ 这些卡上已经有显存被占着（vLLM 按「比例 × 整卡」算 KV，不会扣掉别人的，"
+              "多半在预热时 OOM）：")
+        for st, g in busy:
+            print(gpu_line(st["node"], st["host"], g))
+            for ln in g["ps"]:
+                print(f"         {ln}")
+        if not force:
+            print("    是没停干净的旧进程就 kill 掉；确实要和别的进程同卡（如 N01 上的识别服务），"
+                  "确认显存比例让出了位置后加 --force")
             return 1
     # 先起 headless 的各级，最后起 node_rank 0（它起 API 服务、等各级连上）
     for st in sorted(c["commands"], key=lambda s: "--node-rank 0 " in s["cmd"]):
@@ -353,15 +414,28 @@ def cmd_ident(action: str, node: str, a, chans: list[dict], cj: dict, env: dict)
 
 def cmd_stop(c: dict, user: str) -> int:
     for st in c["commands"]:
-        _ssh(st["host"], user, remote_stop(c["name"]), timeout=60)
-        print(f"  ■ {st['node']}@{st['host']} 已停")
+        _ssh(st["host"], user, remote_stop(c["name"]), timeout=90)
+        g = parse_gpu(_ssh(st["host"], user, GPU_Q).stdout)
+        left = (f"  ⚠ 卡上还占着 {g['used_mb']} MiB：{g['ps'] or g['apps']}"
+                if g["used_mb"] and g["used_mb"] > 1024 else "")
+        print(f"  ■ {st['node']}@{st['host']} 已停{left}")
+    return 0
+
+
+def cmd_gpu(c: dict, user: str) -> int:
+    print(f"{c['name']}")
+    for st in c["commands"]:
+        g = parse_gpu(_ssh(st["host"], user, GPU_Q).stdout)
+        print(gpu_line(st["node"], st["host"], g))
+        for ln in g["ps"]:
+            print(f"         {ln}")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("start", "status", "logs", "errors", "stop",
+    ap.add_argument("action", choices=("start", "status", "logs", "errors", "stop", "gpu",
                                        "ident-start", "ident-status", "ident-logs", "ident-stop"))
     ap.add_argument("channel", help="通道名（如 gsm8k-0），或 all；ident-* 时是节点 id（如 N01）")
     ap.add_argument("--channels", default=DEFAULT_CHANNELS, help="layout.py 生成的 channels.json")
@@ -370,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="额外环境变量，如 NCCL_SOCKET_IFNAME=eth0（多网卡时 NCCL 选错网卡会卡在初始化）")
     ap.add_argument("--wait", type=float, default=900, help="start 后等 API 就绪的秒数（0 = 不等）")
     ap.add_argument("-n", type=int, default=40, help="logs 显示的行数")
+    ap.add_argument("--force", action="store_true",
+                    help="start 时卡上已有别的进程占显存也照样起（如 N01 与识别服务同卡）")
     g = ap.add_argument_group("识别服务（ident-*）")
     g.add_argument("--ident-port", type=int, default=8100)
     g.add_argument("--src", default="/home/ubuntu/vllm-p2p", help="节点上 vllm-p2p 源码目录")
@@ -391,13 +467,15 @@ def main(argv: list[str] | None = None) -> int:
         if a.action == "start":
             print(f"== 启动 {c['name']}（{' → '.join(c['nodes'])}，PP={','.join(map(str, c['partition']))}，"
                   f"dtype={c['dtype']}）")
-            rc |= cmd_start(c, a.user, env, a.wait)
+            rc |= cmd_start(c, a.user, env, a.wait, a.force)
         elif a.action == "status":
             rc |= cmd_status(c, a.user)
         elif a.action == "logs":
             rc |= cmd_logs(c, a.user, a.n)
         elif a.action == "errors":
             rc |= cmd_errors(c, a.user, a.n)
+        elif a.action == "gpu":
+            rc |= cmd_gpu(c, a.user)
         else:
             print(f"== 停止 {c['name']}")
             rc |= cmd_stop(c, a.user)
