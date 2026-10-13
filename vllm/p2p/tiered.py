@@ -597,6 +597,7 @@ async def _run(args) -> int:
             b.n_bound = 0
 
         phases = sorted({1, args.concurrency})
+        refs_c1: list = []
         for c in phases:
             print(f"\n并发 {c}：整模型 ×{len(mrs)} …", flush=True)
             refs, w_ref = [], None
@@ -612,13 +613,33 @@ async def _run(args) -> int:
             ref_for = [refs[mono_of[int(r["back"].removeprefix("back"))]][i]
                        for i, r in enumerate(got)]
             cmp = compare_runs(ref_for, got, tol=tol)
+            # 噪声底：同一个整模型引擎，并发 1 与并发 c 之间的差（批的组成不同 → kernel 的分块 /
+            # 累加顺序不同；fp16 下随机小模型的 logits 很平，这个差不小）。并发 > 1 时分段对
+            # 整模型的差只要求与噪声底同量级（≤ 3× 底，且不低于 tol），同 parity 的判据。
+            if c == 1:
+                refs_c1 = refs
+                floor = None
+            else:
+                floors = [compare_runs(a, b, tol=tol) for a, b in zip(refs_c1, refs)]
+                floor = {"max_lp_diff": max(f["max_lp_diff"] for f in floors),
+                         "same": sum(f["same"] for f in floors),
+                         "n": sum(f["n"] for f in floors)}
+                lim = max(tol, 3 * floor["max_lp_diff"])
+                cmp["ok_lp"] = cmp["max_lp_diff"] <= lim
+                cmp["ok"] = cmp["ok_lp"] and cmp["ok_tie"]
+                cmp["lp_limit"] = lim
             differ = (sum(a["tokens"] != b["tokens"] for a, b in zip(refs[0], refs[1]))
                       if len(refs) > 1 else None)
             sm, sg = summarise(refs[0], w_ref), summarise(got, w_got)
             report[f"c{c}"] = {"mono": sm, "tiered": sg, "compare":
                                {k: v for k, v in cmp.items() if k != "rows"},
-                               "rows": cmp["rows"], "mono_sets_differ": differ}
-            _print_phase(c, sm, sg, cmp, tol)
+                               "rows": cmp["rows"], "mono_sets_differ": differ,
+                               "noise_floor": floor}
+            _print_phase(c, sm, sg, cmp, cmp.get("lp_limit", tol))
+            if floor is not None:
+                print(f"  噪声底（同一整模型，并发 1 vs 并发 {c}）：{floor['same']}/{floor['n']} 条逐 token "
+                      f"相同，公共前缀上 max|Δlogprob| = {floor['max_lp_diff']:.2e} → 分段的上限取 "
+                      f"max(tol, 3×底) = {cmp['lp_limit']:.2e}")
             if differ is not None:
                 print(f"  两种驻留集的整模型输出不同的有 {differ}/{len(prompts)} 条"
                       f"（>0 说明「绑到哪个后段」确实决定了输出，上面的对拍是对着各自的那个比的）")
