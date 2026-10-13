@@ -139,7 +139,7 @@ def _lp_rows(lp) -> list[dict[int, float]]:
 class _Req:
     __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
                  "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
-                 "t_hid", "finish", "done", "events", "info")
+                 "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b")
 
     def __init__(self, rid, prompt, max_tokens, task, loop):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
@@ -158,6 +158,9 @@ class _Req:
         # 流式：("tok", [token…]) …，最后 ("done", result)；出错时 ("err", 异常)
         self.events: asyncio.Queue = asyncio.Queue()
         self.info: dict = {}                 # 绑定时的附加信息（B1 的识别结果放这里）
+        # 远端引擎（remote.py）报的「引擎内毫秒」：每个 decode 位置前段 / 后段各一个
+        self.eng_f: list[float] = []
+        self.eng_b: list[float] = []
 
     def result(self) -> dict:
         n = len(self.tokens)
@@ -172,7 +175,9 @@ class _Req:
             "finish": self.finish, "ttft_ms": ttft, "tpot_ms": tpot,
             "front_prefill_ms": (self.t_front - self.t_arrive) * 1e3 if self.t_front else None,
             "bind_ms": (self.t_bound - self.t_front) * 1e3 if self.t_bound and self.t_front else None,
-            "front_leg_ms": legs_f, "back_leg_ms": legs_b, **({"info": self.info} if self.info else {}),
+            "front_leg_ms": legs_f, "back_leg_ms": legs_b,
+            "front_engine_ms": self.eng_f, "back_engine_ms": self.eng_b,
+            **({"info": self.info} if self.info else {}),
         }
 
 
@@ -342,6 +347,7 @@ class TieredCoordinator:
         try:
             while True:
                 outs = await f.outputs()
+                meta = getattr(f.client, "last_meta", None) or {}
                 feeds: dict[str, tuple[Engine, list]] = {}
                 now = time.perf_counter()
                 for o in outs.outputs:
@@ -359,6 +365,8 @@ class TieredCoordinator:
                             await self._bind(r)
                     else:
                         r.t_hid.append(now)
+                        if o.request_id in meta:
+                            r.eng_f.append(meta[o.request_id])
                         b = r.back
                         feeds.setdefault(b.name, (b, []))[1].append(pack_rows(r.rid, start, rows))
                 for b, items in feeds.values():
@@ -373,6 +381,7 @@ class TieredCoordinator:
         try:
             while True:
                 outs = await b.outputs()
+                meta = getattr(b.client, "last_meta", None) or {}
                 appends: dict[str, tuple[Engine, list]] = {}
                 aborts: dict[str, tuple[Engine, list]] = {}
                 now = time.perf_counter()
@@ -388,6 +397,8 @@ class TieredCoordinator:
                         r.t_first = r.t_first or now
                         r.t_last = now
                         r.t_tok.extend([now] * len(new))
+                        if len(r.tokens) > 1 and o.request_id in meta:
+                            r.eng_b.append(meta[o.request_id])      # 第 1 个 token 是 prefill，不算
                         r.events.put_nowait(("tok", new))
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)

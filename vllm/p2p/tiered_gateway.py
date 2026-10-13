@@ -128,6 +128,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                 "ttft_ms": res.get("ttft_ms"), "tpot_ms": res.get("tpot_ms"),
                 "front_leg_ms_p50": p50(res.get("front_leg_ms") or []),
                 "back_leg_ms_p50": p50(res.get("back_leg_ms") or []),
+                "front_engine_ms_p50": p50(res.get("front_engine_ms") or []),
+                "back_engine_ms_p50": p50(res.get("back_engine_ms") or []),
                 "num_generation_tokens": len(res.get("tokens") or [])}
 
     async def completions(request: web.Request) -> web.StreamResponse:

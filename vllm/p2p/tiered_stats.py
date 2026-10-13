@@ -42,7 +42,9 @@ def summarise_b(rows):
                     "front_prefill": _med([e.get("front_prefill_ms") for e in eng]),
                     "bind": _med([e.get("bind_ms") for e in eng]),
                     "front_leg": _med([e.get("front_leg_ms_p50") for e in eng]),
-                    "back_leg": _med([e.get("back_leg_ms_p50") for e in eng])})
+                    "back_leg": _med([e.get("back_leg_ms_p50") for e in eng]),
+                    "front_eng": _med([e.get("front_engine_ms_p50") for e in eng]),
+                    "back_eng": _med([e.get("back_engine_ms_p50") for e in eng])})
     return out
 
 
@@ -66,14 +68,15 @@ def main(argv=None) -> int:
     def f(x):
         return "—" if x is None else f"{x:g}"
     print(f"{'前段':<8}{'后段':<16}{'条数':>4}{'TTFT':>8}{'TPOT':>8}{'前段prefill':>12}{'绑定':>7}"
-          f"{'前段腿':>8}{'后段腿':>8}   {'A 同通道 TPOT / TTFT':>22}")
+          f"{'前段腿':>8}{'(引擎内)':>9}{'后段腿':>8}{'(引擎内)':>9}   {'A 同通道 TPOT / TTFT':>22}")
     for s in summarise_b(rb):
         ac = A.get(s["back"].removeprefix("back-"))
         tail = f"{f(ac['tpot'])} / {f(ac['ttft'])}（{ac['n']} 条）" if ac else ""
         print(f"{s['front']:<8}{s['back']:<16}{s['n']:>4}{f(s['ttft']):>8}{f(s['tpot']):>8}"
               f"{f(s['front_prefill']):>12}{f(s['bind']):>7}{f(s['front_leg']):>8}"
-              f"{f(s['back_leg']):>8}   {tail:>22}")
-    print("（单位 ms；TPOT = (总时延 − 首 token) / (生成数 − 1)；腿是每条请求的中位数再取中位数）")
+              f"{f(s['front_eng']):>9}{f(s['back_leg']):>8}{f(s['back_eng']):>9}   {tail:>22}")
+    print("（单位 ms；TPOT = (总时延 − 首 token) / (生成数 − 1)；腿是每条请求的中位数再取中位数；\n"
+          " 「引擎内」= 代理收到这条请求的输入到送出它的输出（排队 + 调度 + 前向），腿 − 引擎内 ≈ 网络 + 协调器）")
     return 0
 
 

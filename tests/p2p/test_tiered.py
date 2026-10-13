@@ -531,6 +531,9 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
         assert r["finish"] == ("stop" if want[-1] == EOS else "length")
         assert r["channel"] in ("back-t-0", "back-t-1") and r["front"] in ("front-A", "front-B")
         assert r["metrics"]["front_prefill_ms"] is not None
+        # 代理量的「引擎内」耗时随输出带回来了（前段：append → hidden；后段：feed → token）
+        assert r["metrics"]["front_engine_ms_p50"] is not None
+        assert r["metrics"]["back_engine_ms_p50"] is not None
     assert {r["front"] for r in res} == {"front-A", "front-B"}          # 前段池：两个都用上了
     assert {r["channel"] for r in res} == {"back-t-0", "back-t-1"}      # 同 task 两个后段
     assert nonstream["choices"][0]["text"] == tok.decode(mono(prompts[0], MAXT, EOS))

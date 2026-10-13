@@ -13,7 +13,8 @@ EngineCore（`AsyncMPClient`，PP 多机时 worker 在其余节点上以 headles
                     [A, *EngineCoreRequest]     add_request
                     [X, *list[str]]             abort
                     [U, *(method, args)]        utility，不等结果（失败时代理回 [E, …]）
-    代理 → 协调器   [O, *EngineCoreOutputs]     引擎的每一批输出
+    代理 → 协调器   [O, meta json, *EngineCoreOutputs]   引擎的每一批输出；meta = {req_id: 引擎内毫秒}
+                    （这条请求最近一次「进代理」到这批输出「出代理」—— 排队 + 调度 + 前向，不含网络）
                     [I, info json]  [E, 错误文本]
 
 张量走 vLLM 的零拷贝辅助帧（`MsgpackEncoder` 把大张量放进单独的帧）。
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 __all__ = ["RemoteClient", "AgentBridge", "K_HELLO", "K_ADD", "K_ABORT", "K_UTIL",
@@ -53,6 +55,7 @@ class RemoteClient:
         self.dec_any = MsgpackDecoder()
         self.info: dict = {}
         self._pending_info: asyncio.Future | None = None
+        self.last_meta: dict = {}           # 最近一批输出里各请求的「引擎内毫秒」（代理量的）
 
     async def connect(self, timeout: float = 30.0) -> dict:
         """握手：拿到代理报的本段信息（角色、层、hidden 维度…）。"""
@@ -93,7 +96,8 @@ class RemoteClient:
             frames = await self.sock.recv_multipart(copy=False)
             kind = bytes(frames[0])
             if kind == K_OUT:
-                return self.dec_out.decode(frames[1:])
+                self.last_meta = json.loads(bytes(frames[1])) if len(frames) > 1 else {}
+                return self.dec_out.decode(frames[2:])
             if kind == K_ERR:
                 raise RuntimeError(f"分段引擎 {self.info.get('name') or self.address} 报错："
                                    f"{bytes(frames[1]).decode('utf-8', 'replace')}")
@@ -130,6 +134,8 @@ class AgentBridge:
         self.peer: bytes | None = None
         self.n_in = self.n_out = 0
         self.dead: str | None = None
+        # 每条请求最近一次「有东西进来」的时刻（add / p2p_append / p2p_feed），量引擎内耗时
+        self.t_in: dict[str, float] = {}
 
     async def _err(self, msg: str) -> None:
         if self.peer is not None:
@@ -149,11 +155,20 @@ class AgentBridge:
                     await self.sock.send_multipart(
                         [self.peer, K_INFO, json.dumps(self.info).encode("utf-8")])
                 elif kind == K_ADD:
-                    await self.client.add_request_async(self.dec_req.decode(body))
+                    req = self.dec_req.decode(body)
+                    self.t_in[req.request_id] = time.perf_counter()
+                    await self.client.add_request_async(req)
                 elif kind == K_ABORT:
-                    await self.client.abort_requests_async(list(self.dec_any.decode(body)))
+                    ids = list(self.dec_any.decode(body))
+                    for rid in ids:
+                        self.t_in.pop(rid, None)
+                    await self.client.abort_requests_async(ids)
                 elif kind == K_UTIL:
                     method, args = self.dec_any.decode(body)
+                    if method in ("p2p_append", "p2p_feed") and args:
+                        now = time.perf_counter()
+                        for it in args[0]:
+                            self.t_in[str(it[0])] = now
                     fire = getattr(self.client, "p2p_fire", None)     # 测试用的假引擎
                     fut = await (fire(method, *args) if fire is not None
                                  else _fire_utility(self.client, method, *args))
@@ -180,7 +195,16 @@ class AgentBridge:
             if self.peer is None or not outs.outputs:
                 continue
             self.n_out += 1
-            await self.sock.send_multipart([self.peer, K_OUT, *self.enc.encode(outs)], copy=False)
+            now = time.perf_counter()
+            meta = {}
+            for o in outs.outputs:
+                t = self.t_in.pop(o.request_id, None)
+                if t is not None:
+                    meta[o.request_id] = round((now - t) * 1e3, 3)
+                if o.finish_reason is not None:
+                    self.t_in.pop(o.request_id, None)
+            await self.sock.send_multipart(
+                [self.peer, K_OUT, json.dumps(meta).encode(), *self.enc.encode(outs)], copy=False)
 
     async def run(self) -> None:
         await asyncio.gather(self._inbound(), self._outbound())
