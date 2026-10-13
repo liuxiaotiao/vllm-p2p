@@ -67,6 +67,11 @@ class Engine:
     n_bound: int = 0
     errors: list = field(default_factory=list)
     on_error: Callable[[str], None] | None = None
+    # 远端引擎报的每 decode 位置「引擎内毫秒」的滑动平均（选前段时按它算快慢）；0 = 还没数据
+    ewma_ms: float = 0.0
+
+    def observe(self, ms: float, alpha: float = 0.05) -> None:
+        self.ewma_ms = ms if self.ewma_ms <= 0 else (1 - alpha) * self.ewma_ms + alpha * ms
 
     async def add(self, req) -> None:
         await self.client.add_request_async(req)
@@ -191,8 +196,12 @@ class TieredCoordinator:
 
     def __init__(self, fronts: Engine | Sequence[Engine], backs: Sequence[Engine], *,
                  bind: str | Callable = "least", eos: int | None = None,
-                 stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0):
+                 stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0,
+                 front_pick: str = "speed"):
         fronts = [fronts] if isinstance(fronts, Engine) else list(fronts)
+        if front_pick not in ("speed", "least"):
+            raise ValueError(f"front_pick={front_pick!r}；可选 speed / least")
+        self.front_pick = front_pick
         if not fronts:
             raise ValueError("至少要一个前段")
         if not backs:
@@ -237,9 +246,11 @@ class TieredCoordinator:
             raise RuntimeError("分段引擎 utility 调用失败：\n  " + "\n  ".join(errs[:5]))
 
     def state(self) -> dict:
-        return {"fronts": [{"name": f.name, "inflight": f.inflight} for f in self.fronts],
+        return {"fronts": [{"name": f.name, "inflight": f.inflight,
+                            "engine_ms_ewma": round(f.ewma_ms, 2)} for f in self.fronts],
                 "backs": [{"name": b.name, "task": b.task, "inflight": b.inflight,
-                           "bound": b.n_bound} for b in self.backs]}
+                           "bound": b.n_bound, "engine_ms_ewma": round(b.ewma_ms, 2)}
+                          for b in self.backs]}
 
     # ---- 请求 ----
     async def submit(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
@@ -311,10 +322,22 @@ class TieredCoordinator:
                 f"（prompt {r.n_prompt}） token {len(r.tokens)} 个 hidden 回 {len(r.t_hid)} 次")
 
     def _pick_front(self) -> Engine:
+        """`least`：在飞最少。`speed`（默认）：(在飞 + 1) × 该前段每位置的引擎内耗时最小 ——
+        前段的卡型不同（A30 vs RTX 6000，B1 实测每位置 6 ms vs 28 ms），只数在飞会把一半
+        请求压到慢卡上。还没数据的前段按已知最快的算（先让它接几条、量出来）。"""
         k = next(self._rr["__front__"])
-        low = min(f.inflight for f in self.fronts)
-        least = [f for f in self.fronts if f.inflight == low]
-        return least[k % len(least)]
+        if self.front_pick == "least":
+            low = min(f.inflight for f in self.fronts)
+            cands = [f for f in self.fronts if f.inflight == low]
+            return cands[k % len(cands)]
+        known = [f.ewma_ms for f in self.fronts if f.ewma_ms > 0]
+        base = min(known) if known else 1.0
+
+        def cost(f):
+            return (f.inflight + 1) * (f.ewma_ms if f.ewma_ms > 0 else base)
+        low = min(cost(f) for f in self.fronts)
+        cands = [f for f in self.fronts if cost(f) <= low * (1 + 1e-9)]
+        return cands[k % len(cands)]
 
     def _candidates(self, task: str | None) -> list[Engine]:
         same = [b for b in self.backs if task is not None and b.task == task]
@@ -367,6 +390,7 @@ class TieredCoordinator:
                         r.t_hid.append(now)
                         if o.request_id in meta:
                             r.eng_f.append(meta[o.request_id])
+                            f.observe(meta[o.request_id])
                         b = r.back
                         feeds.setdefault(b.name, (b, []))[1].append(pack_rows(r.rid, start, rows))
                 for b, items in feeds.values():
@@ -399,6 +423,7 @@ class TieredCoordinator:
                         r.t_tok.extend([now] * len(new))
                         if len(r.tokens) > 1 and o.request_id in meta:
                             r.eng_b.append(meta[o.request_id])      # 第 1 个 token 是 prefill，不算
+                            b.observe(meta[o.request_id])
                         r.events.put_nowait(("tok", new))
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)

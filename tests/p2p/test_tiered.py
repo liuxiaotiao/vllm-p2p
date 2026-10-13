@@ -570,3 +570,24 @@ def test_tiered_stats_groups_by_path(tmp_path, capsys) -> None:
     assert s[("N01", "back-g-0")]["n"] == 2 and s[("N01", "back-g-0")]["tpot"] == 10.0
     assert s[("N10", "back-g-0")]["tpot"] == 20.0
     assert "10 / 50（1 条）" in capsys.readouterr().out
+
+
+def test_front_pick_speed_aware() -> None:
+    from vllm.p2p.tiered import Engine, TieredCoordinator
+
+    fast, slow = Engine("fast", "front", None), Engine("slow", "front", None)
+    co = TieredCoordinator([fast, slow], [Engine("b", "back", None, task="t")])
+    # 还没数据：轮流
+    assert {co._pick_front().name for _ in range(4)} == {"fast", "slow"}
+    fast.observe(6.0)
+    slow.observe(28.0)
+    picks = []
+    for _ in range(6):                     # 每挑一个就给它记一条在飞
+        f = co._pick_front()
+        f.inflight += 1
+        picks.append(f.name)
+    # 慢 4.7 倍：前 4 条都给快的（(4+1)×6=30 > (0+1)×28），第 5 条才轮到慢的
+    assert picks[:4] == ["fast"] * 4 and "slow" in picks
+    co2 = TieredCoordinator([fast, slow], [Engine("b", "back", None, task="t")], front_pick="least")
+    fast.inflight = slow.inflight = 0
+    assert {co2._pick_front().name for _ in range(4)} == {"fast", "slow"}

@@ -313,14 +313,15 @@ async def _amain(a) -> int:
     be = [e for e in engines if e.role == "back"]
     eos, stop_ids = load_stop_ids(a.model_dir)
     tok = Tokenizer.from_file(str(Path(a.model_dir) / "tokenizer.json"))
-    co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False)
+    co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
+                           front_pick=a.front_pick)
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode="oracle",
                    max_model_len=a.max_model_len)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, a.host, a.port).start()
-    print(f"分段网关（oracle）：前段 {[e.name for e in fe]}，后段 "
+    print(f"分段网关（oracle，前段按 {a.front_pick} 挑）：前段 {[e.name for e in fe]}，后段 "
           f"{ {u: [b.name for b in be if b.task == u] for u in sorted({b.task for b in be})} }；"
           f"停止 token {stop_ids}；监听 {a.host}:{a.port}", flush=True)
     try:
@@ -343,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=9100, help="默认 9100（A 的网关占着 9000）")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--connect-timeout", type=float, default=30.0)
+    ap.add_argument("--front-pick", choices=("speed", "least"), default="speed",
+                    help="选前段：speed =（在飞+1）×实测每位置耗时最小（默认）；least = 在飞最少")
     a = ap.parse_args(argv)
     try:
         return asyncio.run(_amain(a))
