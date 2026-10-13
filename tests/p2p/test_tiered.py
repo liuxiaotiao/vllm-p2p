@@ -506,6 +506,9 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
                 "prompt": prompts[0], "max_tokens": MAXT, "temperature": 0.0,
                 "p2p_task": "t", "p2p_id": "nostream"})
             nonstream = await nb.json()
+            nob = await client.post("/v1/completions", json={
+                "prompt": prompts[0], "max_tokens": 4, "temperature": 0.0, "p2p_task": "zzz"})
+            assert nob.status == 503 and "没有后段" in (await nob.json())["error"]["message"]
             recs = (await (await client.get("/p2p/records")).json())["records"]
             chans = await (await client.get("/p2p/channels")).json()
             return res, nonstream, recs, chans, cores
@@ -545,3 +548,22 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
     han = list("中".encode())
     assert d.push([ord("a")]) == "a" and d.push(han[:2]) == "" and d.push(han[2:]) == "中"
     assert d.flush() == "" and d.text == "a中"
+
+
+def test_tiered_stats_groups_by_path(tmp_path, capsys) -> None:
+    from vllm.p2p import tiered_stats
+
+    def row(front, ch, n, total, ttft, fl=3.0, bl=9.0):
+        return {"front": front, "channel": ch, "n_generated": n, "total_ms": total,
+                "prefill_ms": ttft, "engine": {"front_prefill_ms": 50, "bind_ms": 1,
+                                                "front_leg_ms_p50": fl, "back_leg_ms_p50": bl}}
+    b = [row("N01", "back-g-0", 11, 200, 100), row("N10", "back-g-0", 11, 300, 100),
+         row("N01", "back-g-0", 11, 220, 120)]
+    a = [{"channel": "g-0", "n_generated": 11, "total_ms": 150, "prefill_ms": 50}]
+    (tmp_path / "b.json").write_text(json.dumps({"requests": b}))
+    (tmp_path / "a.json").write_text(json.dumps({"requests": a}))
+    assert tiered_stats.main(["--b", str(tmp_path / "b.json"), "--a", str(tmp_path / "a.json")]) == 0
+    s = {(x["front"], x["back"]): x for x in tiered_stats.summarise_b(b)}
+    assert s[("N01", "back-g-0")]["n"] == 2 and s[("N01", "back-g-0")]["tpot"] == 10.0
+    assert s[("N10", "back-g-0")]["tpot"] == 20.0
+    assert "10 / 50（1 条）" in capsys.readouterr().out

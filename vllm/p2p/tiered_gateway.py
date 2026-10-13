@@ -151,6 +151,10 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             return bad(400, "分段网关只支持贪心（temperature 0）", rec)
         if mode == "oracle" and not task:
             return bad(400, "oracle 模式要在请求里给 p2p_task", rec)
+        if not any(b.task == task for b in co.backs):
+            # 与 A 的网关一致：task 没有后段 → 立刻 503，不偷偷塞给别的 task 的后段
+            have = sorted({b.task for b in co.backs if b.task})
+            return bad(503, f"task {task!r} 没有后段（有的是 {have}）", rec)
         max_tokens = int(body.get("max_tokens") or 16)
         max_tokens = max(1, min(max_tokens, max_model_len - len(ids)))
         stream = bool(body.get("stream"))

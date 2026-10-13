@@ -526,6 +526,13 @@ def main(argv: list[str] | None = None) -> int:
     if a.thinking != "default":
         textio.template_kw["enable_thinking"] = a.thinking == "on"
     cases = load_cases(a.cases, tasks)
+    if mode in ("oracle", "shadow"):
+        # 按标注路由时，网关上没有通道的 task 只会 503 —— 直接跳过，免得压测里混进一堆失败
+        # （网关 --only 只开了部分通道、或分段网关只起了部分后段时）
+        skip = [u for u, _ in cases if u is not None and u not in tasks]
+        if skip:
+            log.info("网关上没有 %s 的通道：这 %d 条跳过", sorted(set(skip)), len(skip))
+            cases = [(u, p) for u, p in cases if u is None or u in tasks]
     if not cases:
         raise SystemExit(f"{a.cases} 里一条都没有")
     pool = interleave(cases) if a.order == "interleave" else list(cases)
