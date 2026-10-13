@@ -69,3 +69,13 @@ def test_match_pattern_does_not_match_its_own_query() -> None:
     assert re.search(pat, f"vllm serve /w {FLAG} {NAME}")
     assert not re.search(pat, f"vllm serve /w {FLAG} {NAME}0 --x")
     assert not re.search(pat, L.remote_running(NAME))     # 执行查询的 shell 自己的命令行
+
+
+def test_venv_is_put_on_path() -> None:
+    cmd = ("VLLM_PP_LAYER_PARTITION=8,13,27 /home/ubuntu/venvs/vllm-p2p/bin/vllm serve /w "
+           f"{FLAG} {NAME} --hf-overrides \"$(cat /x/ov.json)\"")
+    assert L.venv_of(cmd) == "/home/ubuntu/venvs/vllm-p2p"
+    assert L.venv_of(f"vllm serve /w {FLAG} {NAME}") is None          # 没用绝对路径就不猜
+    script = L.remote_start(cmd, NAME, "N01", {})
+    assert "export PATH=/home/ubuntu/venvs/vllm-p2p/bin:$PATH" in script
+    assert "VIRTUAL_ENV=/home/ubuntu/venvs/vllm-p2p" in script

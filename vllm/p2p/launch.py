@@ -46,6 +46,17 @@ def match_pattern(channel: str) -> str:
     return f"[-]-served-model-name {channel}( |$)"
 
 
+def venv_of(cmd: str) -> str | None:
+    """从启动命令里认出 venv：命令里的 vllm 是绝对路径 `<venv>/bin/vllm` 时返回 `<venv>`。"""
+    for tok in shlex.split(cmd.split(" --hf-overrides ", 1)[0]):
+        if "=" in tok and not tok.startswith("/"):
+            continue                      # 开头的 VAR=值
+        if tok.endswith("/bin/vllm"):
+            return tok[: -len("/bin/vllm")]
+        return None
+    return None
+
+
 def remote_start(cmd: str, channel: str, node: str, env: dict[str, str]) -> str:
     """远端执行的 shell：后台起 vllm serve，输出写日志，ssh 断开后进程不退。
 
@@ -53,7 +64,12 @@ def remote_start(cmd: str, channel: str, node: str, env: dict[str, str]) -> str:
     `cmd` 以 `VLLM_PP_LAYER_PARTITION=… vllm serve …` 开头 —— `exec VAR=值 命令` 在 bash 里
     不成立（VAR=值 会被当成命令名），所以用 `exec env …`：进程直接替换成 vllm，pgrep 只见一个。
     """
-    exports = "".join(f"export {k}={shlex.quote(v)}; " for k, v in sorted(env.items()))
+    # 等同于在远端 activate 了 venv：vllm 本身用绝对路径已经足够，但它运行中按名字调用的
+    # 工具（比如个别算子现场编译时找 ninja）要从 PATH 里找，venv 的 bin/ 得在 PATH 上
+    venv = venv_of(cmd)
+    act = (f"export VIRTUAL_ENV={shlex.quote(venv)}; export PATH={shlex.quote(venv + '/bin')}:$PATH; "
+           if venv else "")
+    exports = act + "".join(f"export {k}={shlex.quote(v)}; " for k, v in sorted(env.items()))
     log = log_path(channel, node)
     inner = f"{exports}exec env {cmd}"
     # 注意是 `cd /tmp;` 不是 `cd /tmp &&`：`A && B &` 会把整个 `A && B` 放进一个后台子 shell，
