@@ -289,7 +289,7 @@ def summarise_smi(csv_text: str) -> dict:
             except ValueError:
                 return None
         u, m, t, p = (num(x) for x in parts[1:5])
-        if u is not None:
+        if u is not None and 0 <= u <= 100:          # 防御：列错位时宁可丢样本也不出 584% 这种数
             util.append(u)
         if m is not None:
             mem.append(m)
@@ -301,6 +301,8 @@ def summarise_smi(csv_text: str) -> dict:
         return {"error": "没有样本"}
     s = sorted(util)
     return {
+        # vLLM 不报逐节点的 forward 时长 → 0（p2p-framework 的 report 要这个键）
+        "compute_util": 0.0,
         "gpu_util_mean": round(sum(util) / len(util), 1),
         "gpu_util_p95": round(s[min(len(s) - 1, int(0.95 * len(s)))], 1),
         "mem_used_max_mb": max(mem) if mem else None,
@@ -629,6 +631,13 @@ def main(argv: list[str] | None = None) -> int:
     for (node, host), pid in smi_pids.items():
         r = _launch._ssh(host, a.user, smi_stop_cmd(tag, pid), timeout=60)
         usage[node] = summarise_smi(r.stdout) if r.returncode == 0 else {"error": r.stderr[:200]}
+        if r.returncode == 0:
+            usage[node]["raw_head"] = r.stdout.splitlines()[:2]      # 核对列用
+    for node in sorted(usage):
+        v = usage[node]
+        log.info("  GPU %s：利用率均值 %s%%  p95 %s%%  显存峰值 %s/%s MB  功耗 %s W  （%s 个样本）",
+                 node, v.get("gpu_util_mean"), v.get("gpu_util_p95"), v.get("mem_used_max_mb"),
+                 v.get("mem_total_mb"), v.get("power_mean_w"), v.get("n_samples"))
     gw = http_json(f"{a.gateway}/p2p/records")
     gwr = {g["id"]: g for g in gw["records"]}
 
