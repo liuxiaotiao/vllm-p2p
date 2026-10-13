@@ -352,6 +352,14 @@ def ident_stop() -> str:
             f"sleep 1; done; pkill -KILL -f -- {pat}; true")
 
 
+def _pretty(raw: bytes) -> str:
+    """识别服务 /info 的 JSON → 人能读的一行（中文不转义）。"""
+    try:
+        return json.dumps(json.loads(raw), ensure_ascii=False)[:600]
+    except Exception:                                         # noqa: BLE001
+        return raw.decode("utf-8", "replace")[:600]
+
+
 def cmd_ident(action: str, node: str, a, chans: list[dict], cj: dict, env: dict) -> int:
     c, st = find_node(chans, node)
     host = st["host"]
@@ -378,7 +386,7 @@ def cmd_ident(action: str, node: str, a, chans: list[dict], cj: dict, env: dict)
         while time.time() - t0 < a.wait:
             try:
                 with urllib.request.urlopen(f"{url}/info", timeout=3) as resp:
-                    print(f"  ✓ 就绪（{time.time() - t0:.0f}s）：{resp.read().decode()[:400]}")
+                    print(f"  ✓ 就绪（{time.time() - t0:.0f}s）：{_pretty(resp.read())}")
                     print(f"    网关：python vllm/p2p/gateway.py --mode lr --identifier {url} …")
                     return 0
             except Exception:                                 # noqa: BLE001
@@ -395,7 +403,7 @@ def cmd_ident(action: str, node: str, a, chans: list[dict], cj: dict, env: dict)
         up = False
         try:
             with urllib.request.urlopen(f"{url}/info", timeout=3) as resp:
-                info = resp.read().decode()
+                info = _pretty(resp.read())
                 up = True
         except Exception:                                     # noqa: BLE001
             info = ""

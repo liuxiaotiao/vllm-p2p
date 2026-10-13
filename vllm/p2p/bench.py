@@ -398,6 +398,7 @@ def a5_check(rows: list[dict], gw_records: Mapping[str, dict], clf) -> dict:
     agree = n = 0
     dmax = 0.0
     cnt_eq = cnt_n = 0
+    diff_by_layer: dict[int, list[float]] = defaultdict(list)
     bad = []
     for r in rows:
         fl = r.get("_front_layers")
@@ -421,9 +422,18 @@ def a5_check(rows: list[dict], gw_records: Mapping[str, dict], clf) -> dict:
                     a, b = LayerStat.from_wire(s), LayerStat.from_wire(fl[l])
                     cnt_n += 1
                     cnt_eq += bool(np.array_equal(a.count, b.count))
-    return {"n": n, "label_agree": agree, "max_abs_prob_diff": round(dmax, 4),
-            **({"layer_count_equal": f"{cnt_eq}/{cnt_n}"} if cnt_n else {}),
-            "disagree": bad[:20]}
+                    # 有多大比例的 top-k 选择不一样：Σ|Δcount| / 2 / (body token × k)
+                    tot = max(float(a.count.sum()), 1.0)
+                    diff_by_layer[int(l)].append(float(np.abs(a.count - b.count).sum()) / 2 / tot)
+    out = {"n": n, "label_agree": agree, "max_abs_prob_diff": round(dmax, 4),
+           "disagree": bad[:20]}
+    if cnt_n:
+        out["layer_count_equal"] = f"{cnt_eq}/{cnt_n}"
+        # 逐层：两边 top-k 选择不同的比例（均值）。fp16 下两套实现（vLLM 融合 kernel vs
+        # p2p-framework 逐专家 matmul）的舍入不同，并列附近的选择会换位，越深的层差得越多
+        out["topk_diff_by_layer"] = {l: round(sum(v) / len(v), 4)
+                                     for l, v in sorted(diff_by_layer.items())}
+    return out
 
 
 def write_front_dump(path: Path, rows: list[dict], gw_records: Mapping[str, dict], *,
