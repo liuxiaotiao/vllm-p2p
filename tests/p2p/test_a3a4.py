@@ -298,6 +298,8 @@ def test_small_helpers() -> None:
     s = B.summarise_smi("2026/10/13 05:00:00.1, 50, 20000, 24576, 100.5\n"
                         "2026/10/13 05:00:01.1, 70, 21000, 24576, 120.5\nbad line\n")
     assert s["gpu_util_mean"] == 60.0 and s["mem_used_max_mb"] == 21000 and s["n_samples"] == 2
+    assert s["compute_util"] == 0.0
+    assert B.summarise_smi("t, 584, 1, 2, 3\n")["error"]
     p0 = B.parse_prom('vllm:request_queue_time_seconds_sum{model_name="x"} 1.0\n'
                       'vllm:request_queue_time_seconds_count{model_name="x"} 2\n# HELP x\n')
     p1 = B.parse_prom('vllm:request_queue_time_seconds_sum{model_name="x"} 3.0\n'

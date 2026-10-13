@@ -502,7 +502,13 @@ def main(argv: list[str] | None = None) -> int:
 
     cj = json.loads(Path(a.channels).read_text(encoding="utf-8"))
     channels = {c["name"]: c for c in cj["channels"]}
-    gw_info = http_json(f"{a.gateway}/p2p/channels")
+    try:
+        gw_info = http_json(f"{a.gateway}/p2p/channels")
+    except OSError as e:
+        raise SystemExit(
+            f"连不上网关 {a.gateway}（{e}）—— 网关没起或已经退出。先起网关（要一直开着，比如另开一个终端"
+            "或用 nohup 放后台）：\n  /home/ubuntu/venvs/vllm-p2p/bin/python vllm/p2p/gateway.py "
+            "--mode shadow --identifier http://<识别服务所在节点>:8100 --ident-layers") from None
     mode = gw_info["mode"]
     live = {c["name"] for c in gw_info["channels"]}
     tasks = sorted({channels[c]["task"] for c in live if c in channels})
