@@ -33,11 +33,23 @@ try:
 except ImportError:                                               # pragma: no cover
     from vllm.p2p.identifier import use_p2p_framework
 
-__all__ = ["pair_rows", "common_prefix", "compare", "main"]
+__all__ = ["pair_rows", "same_channel", "common_prefix", "compare", "main"]
 
 
 def _key(r: Mapping) -> tuple:
     return ("id", r["case_id"]) if r.get("case_id") else ("p", r.get("true_task"), r.get("prompt"))
+
+
+def _chan(r: Mapping) -> str:
+    """通道名归一：B 的后段引擎叫 back-<通道>，与 A 的 <通道> 是同一组驻留集。"""
+    return str(r.get("channel") or "").removeprefix("back-")
+
+
+def same_channel(pairs: Sequence[tuple[dict, dict]]) -> tuple[list[tuple[dict, dict]], int]:
+    """只留两边落在同一组驻留集（同一条通道 / 它的后段）上的配对 —— 同 task 的不同通道驻留集
+    不同，输出本来就不一样，拿来比一致率没有意义。→ (留下的, 去掉的条数)"""
+    kept = [(x, y) for x, y in pairs if _chan(x) and _chan(x) == _chan(y)]
+    return kept, len(pairs) - len(kept)
 
 
 def pair_rows(a: Sequence[Mapping], b: Sequence[Mapping]) -> tuple[list[tuple[dict, dict]], int, int]:
@@ -124,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--p2p-framework", default=None)
     ap.add_argument("--prefix", type=int, default=64)
     ap.add_argument("--show", type=int, default=8, help="列出前几条分叉的样本")
+    ap.add_argument("--same-channel", action="store_true",
+                    help="只比两边落在同一组驻留集上的（A 的通道 X ↔ B 的后段 back-X）")
     ap.add_argument("--out", type=Path, default=None)
     a = ap.parse_args(argv)
 
@@ -134,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
     ra = json.loads(a.a.read_text(encoding="utf-8"))["requests"]
     rb = json.loads(a.b.read_text(encoding="utf-8"))["requests"]
     pairs, ma, mb = pair_rows(ra, rb)
+    if a.same_channel:
+        pairs, dropped = same_channel(pairs)
+        print(f"--same-channel：去掉 {dropped} 条两边驻留集不同的配对")
     if not pairs:
         print("✗ 一条都配不上 —— 两份结果不是同一个测试集？（按 case_id，没有就按 task+prompt）")
         return 2

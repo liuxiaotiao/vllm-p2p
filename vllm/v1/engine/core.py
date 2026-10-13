@@ -1006,9 +1006,10 @@ class EngineCoreProc(EngineCore):
         # background threads (like NIXL handshake) to make progress.
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
-            if getattr(self.scheduler, "p2p_role", None):
+            if getattr(self.scheduler, "p2p_role", None) and not self.batch_queue:
                 # P2P 分段引擎「有请求但没东西可算」= 在等另一段送 token / hidden 来：
                 # 阻塞等输入（来了马上处理、马上下一步），不按 1ms 空转。
+                # PP 时还有批在路上（batch_queue 非空）就不能等 —— 要马上回去收它的结果。
                 try:
                     req = self.input_queue.get(timeout=0.05)
                 except queue.Empty:

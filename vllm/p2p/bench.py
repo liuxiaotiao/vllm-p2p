@@ -217,7 +217,13 @@ def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str,
         **({"shadow": sh} if sh else {}),
         **({"n_body": sum(b - a for a, b in rec.body)} if rec.body is not None else {}),
         "rebinds": 0, "alarms": 0,
-        "front": nodes[0] if nodes else "", "back": "+".join(nodes[1:]),
+        # 分段网关（tiered_gateway.py）：前段、后段是逐请求挑的，路由记录里直接给节点
+        "front": ("+".join(gw["front_nodes"]) if gw.get("front_nodes") else
+                  (nodes[0] if nodes else "")),
+        "back": ("+".join(gw["back_nodes"]) if gw.get("back_nodes") else "+".join(nodes[1:])),
+        **({"front_engine": gw["front"]} if gw.get("front") else {}),
+        **({"tiered": {k: gw.get(k) for k in ("front_prefill_ms", "bind_ms")}}
+           if gw.get("front_nodes") else {}),
         "channel": chname,
         "n_prompt": n_prompt, "n_generated": n_gen,
         "total_ms": round(total, 2),
@@ -550,7 +556,9 @@ def main(argv: list[str] | None = None) -> int:
 
     hosts = {c["name"]: [(st["node"], st["host"]) for st in c.get("commands", [])]
              for c in cj["channels"]}
-    all_hosts = sorted({nh for c in live for nh in hosts.get(c, [])})
+    # 分段网关还有前段引擎（不属于任何「通道」）：它们的节点也要采 smi
+    fronts_live = [f["name"] for f in gw_info.get("fronts") or []]
+    all_hosts = sorted({nh for c in (*live, *fronts_live) for nh in hosts.get(c, [])})
 
     # ---- 预热：每条通道至少一条（task 轮着来，网关按最闲分到同 task 的各条） ---- #
     if a.warmup:

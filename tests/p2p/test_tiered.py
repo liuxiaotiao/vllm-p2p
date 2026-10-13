@@ -425,3 +425,123 @@ def test_b0_script_end_to_end_with_fake_engines(configs, tmp_path, monkeypatch, 
                                                                             les["mono1"]}
     assert [m[2] for m in made if m[1] == "back"] == [(2, 4), (2, 4)]
     assert "B0 正确性：✓" in text
+
+
+# --------------------------------------------------------------------------- #
+# B1：同一套，但每个引擎隔着真的 ZMQ（remote.AgentBridge ↔ RemoteClient），
+# 两个前段 + 两个后段，再在前面挂分段网关（tiered_gateway.make_app）走 HTTP/SSE
+# --------------------------------------------------------------------------- #
+class _ToyTok:
+    """decode(ids) → 每个 id 一个字母（够测增量解码与拼接）。"""
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(97 + i % 26) for i in ids if not (skip_special_tokens and i == EOS))
+
+
+def test_remote_agents_and_gateway_end_to_end(configs) -> None:
+    pytest.importorskip("zmq")
+    aiohttp = pytest.importorskip("aiohttp")
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from vllm.p2p.remote import AgentBridge, RemoteClient
+    from vllm.p2p.tiered import Engine, TieredCoordinator
+    from vllm.p2p.tiered_gateway import IncrementalDetok, make_app
+
+    rng = random.Random(7)
+    prompts = [[rng.randrange(3, V) for _ in range(rng.randint(3, 30))] for _ in range(10)]
+    MAXT = 12
+
+    async def go():
+        cores, bridges, tasks, clients = [], [], [], []
+        spec = [("front-A", "front", None), ("front-B", "front", None),
+                ("back-t-0", "back", "t"), ("back-t-1", "back", "t")]
+        port0 = 25000 + random.Random().randrange(2000)
+        for k, (name, role, task) in enumerate(spec):
+            core = FakeCore(make_sched(configs[role], 64),
+                            FrontRunner() if role == "front" else BackRunner(), 30 + k)
+            core._ensure()
+            br = AgentBridge(core, f"tcp://127.0.0.1:{port0 + k}",
+                             {"name": name, "role": role, "task": task, "layers": [0, 2],
+                              "pp": 1, "max_num_seqs": 16})
+            cores.append(core)
+            bridges.append(br)
+            tasks.append(asyncio.get_running_loop().create_task(br.run()))
+        engines = []
+        for k, (name, role, task) in enumerate(spec):
+            cl = RemoteClient(f"tcp://127.0.0.1:{port0 + k}")
+            info = await cl.connect(timeout=10)
+            assert info["name"] == name and info["role"] == role
+            clients.append(cl)
+            engines.append(Engine(name, role, cl, task=task))
+        co = TieredCoordinator(engines[:2], engines[2:], eos=EOS, ignore_eos=False)
+        co.start()
+        stages = {n: {"nodes": [f"N-{n}"]} for n, _, _ in spec}
+        app = make_app(co, stages=stages, tokenizer=_ToyTok(), max_model_len=256)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            async def one(i, p):
+                r = await client.post("/v1/completions", json={
+                    "prompt": p, "max_tokens": MAXT, "temperature": 0.0, "stream": True,
+                    "p2p_task": "t", "p2p_id": f"q{i}", "stream_options": {"include_usage": True}})
+                assert r.status == 200, await r.text()
+                text, usage, fin, met = "", None, None, None
+                async for line in r.content:
+                    line = line.strip()
+                    if not line.startswith(b"data:") or line == b"data: [DONE]":
+                        continue
+                    d = json.loads(line[5:])
+                    assert "error" not in d, d
+                    for c in d.get("choices") or []:
+                        text += c["text"]
+                        fin = c["finish_reason"] or fin
+                    usage = d.get("usage") or usage
+                    met = d.get("p2p_metrics") or met
+                return {"text": text, "usage": usage, "finish": fin, "metrics": met,
+                        "channel": r.headers.get("X-P2P-Channel"),
+                        "front": r.headers.get("X-P2P-Front")}
+
+            res = await asyncio.gather(*(one(i, p) for i, p in enumerate(prompts)))
+            nb = await client.post("/v1/completions", json={
+                "prompt": prompts[0], "max_tokens": MAXT, "temperature": 0.0,
+                "p2p_task": "t", "p2p_id": "nostream"})
+            nonstream = await nb.json()
+            recs = (await (await client.get("/p2p/records")).json())["records"]
+            chans = await (await client.get("/p2p/channels")).json()
+            return res, nonstream, recs, chans, cores
+        finally:
+            await client.close()
+            await co.close()
+            for t in tasks:
+                t.cancel()
+            for c in cores:
+                c.close()
+            for cl in clients:
+                cl.shutdown()
+
+    res, nonstream, recs, chans, cores = asyncio.run(go())
+    tok = _ToyTok()
+    for p, r in zip(prompts, res):
+        want = mono(p, MAXT, EOS)
+        assert r["text"] == tok.decode(want), (r, want)
+        assert r["usage"]["completion_tokens"] == len(want)
+        assert r["finish"] == ("stop" if want[-1] == EOS else "length")
+        assert r["channel"] in ("back-t-0", "back-t-1") and r["front"] in ("front-A", "front-B")
+        assert r["metrics"]["front_prefill_ms"] is not None
+    assert {r["front"] for r in res} == {"front-A", "front-B"}          # 前段池：两个都用上了
+    assert {r["channel"] for r in res} == {"back-t-0", "back-t-1"}      # 同 task 两个后段
+    assert nonstream["choices"][0]["text"] == tok.decode(mono(prompts[0], MAXT, EOS))
+    by = {r["id"]: r for r in recs}
+    assert by["q0"]["front_nodes"] and by["q0"]["back_nodes"] and by["q0"]["status"] == 200
+    assert [c["name"] for c in chans["channels"]] == ["back-t-0", "back-t-1"]
+    assert {f["name"] for f in chans["fronts"]} == {"front-A", "front-B"}
+    assert not any(c.sched.requests for c in cores)                    # 两端都收干净了
+
+    # 增量解码：多字节字符没凑齐时不吐、凑齐了一次吐出
+    class _Bytes:
+        def decode(self, ids, skip_special_tokens=True):
+            return bytes(ids).decode("utf-8", errors="replace")
+    d = IncrementalDetok(_Bytes())
+    han = list("中".encode())
+    assert d.push([ord("a")]) == "a" and d.push(han[:2]) == "" and d.push(han[2:]) == "中"
+    assert d.flush() == "" and d.text == "a中"

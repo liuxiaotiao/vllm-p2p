@@ -29,6 +29,11 @@
   以及 `EngineCoreOutput` / `ModelRunnerOutput` / `SchedulerOutput` / `Request` 上各一个字段。
 * `vllm/p2p/tiered.py` —— B-1 的协调器（按请求绑定后段、两个方向搬 token / hidden）与 B0
   原型（1 前段 + 2 同 task 后段，单卡微型 checkpoint，对拍整模型 + 开销）。
+* B1（真模型、跨机）：`vllm/p2p/stages.py`（channels.json → stages.json：每个前段节点一个前段引擎、
+  每条通道的后段节点组成一个后段引擎）、`vllm/p2p/stage_agent.py`（每个分段引擎首节点上的代理：
+  本机 EngineCore + 给协调器的 ZMQ 入口；其余节点 headless worker）、`vllm/p2p/remote.py`
+  （协调器 ↔ 代理的线路，`RemoteClient` 与 `AsyncMPClient` 同接口）、`vllm/p2p/tiered_gateway.py`
+  （OpenAI 兼容网关 + 协调器，bench / report / compare 原样可用）。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）

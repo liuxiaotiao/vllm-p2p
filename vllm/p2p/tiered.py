@@ -137,13 +137,14 @@ def _lp_rows(lp) -> list[dict[int, float]]:
 # 协调器
 # --------------------------------------------------------------------------- #
 class _Req:
-    __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "back", "stream", "tokens",
-                 "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok", "t_hid",
-                 "finish", "done")
+    __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
+                 "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
+                 "t_hid", "finish", "done", "events", "info")
 
     def __init__(self, rid, prompt, max_tokens, task, loop):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
         self.n_prompt = len(prompt)
+        self.front: Engine | None = None
         self.back: Engine | None = None
         self.stream = RowStream()
         self.tokens: list[int] = []
@@ -154,6 +155,9 @@ class _Req:
         self.t_hid: list[float] = []         # 第 k 个 token 的前段 hidden 回到协调器的时刻
         self.finish = None
         self.done: asyncio.Future = loop.create_future()
+        # 流式：("tok", [token…]) …，最后 ("done", result)；出错时 ("err", 异常)
+        self.events: asyncio.Queue = asyncio.Queue()
+        self.info: dict = {}                 # 绑定时的附加信息（B1 的识别结果放这里）
 
     def result(self) -> dict:
         n = len(self.tokens)
@@ -162,39 +166,51 @@ class _Req:
         legs_f = [(h - t) * 1e3 for t, h in zip(self.t_tok, self.t_hid)]
         legs_b = [(t - h) * 1e3 for h, t in zip(self.t_hid, self.t_tok[1:])]
         return {
-            "rid": self.rid, "back": self.back.name if self.back else None, "task": self.task,
+            "rid": self.rid, "front": self.front.name if self.front else None,
+            "back": self.back.name if self.back else None, "task": self.task,
             "n_prompt": self.n_prompt, "tokens": self.tokens, "logprobs": self.lps,
             "finish": self.finish, "ttft_ms": ttft, "tpot_ms": tpot,
             "front_prefill_ms": (self.t_front - self.t_arrive) * 1e3 if self.t_front else None,
-            "front_leg_ms": legs_f, "back_leg_ms": legs_b,
+            "bind_ms": (self.t_bound - self.t_front) * 1e3 if self.t_bound and self.t_front else None,
+            "front_leg_ms": legs_f, "back_leg_ms": legs_b, **({"info": self.info} if self.info else {}),
         }
 
 
 class TieredCoordinator:
-    """一个前段 + 若干后段。`generate()` 可以并发调用。
+    """若干前段 + 若干后段。`generate()` / `stream()` 可以并发调用。
 
-    bind：`least`（同 task 后段里在飞请求最少的，平手轮流）/ `rr`（轮流）/ 一个函数
-    `f(req_info: dict, candidates: list[Engine]) -> Engine`（B1 的 LR 绑定从这里接）。"""
+    前段：每条请求挑在飞最少的前段（任何 task 都能用任何前段）。
+    后段：前段 prefill 完以后在**同 task** 的后段里挑 —— `bind`：`least`（在飞最少，平手轮流）/
+    `rr`（轮流）/ 一个函数 `f(req_info: dict, candidates: list[Engine]) -> Engine`（B1 的识别后绑定
+    从这里接）。task 没有对应后段时用全部后段。"""
 
-    def __init__(self, front: Engine, backs: Sequence[Engine], *, bind: str | Callable = "least",
-                 eos: int | None = None, stop_ids: Sequence[int] = (), ignore_eos: bool = False,
-                 logprobs: int = 0):
+    def __init__(self, fronts: Engine | Sequence[Engine], backs: Sequence[Engine], *,
+                 bind: str | Callable = "least", eos: int | None = None,
+                 stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0):
+        fronts = [fronts] if isinstance(fronts, Engine) else list(fronts)
+        if not fronts:
+            raise ValueError("至少要一个前段")
         if not backs:
             raise ValueError("至少要一个后段")
-        self.front, self.backs = front, list(backs)
+        self.fronts, self.backs = fronts, list(backs)
         self.bind, self.eos, self.stop_ids = bind, eos, tuple(stop_ids)
         self.ignore_eos, self.logprobs = ignore_eos, logprobs
         self.reqs: dict[str, _Req] = {}
         self._rr: dict[Any, itertools.count] = defaultdict(itertools.count)
         self._tasks: list[asyncio.Task] = []
         self._ids = itertools.count()
-        for e in (front, *self.backs):
+        for e in (*self.fronts, *self.backs):
             e.on_error = lambda msg: self._fail_all(RuntimeError(f"分段引擎 utility 调用失败：{msg}"))
+
+    @property
+    def front(self) -> Engine:                      # 只有一个前段时的简写（B0 脚本与测试用）
+        return self.fronts[0]
 
     # ---- 生命周期 ----
     def start(self) -> None:
         loop = asyncio.get_running_loop()
-        self._tasks = [loop.create_task(self._front_loop(), name="p2p-front")]
+        self._tasks = [loop.create_task(self._front_loop(f), name=f"p2p-{f.name}")
+                       for f in self.fronts]
         self._tasks += [loop.create_task(self._back_loop(b), name=f"p2p-{b.name}")
                         for b in self.backs]
 
@@ -208,42 +224,92 @@ class TieredCoordinator:
         for r in list(self.reqs.values()):
             if not r.done.done():
                 r.done.set_exception(exc)
+                r.events.put_nowait(("err", exc))
 
     def _check_errors(self) -> None:
-        errs = [e for x in (self.front, *self.backs) for e in x.errors]
+        errs = [e for x in (*self.fronts, *self.backs) for e in x.errors]
         if errs:
             raise RuntimeError("分段引擎 utility 调用失败：\n  " + "\n  ".join(errs[:5]))
 
+    def state(self) -> dict:
+        return {"fronts": [{"name": f.name, "inflight": f.inflight} for f in self.fronts],
+                "backs": [{"name": b.name, "task": b.task, "inflight": b.inflight,
+                           "bound": b.n_bound} for b in self.backs]}
+
     # ---- 请求 ----
-    async def generate(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
-                       rid: str | None = None, timeout: float | None = None) -> dict:
+    async def submit(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
+                     rid: str | None = None) -> _Req:
+        """把一条请求送进前段，返回它的状态对象（`events` 队列里陆续有 token）。"""
         self._check_errors()
         rid = rid or f"t{next(self._ids)}"
+        if rid in self.reqs:
+            raise ValueError(f"请求号 {rid} 正在用")
         r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop())
-        self.front.inflight += 1
+        f = r.front = self._pick_front()
+        f.inflight += 1
         # 前段这条永远不会自己结束（不采样、不查停止条件）：max_tokens 只是 Request 的必填项
-        await self.front.add(_core_request(
+        await f.add(_core_request(
             rid, prompt=list(prompt), embeds=None, max_tokens=max_tokens + 1, eos=None,
             logprobs=0, ignore_eos=True, stop_ids=(), arrival=time.time()))
+        return r
+
+    async def cancel(self, r: _Req) -> None:
+        """客户端走了 / 超时：两段都 abort，记账退回。"""
+        if r.rid not in self.reqs:
+            return
+        self.reqs.pop(r.rid, None)
+        if r.front is not None:
+            await r.front.abort([r.rid])
+            if r.finish is None:
+                r.front.inflight -= 1
+        if r.back is not None:
+            await r.back.abort([r.rid])
+            if r.finish is None:
+                r.back.inflight -= 1
+
+    async def stream(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
+                     rid: str | None = None, timeout: float | None = None):
+        """异步生成器：先产出 ("req", 请求状态对象)，再逐批 ("tok", [token…])，最后
+        ("done", result)。`timeout` 是两次产出之间最多等多久（不是整条的总时长）。"""
+        r = await self.submit(prompt, max_tokens, task=task, rid=rid)
         try:
-            return await asyncio.wait_for(asyncio.shield(r.done), timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-            why = self.describe(rid)
-            await self.front.abort([rid])
-            if r.back is not None:
-                await r.back.abort([rid])
-            if isinstance(e, asyncio.CancelledError):
-                raise
-            raise TimeoutError(f"{rid} 超时：{why}") from None
+            yield ("req", r)
+            while True:
+                try:
+                    ev = await asyncio.wait_for(r.events.get(), timeout)
+                except asyncio.TimeoutError:
+                    raise TimeoutError(f"{r.rid} {timeout:.0f}s 没有进展：{self.describe(r.rid)}") \
+                        from None
+                if ev[0] == "err":
+                    raise ev[1]
+                yield ev
+                if ev[0] == "done":
+                    return
         finally:
-            self.reqs.pop(rid, None)
+            if r.finish is None:
+                await self.cancel(r)
+            self.reqs.pop(r.rid, None)
+
+    async def generate(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
+                       rid: str | None = None, timeout: float | None = None) -> dict:
+        async for ev in self.stream(prompt, max_tokens, task=task, rid=rid, timeout=timeout):
+            if ev[0] == "done":
+                return ev[1]
+        raise RuntimeError("流在 done 之前结束了")
 
     def describe(self, rid: str) -> str:
         r = self.reqs.get(rid)
         if r is None:
             return "（已结束）"
-        return (f"back={r.back.name if r.back else None} hidden 收到 {r.stream.next} 位"
+        return (f"front={r.front.name if r.front else None} "
+                f"back={r.back.name if r.back else None} hidden 收到 {r.stream.next} 位"
                 f"（prompt {r.n_prompt}） token {len(r.tokens)} 个 hidden 回 {len(r.t_hid)} 次")
+
+    def _pick_front(self) -> Engine:
+        k = next(self._rr["__front__"])
+        low = min(f.inflight for f in self.fronts)
+        least = [f for f in self.fronts if f.inflight == low]
+        return least[k % len(least)]
 
     def _candidates(self, task: str | None) -> list[Engine]:
         same = [b for b in self.backs if task is not None and b.task == task]
@@ -252,7 +318,8 @@ class TieredCoordinator:
     def _pick(self, r: _Req) -> Engine:
         cands = self._candidates(r.task)
         if callable(self.bind):
-            return self.bind({"rid": r.rid, "task": r.task, "n_prompt": r.n_prompt}, cands)
+            return self.bind({"rid": r.rid, "task": r.task, "n_prompt": r.n_prompt,
+                              "front": r.front.name if r.front else None}, cands)
         k = next(self._rr[r.task])
         if self.bind == "rr":
             return cands[k % len(cands)]
@@ -271,15 +338,15 @@ class TieredCoordinator:
             arrival=time.time()))
 
     # ---- 两个方向的搬运 ----
-    async def _front_loop(self) -> None:
+    async def _front_loop(self, f: Engine) -> None:
         try:
             while True:
-                outs = await self.front.outputs()
+                outs = await f.outputs()
                 feeds: dict[str, tuple[Engine, list]] = {}
                 now = time.perf_counter()
                 for o in outs.outputs:
                     r = self.reqs.get(o.request_id)
-                    if r is None or o.p2p_hidden is None:
+                    if r is None or o.p2p_hidden is None or r.front is not f:
                         continue
                     got = r.stream.add(o.p2p_pos, o.p2p_hidden)
                     if got is None:
@@ -306,31 +373,40 @@ class TieredCoordinator:
         try:
             while True:
                 outs = await b.outputs()
-                appends, aborts = [], []
+                appends: dict[str, tuple[Engine, list]] = {}
+                aborts: dict[str, tuple[Engine, list]] = {}
                 now = time.perf_counter()
                 for o in outs.outputs:
                     r = self.reqs.get(o.request_id)
-                    if r is None:
+                    if r is None or r.back is not b:
                         continue
+                    f = r.front
                     if o.new_token_ids:
-                        r.tokens.extend(int(t) for t in o.new_token_ids)
+                        new = [int(t) for t in o.new_token_ids]
+                        r.tokens.extend(new)
                         r.lps.extend(_lp_rows(o.new_logprobs))
                         r.t_first = r.t_first or now
                         r.t_last = now
-                        r.t_tok.extend([now] * len(o.new_token_ids))
+                        r.t_tok.extend([now] * len(new))
+                        r.events.put_nowait(("tok", new))
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)
                         b.inflight -= 1
-                        self.front.inflight -= 1
-                        aborts.append(r.rid)
+                        f.inflight -= 1
+                        aborts.setdefault(f.name, (f, []))[1].append(r.rid)
+                        res = r.result()
+                        res["stop_reason"] = o.stop_reason
                         if not r.done.done():
-                            r.done.set_result(r.result())
+                            r.done.set_result(res)
+                        r.events.put_nowait(("done", res))
+                        self.reqs.pop(r.rid, None)
                     elif o.new_token_ids:
-                        appends.append([r.rid, [int(t) for t in o.new_token_ids]])
-                if appends:
-                    await self.front.fire("p2p_append", appends)
-                if aborts:
-                    await self.front.abort(aborts)
+                        appends.setdefault(f.name, (f, []))[1].append(
+                            [r.rid, [int(t) for t in o.new_token_ids]])
+                for f, items in appends.values():
+                    await f.fire("p2p_append", items)
+                for f, ids in aborts.values():
+                    await f.abort(ids)
         except asyncio.CancelledError:
             raise
         except BaseException as e:      # noqa: BLE001
