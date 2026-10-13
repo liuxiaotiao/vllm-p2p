@@ -626,6 +626,9 @@ async def _run(args) -> int:
                          "n": sum(f["n"] for f in floors)}
                 lim = max(tol, 3 * floor["max_lp_diff"])
                 cmp["ok_lp"] = cmp["max_lp_diff"] <= lim
+                # 分叉处的「近似平票」也按噪声底放宽：整模型自己换个批就会在差这么多的地方分叉
+                cmp["ok_tie"] = all(r["tie_gap"] is None or r["tie_gap"] <= max(2 * tol, lim)
+                                    for r in cmp["rows"])
                 cmp["ok"] = cmp["ok_lp"] and cmp["ok_tie"]
                 cmp["lp_limit"] = lim
             differ = (sum(a["tokens"] != b["tokens"] for a, b in zip(refs[0], refs[1]))
