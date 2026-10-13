@@ -101,3 +101,23 @@ def test_user_env_overrides_detected_nic() -> None:
     cmd = f"VLLM_PP_LAYER_PARTITION=8 /v/bin/vllm serve /w {FLAG} {NAME}"
     script = L.remote_start(cmd, NAME, "N01", {"GLOO_SOCKET_IFNAME": "eth9"}, "192.168.1.2")
     assert script.index("GLOO_SOCKET_IFNAME=$P2P_IF") < script.index("GLOO_SOCKET_IFNAME=eth9")
+
+
+def test_ident_command_uses_the_channel_venv(tmp_path) -> None:
+    """识别服务用通道命令里 vllm 所在的 venv，跑在前段节点上，带上清单的 L₀ 与 task。"""
+    cmd = ("VLLM_PP_LAYER_PARTITION=8,13,27 /home/ubuntu/venvs/vllm-p2p/bin/vllm serve /w/q3 "
+           f"{FLAG} gsm8k-0 --node-rank 0 --hf-overrides \"$(cat /x/ov.json)\"")
+    back = cmd.replace("--node-rank 0", "--node-rank 1")
+    chans = [{"name": "gsm8k-0", "task": "gsm8k",
+              "commands": [{"node": "N01", "host": "192.168.1.2", "cmd": cmd},
+                           {"node": "N03", "host": "192.168.1.6", "cmd": back}]},
+             {"name": "mbpp-0", "task": "mbpp", "commands": []}]
+    host, c = L.ident_command(chans, {"l0": 8, "model_dir": "/w/q3"}, "N01", port=8100,
+                              src="/home/ubuntu/vllm-p2p", p2p_framework="/p2p",
+                              lr_model="/p2p/sel.npz", tasks=None)
+    assert host == "192.168.1.2"
+    assert c.startswith("/home/ubuntu/venvs/vllm-p2p/bin/python "
+                        "/home/ubuntu/vllm-p2p/vllm/p2p/identifier.py --p2p-identifier")
+    assert "--tasks gsm8k=1,mbpp=1" in c and "--l0 8" in c and "--model-dir /w/q3" in c
+    assert L.venv_of(c) == "/home/ubuntu/venvs/vllm-p2p"
+    assert "[-]-p2p-identifier" in L.ident_running()

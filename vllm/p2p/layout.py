@@ -47,6 +47,7 @@ __all__ = [
     "ARCH", "Stage", "Channel", "HostInfo", "LayoutError",
     "load_plan", "pair_static", "channels_from_plan", "parse_hosts",
     "parse_layer_experts", "localize_expert_name", "expert_key", "channel_dtype",
+    "parse_gpu_mem_node",
 ]
 
 ARCH = "Qwen3MoePartialForCausalLM"
@@ -118,15 +119,22 @@ class Channel:
         """只列**没装全**的层（1-based）。装全的层按原生 Qwen3-MoE 构造。"""
         return {l: es for l, es in self.layer_experts().items() if len(es) < self.n_experts}
 
-    def hf_overrides(self, *, miss_policy: str = "local_topk") -> dict:
-        """给 `vllm serve --hf-overrides` 的 dict。键是 **0-based** 层号的字符串。"""
-        return {
+    def hf_overrides(self, *, miss_policy: str = "local_topk",
+                     stats: Mapping | None = None) -> dict:
+        """给 `vllm serve --hf-overrides` 的 dict。键是 **0-based** 层号的字符串。
+
+        `stats`：开 A5 统计钩子（`vllm/p2p/stats.py`），如 `{"lr_layers": [0, …, 7]}`。
+        不给 = 不开，模型前向与没有钩子时逐位相同。"""
+        d = {
             "architectures": [ARCH],
             "p2p_layer_experts": {str(l - 1): list(es)
                                   for l, es in sorted(self.partial_layers().items())},
             "p2p_miss_policy": miss_policy,
             "p2p_channel": self.name,
         }
+        if stats is not None:
+            d["p2p_stats"] = dict(stats)
+        return d
 
     def resident_fraction(self) -> float:
         le = self.layer_experts()
@@ -396,13 +404,22 @@ def serve_commands(
     master_port: int = 29500,
     max_model_len: int = 4096,
     gpu_mem: float = 0.90,
+    gpu_mem_node: Mapping[str, float] | None = None,
     attention_backend: str | None = "TRITON_ATTN",
+    prefix_caching: bool = False,
     extra: Sequence[str] = (),
 ) -> list[tuple[str, str]]:
     """逐节点的启动命令 → [(节点, 命令)]，按 node_rank 排。
 
-    node_rank 0（前段节点）起 API 服务器，其余 `--headless`。三台的参数除 node_rank 与
-    headless 外必须一字不差 —— 所以由同一处生成。
+    node_rank 0（前段节点）起 API 服务器，其余 `--headless`。三台的参数除 node_rank、
+    headless 与逐节点的显存比例（`gpu_mem_node`）外必须一字不差 —— 所以由同一处生成。
+
+    `gpu_mem_node`：个别节点要给别的进程让显存时用（如 A4 的识别服务与前段 vLLM 同卡）。
+    显存比例是**每台各自**生效的（每台 worker 按本机的 `--gpu-memory-utilization` 算 KV），
+    所以只改那一台、不影响其余各级。
+
+    `prefix_caching` 默认关：本框架没有前缀缓存（每条 prompt 整段 prefill），开了的话同一
+    模板前缀会被复用，TTFT 不可比；A5 的统计也只能看到真正算过的 token。
     """
     missing = [v for v in ch.nodes if v not in hosts]
     if missing:
@@ -418,7 +435,8 @@ def serve_commands(
             "--master-addr", head, "--master-port", str(master_port),
             "--dtype", dtype,
             "--max-model-len", str(max_model_len),
-            "--gpu-memory-utilization", f"{gpu_mem:g}",
+            "--gpu-memory-utilization", f"{(gpu_mem_node or {}).get(v, gpu_mem):g}",
+            *([] if prefix_caching else ["--no-enable-prefix-caching"]),
             *extra,
         ]
         if attention_backend:
@@ -433,6 +451,21 @@ def serve_commands(
         env = f"VLLM_PP_LAYER_PARTITION={ch.partition_env}"
         cmd = f'{env} {cmd} --hf-overrides "$(cat {shlex.quote(overrides_path)})"'
         out.append((v, cmd))
+    return out
+
+
+def parse_gpu_mem_node(items: Sequence[str]) -> dict[str, float]:
+    """["N01=0.5", "N09=0.6"] → {"N01": 0.5, "N09": 0.6}。"""
+    out: dict[str, float] = {}
+    for it in items:
+        node, eq, val = str(it).partition("=")
+        try:
+            f = float(val)
+        except ValueError:
+            f = -1.0
+        if not eq or not node.strip() or not 0.0 < f <= 1.0:
+            raise LayoutError(f"--gpu-mem-node {it!r} 要写成 节点=比例（0 < 比例 ≤ 1），如 N01=0.5")
+        out[node.strip()] = f
     return out
 
 
@@ -476,6 +509,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--master-port", type=int, default=29500)
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
+    ap.add_argument("--gpu-mem-node", action="append", default=[], metavar="节点=比例",
+                    help="逐节点覆盖 --gpu-mem，可重复，如 --gpu-mem-node N01=0.5"
+                         "（A4 的识别服务与 N01 的前段同卡时给它让显存）")
+    ap.add_argument("--prefix-caching", action="store_true",
+                    help="开 vLLM 的前缀缓存（默认关：本框架没有前缀缓存，开了 TTFT 不可比）")
+    ap.add_argument("--stats", action="store_true",
+                    help="开 A5 统计钩子：逐请求的全量路由 top-k、后段 miss、前 L₀ 层 LR 特征，"
+                         "落到各节点的 $VLLM_P2P_STATS_DIR（默认 /tmp/p2p_stats）")
+    ap.add_argument("--lr-layers", default=None,
+                    help="--stats 时按 body token 聚合哪些层（0-based，逗号分隔）；默认前 L₀ 层")
     ap.add_argument("--n-layers", type=int, default=None)
     ap.add_argument("--n-experts", type=int, default=None)
     args = ap.parse_args(argv)
@@ -490,6 +533,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     hosts = parse_hosts(args.hosts) if args.hosts else {}
     sm75 = [x.strip() for x in args.sm75.split(",") if x.strip()]
+    try:
+        gmn = parse_gpu_mem_node(args.gpu_mem_node)
+    except LayoutError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    known = {v for ch in chans for v in ch.nodes}
+    stray = sorted(set(gmn) - known)
+    if stray:
+        print(f"✗ --gpu-mem-node 里的 {stray} 不在任何通道里（有的是 {sorted(known)}）",
+              file=sys.stderr)
+        return 2
+    stats = None
+    if args.stats:
+        lr = ([int(x) for x in args.lr_layers.split(",") if x.strip()]
+              if args.lr_layers else list(range(int(plan["l0"]))))
+        stats = {"lr_layers": lr}
 
     args.out.mkdir(parents=True, exist_ok=True)
     remote = (args.remote_out or str(args.out)).rstrip("/")
@@ -507,19 +566,27 @@ def main(argv: list[str] | None = None) -> int:
             dtype, why = args.dtype, []
         print(describe(ch, dtype, why))
         ov = args.out / f"{ch.name}.overrides.json"
-        ov.write_text(json.dumps(ch.hf_overrides(miss_policy=args.miss_policy),
+        ov.write_text(json.dumps(ch.hf_overrides(miss_policy=args.miss_policy, stats=stats),
                                  separators=(",", ":")), encoding="utf-8")
         entry = {"name": ch.name, "task": ch.task, "front": ch.front, "back": ch.back,
                  "nodes": ch.nodes, "partition": ch.partition, "dtype": dtype,
                  "attention_backend": args.attention_backend or None,
-                 "port": args.port, "overrides": str(ov)}
+                 "port": args.port, "overrides": str(ov),
+                 "gpu_mem": {v: gmn.get(v, args.gpu_mem) for v in ch.nodes},
+                 "prefix_caching": bool(args.prefix_caching),
+                 "stats": stats,
+                 "stages": [{"node": s.node, "role": s.role, "layers": [s.lo, s.hi],
+                             "n_experts": round(sum(len(e) for e in s.layer_experts.values())
+                                                / s.n_layers, 1)} for s in ch.stages]}
         if hosts:
             cmds = serve_commands(ch, hosts, model_dir=args.model_dir,
                                   overrides_path=f"{remote}/{ov.name}", dtype=dtype,
                                   vllm_bin=args.vllm_bin, port=args.port,
                                   master_port=args.master_port,
                                   max_model_len=args.max_model_len, gpu_mem=args.gpu_mem,
-                                  attention_backend=args.attention_backend or None)
+                                  gpu_mem_node=gmn,
+                                  attention_backend=args.attention_backend or None,
+                                  prefix_caching=args.prefix_caching)
             entry["api"] = f"http://{hosts[ch.nodes[0]].host}:{args.port}/v1"
             entry["commands"] = [{"node": v, "host": hosts[v].host, "cmd": c} for v, c in cmds]
             sh = args.out / f"{ch.name}.sh"
@@ -530,7 +597,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    API {entry['api']}   命令见 {sh}")
         summary.append(entry)
     (args.out / "channels.json").write_text(
-        json.dumps({"plan": str(args.plan), "l0": plan["l0"], "channels": summary},
+        json.dumps({"plan": str(args.plan), "l0": plan["l0"],
+                    "n_layers": chans[0].n_layers if chans else None,
+                    "n_experts": chans[0].n_experts if chans else None,
+                    "model_dir": args.model_dir, "channels": summary},
                    ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已写 {args.out}/channels.json")
     return 0

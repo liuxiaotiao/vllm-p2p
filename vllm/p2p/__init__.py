@@ -11,7 +11,16 @@
   与逐节点 `vllm serve` 命令。纯 Python，控制机上不装 vLLM 也能按文件路径直接跑。
 * `vllm/p2p/parity.py` —— 单卡对拍（vLLM 原生 / 部分专家模型 / p2p-framework 参考实现）。
 * `vllm/p2p/envcheck.py` —— 安装脚本每一步的「就绪了吗」检查。
-* `tests/p2p/` —— `layout.py` 的单测。
+* `vllm/p2p/launch.py` —— 按 `channels.json` 拉起 / 查看 / 停止通道与识别服务（控制机，纯 Python）。
+* `vllm/p2p/gateway.py` —— A3/A4：按 task 分发的 OpenAI 兼容网关（oracle / lr / shadow）。
+* `vllm/p2p/identifier.py` —— A4：前 L₀ 层 + LR 的识别服务（复用 p2p-framework 的执行层与 LR）。
+* `vllm/p2p/bench.py` —— A3：闭环压测，结果与 p2p-framework 的 results/*.json 同构。
+* `vllm/p2p/stats.py` —— A5：worker 内的逐请求路由统计（全量 top-k → miss、LR 特征）；
+  模型里的写入在 `qwen3_moe_partial.py`（自定义算子 `vllm.p2p_route_select`），
+  逐请求切分在 `vllm/v1/worker/gpu_model_runner.py` 的两处钩子（`p2p_stats`）。
+* `vllm/entrypoints/openai/serving_completion.py` —— 网关发来的请求在最后的 usage 块里附
+  引擎侧的逐请求时间（`p2p_metrics`：排队 / prefill / decode）。
+* `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）
 
@@ -41,5 +50,6 @@ moe 本身不改；装完约 10 GiB），装 torch 2.9.1（含 CUDA 12 库）与
 venv 只借用 moe 的 Python 解释器（不读它的包），所以不要删 moe 环境。ssh 非交互 shell 不会 activate venv，
 所以 `vllm/p2p/layout.py` 生成命令时用 `--vllm-bin /home/ubuntu/venvs/vllm-p2p/bin/vllm`。
 
-本包刻意不在 `__init__` 里 import 任何东西 —— `layout.py` 要能在没有 torch 的控制机上跑。
+本包刻意不在 `__init__` 里 import 任何东西 —— `layout.py` / `launch.py` 要能在没有 torch 的
+控制机上跑；`gateway.py` / `bench.py` / `identifier.py` 也按文件路径运行（同目录互相 import）。
 """

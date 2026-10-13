@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.attention.layer import Attention, MLAAttention
+from vllm.p2p import stats as p2p_stats  # P2P 移植 A5：逐请求路由统计（默认关）
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -844,6 +845,10 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # P2P 移植 A5：请求结束 → 逐请求统计落盘（只有 p2p_stats 开着时才有收集器）
+        if (_p2p := p2p_stats.get_collector()) is not None and \
+                scheduler_output.finished_req_ids:
+            _p2p.finish(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -3295,6 +3300,12 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # P2P 移植 A5：把本步各层的全量路由 top-k 按请求切开累加（每步一次同步）
+        if (_p2p := p2p_stats.get_collector()) is not None:
+            _p2p.on_step(
+                req_ids[:num_reqs], num_scheduled_tokens_np,
+                self.positions.np[:num_tokens_unpadded].copy(), self.requests)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

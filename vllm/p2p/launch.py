@@ -9,6 +9,10 @@
     python3 vllm/p2p/launch.py stop   gsm8k-0          # 停掉
     python3 vllm/p2p/launch.py status all              # 所有通道
 
+    # A4 的识别服务（前 L₀ 层 + LR）：起在一台前段节点上（它本地有层 1..L₀ 的全专家权重）
+    python3 vllm/p2p/launch.py ident-start  N01 [--ident-port 8100] [--lr-model …]
+    python3 vllm/p2p/launch.py ident-status N01 | ident-logs N01 | ident-stop N01
+
 `channels.json` 由 `vllm/p2p/layout.py --hosts … --out DIR` 生成（默认读
 /home/ubuntu/vllm-p2p/p2p_channels/channels.json，`--channels` 可改）。各级的启动命令、
 地址都在里面，这里只负责 ssh 过去执行 —— 命令本身一个字不改，保证与 layout 生成的一致。
@@ -47,12 +51,14 @@ def match_pattern(channel: str) -> str:
 
 
 def venv_of(cmd: str) -> str | None:
-    """从启动命令里认出 venv：命令里的 vllm 是绝对路径 `<venv>/bin/vllm` 时返回 `<venv>`。"""
+    """从启动命令里认出 venv：命令里的程序是绝对路径 `<venv>/bin/vllm`（或 `/bin/python`）时
+    返回 `<venv>`。"""
     for tok in shlex.split(cmd.split(" --hf-overrides ", 1)[0]):
         if "=" in tok and not tok.startswith("/"):
             continue                      # 开头的 VAR=值
-        if tok.endswith("/bin/vllm"):
-            return tok[: -len("/bin/vllm")]
+        for exe in ("/bin/vllm", "/bin/python", "/bin/python3"):
+            if tok.endswith(exe):
+                return tok[: -len(exe)]
         return None
     return None
 
@@ -236,6 +242,115 @@ def cmd_errors(c: dict, user: str, n: int) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# A4 识别服务
+# --------------------------------------------------------------------------- #
+IDENT_PATTERN = "[-]-p2p-identifier"
+
+
+def ident_log(node: str) -> str:
+    return f"/tmp/p2p_identifier_{node}.log"
+
+
+def find_node(chans: list[dict], node: str) -> tuple[dict, dict]:
+    """节点 id → (它所在的通道, 那一级的命令条目)。"""
+    for c in chans:
+        for st in c.get("commands", []):
+            if st["node"] == node:
+                return c, st
+    raise SystemExit(f"channels.json 里没有节点 {node}")
+
+
+def ident_command(chans: list[dict], cj: dict, node: str, *, port: int, src: str,
+                  p2p_framework: str, lr_model: str, tasks: str | None,
+                  extra: str = "") -> tuple[str, str]:
+    """→ (host, 命令)。解释器取通道命令里 vllm 所在的 venv（同一个 venv 里有 torch/aiohttp）。"""
+    c, st = find_node(chans, node)
+    if not st["cmd"].split("--node-rank ", 1)[1].startswith("0 "):
+        print(f"  ⚠ {node} 不是前段节点（不是 node_rank 0）—— 它本地多半没有层 1..L₀ 的全专家权重")
+    venv = venv_of(st["cmd"])
+    if venv is None:
+        raise SystemExit("通道命令里的 vllm 不是 venv 里的绝对路径，认不出解释器 —— "
+                         "layout.py 生成时给 --vllm-bin /home/ubuntu/venvs/vllm-p2p/bin/vllm")
+    model_dir = cj.get("model_dir") or shlex.split(st["cmd"].split(" serve ", 1)[1])[0]
+    tasks = tasks or ",".join(f"{u}=1" for u in sorted({x["task"] for x in chans}))
+    args = [f"{venv}/bin/python", f"{src.rstrip('/')}/vllm/p2p/identifier.py", "--p2p-identifier",
+            "--p2p-framework", p2p_framework, "--model-dir", model_dir, "--lr-model", lr_model,
+            "--tasks", tasks, "--l0", str(cj["l0"]), "--device", "cuda:0",
+            "--dtype", "float16", "--port", str(port)]
+    return st["host"], " ".join(shlex.quote(x) for x in args) + (f" {extra}" if extra else "")
+
+
+def ident_running() -> str:
+    return f"pgrep -f -- {shlex.quote(IDENT_PATTERN)} || true"
+
+
+def ident_stop() -> str:
+    pat = shlex.quote(IDENT_PATTERN)
+    return (f"pkill -TERM -f -- {pat}; for i in $(seq 15); do pgrep -f -- {pat} >/dev/null || exit 0; "
+            f"sleep 1; done; pkill -KILL -f -- {pat}; true")
+
+
+def cmd_ident(action: str, node: str, a, chans: list[dict], cj: dict, env: dict) -> int:
+    c, st = find_node(chans, node)
+    host = st["host"]
+    url = f"http://{host}:{a.ident_port}"
+    if action == "ident-start":
+        if _ssh(host, a.user, ident_running()).stdout.strip():
+            print(f"  ✗ {node} 上识别服务已经在跑 —— 先 ident-stop")
+            return 1
+        host, cmd = ident_command(chans, cj, node, port=a.ident_port, src=a.src,
+                                  p2p_framework=a.p2p_framework, lr_model=a.lr_model,
+                                  tasks=a.tasks, extra=a.ident_args)
+        venv = venv_of(cmd)
+        act = (f"export VIRTUAL_ENV={shlex.quote(venv)}; "
+               f"export PATH={shlex.quote(venv + '/bin')}:$PATH; ") if venv else ""
+        exports = act + "".join(f"export {k}={shlex.quote(v)}; " for k, v in sorted(env.items()))
+        inner = f"{exports}exec {cmd}"
+        r = _ssh(host, a.user, f"cd /tmp || exit 1; nohup bash -c {shlex.quote(inner)} > "
+                               f"{shlex.quote(ident_log(node))} 2>&1 < /dev/null & echo $!")
+        if r.returncode != 0:
+            print(f"  ✗ 启动失败：{r.stderr.strip()[:300]}")
+            return 1
+        print(f"  → {node}@{host} 识别服务 pid {r.stdout.strip()}，日志 {ident_log(node)}")
+        t0 = time.time()
+        while time.time() - t0 < a.wait:
+            try:
+                with urllib.request.urlopen(f"{url}/info", timeout=3) as resp:
+                    print(f"  ✓ 就绪（{time.time() - t0:.0f}s）：{resp.read().decode()[:400]}")
+                    print(f"    网关：python vllm/p2p/gateway.py --mode lr --identifier {url} …")
+                    return 0
+            except Exception:                                 # noqa: BLE001
+                pass
+            if not _ssh(host, a.user, ident_running()).stdout.strip():
+                print("  ✗ 进程退出了，日志最后几行：")
+                print(_ssh(host, a.user, f"tail -n 30 {shlex.quote(ident_log(node))}").stdout)
+                return 1
+            time.sleep(5)
+        print(f"  ✗ {a.wait:.0f}s 内没就绪 —— python3 {sys.argv[0]} ident-logs {node}")
+        return 1
+    if action == "ident-status":
+        pids = _ssh(host, a.user, ident_running()).stdout.split()
+        up = False
+        try:
+            with urllib.request.urlopen(f"{url}/info", timeout=3) as resp:
+                info = resp.read().decode()
+                up = True
+        except Exception:                                     # noqa: BLE001
+            info = ""
+        print(f"识别服务 {node}@{host}  {'✓ ' + url if up else '✗ 不通'}  "
+              f"{'pid ' + ','.join(pids) if pids else '没有进程'}")
+        if info:
+            print(f"    {info[:400]}")
+        return 0 if up else 1
+    if action == "ident-logs":
+        print(_ssh(host, a.user, f"tail -n {int(a.n)} {shlex.quote(ident_log(node))}").stdout)
+        return 0
+    _ssh(host, a.user, ident_stop(), timeout=60)
+    print(f"  ■ {node}@{host} 识别服务已停")
+    return 0
+
+
 def cmd_stop(c: dict, user: str) -> int:
     for st in c["commands"]:
         _ssh(st["host"], user, remote_stop(c["name"]), timeout=60)
@@ -246,16 +361,31 @@ def cmd_stop(c: dict, user: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("start", "status", "logs", "errors", "stop"))
-    ap.add_argument("channel", help="通道名（如 gsm8k-0），或 all")
+    ap.add_argument("action", choices=("start", "status", "logs", "errors", "stop",
+                                       "ident-start", "ident-status", "ident-logs", "ident-stop"))
+    ap.add_argument("channel", help="通道名（如 gsm8k-0），或 all；ident-* 时是节点 id（如 N01）")
     ap.add_argument("--channels", default=DEFAULT_CHANNELS, help="layout.py 生成的 channels.json")
     ap.add_argument("--user", default="ubuntu", help="ssh 用户")
     ap.add_argument("--env", action="append", default=[], metavar="K=V",
                     help="额外环境变量，如 NCCL_SOCKET_IFNAME=eth0（多网卡时 NCCL 选错网卡会卡在初始化）")
     ap.add_argument("--wait", type=float, default=900, help="start 后等 API 就绪的秒数（0 = 不等）")
     ap.add_argument("-n", type=int, default=40, help="logs 显示的行数")
+    g = ap.add_argument_group("识别服务（ident-*）")
+    g.add_argument("--ident-port", type=int, default=8100)
+    g.add_argument("--src", default="/home/ubuntu/vllm-p2p", help="节点上 vllm-p2p 源码目录")
+    g.add_argument("--p2p-framework", default="/home/ubuntu/p2p-framework")
+    g.add_argument("--lr-model",
+                   default="/home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz")
+    g.add_argument("--tasks", default=None, help="默认 = 通道里出现的 task，先验各 1")
+    g.add_argument("--ident-args", default="", help="原样追加给 identifier.py 的参数")
     a = ap.parse_args(argv)
     env = dict(kv.split("=", 1) for kv in a.env)
+    if a.action.startswith("ident-"):
+        p = Path(a.channels)
+        if not p.is_file():
+            raise SystemExit(f"找不到 {p}")
+        cj = json.loads(p.read_text(encoding="utf-8"))
+        return cmd_ident(a.action, a.channel, a, _load(a.channels), cj, env)
     rc = 0
     for c in _pick(_load(a.channels), a.channel):
         if a.action == "start":

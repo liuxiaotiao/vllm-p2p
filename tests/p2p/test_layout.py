@@ -308,3 +308,39 @@ def test_expert_key_sees_every_localized_expert() -> None:
     want = {(l, i, p) for l in range(4) for i in range(len(le.get(l, range(8))))
             for p in ("gate_proj", "up_proj", "down_proj")}
     assert seen == want
+
+
+def test_gpu_mem_node_stats_and_prefix_caching(tmp_path) -> None:
+    """A4：识别服务与 N01 的前段同卡时只降 N01 的显存比例；A5：--stats 进 hf_overrides；
+    前缀缓存默认关（本框架没有前缀缓存，开了 TTFT 不可比）。"""
+    if not (PLAN.exists() and HOSTS.exists()):
+        pytest.skip("清单或 hosts 不在")
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--gpu-mem", "0.95", "--gpu-mem-node", "N01=0.5", "--stats"]) == 0
+    cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
+    assert cj["n_experts"] == 128 and cj["n_layers"] == 48
+    g0 = next(c for c in cj["channels"] if c["name"] == "gsm8k-0")
+    assert g0["gpu_mem"] == {"N01": 0.5, "N03": 0.95, "N05": 0.95}
+    cmds = {x["node"]: x["cmd"] for x in g0["commands"]}
+    assert "--gpu-memory-utilization 0.5 " in cmds["N01"]
+    assert "--gpu-memory-utilization 0.95 " in cmds["N03"]
+    assert all("--no-enable-prefix-caching" in c for c in cmds.values())
+    ov = json.loads((out / "gsm8k-0.overrides.json").read_text(encoding="utf-8"))
+    assert ov["p2p_stats"] == {"lr_layers": list(range(8))}
+    # 其它通道不受 N01 的影响
+    g1 = next(c for c in cj["channels"] if c["name"] == "gsm8k-1")
+    assert set(g1["gpu_mem"].values()) == {0.95}
+    # 写错节点名 / 比例要报错
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--gpu-mem-node", "N99=0.5"]) == 2
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--gpu-mem-node", "N01=1.5"]) == 2
+    # 不给 --stats 时 overrides 里没有它；--prefix-caching 时不加关闭开关
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--prefix-caching"]) == 0
+    ov = json.loads((out / "gsm8k-0.overrides.json").read_text(encoding="utf-8"))
+    assert "p2p_stats" not in ov
+    cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
+    assert not any("--no-enable-prefix-caching" in x["cmd"]
+                   for c in cj["channels"] for x in c["commands"])

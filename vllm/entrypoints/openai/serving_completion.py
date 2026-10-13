@@ -342,6 +342,10 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        # P2P 移植（A3）：网关发来的请求（vllm_xargs 里有 p2p_id）在最后的 usage 块里
+        # 附上引擎自己量的逐请求时间（排队 / prefill / decode），压测据此算「去排队」的指标
+        p2p_want = bool(request.vllm_xargs and "p2p_id" in request.vllm_xargs)
+        p2p_last_metrics = None
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -352,6 +356,8 @@ class OpenAIServingCompletion(OpenAIServing):
             async for prompt_idx, res in result_generator:
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
+                if p2p_want and res.metrics is not None:
+                    p2p_last_metrics = res.metrics
 
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
@@ -498,6 +504,8 @@ class OpenAIServingCompletion(OpenAIServing):
                     choices=[],
                     usage=final_usage_info,
                 )
+                if p2p_want:
+                    final_usage_chunk.p2p_metrics = _p2p_metrics(p2p_last_metrics)
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
                 )
@@ -738,3 +746,22 @@ class OpenAIServingCompletion(OpenAIServing):
             cache_salt=request.cache_salt,
             needs_detokenization=bool(request.echo and not request.return_token_ids),
         )
+
+
+def _p2p_metrics(m) -> dict | None:
+    """RequestStateStats → 毫秒。queued/scheduled/first/last_token_ts 是引擎核心的单调时钟
+    （同一台机器上，可以相减）；arrival_time 是前端的墙钟；first_token_latency 从到达算起。"""
+    if m is None:
+        return None
+
+    def ms(a: float, b: float) -> float | None:
+        return round((b - a) * 1000.0, 3) if a > 0 and b > 0 else None
+
+    return {
+        "arrival_time": m.arrival_time,
+        "queued_ms": ms(m.queued_ts, m.scheduled_ts),
+        "prefill_ms": ms(m.scheduled_ts, m.first_token_ts),
+        "decode_ms": ms(m.first_token_ts, m.last_token_ts),
+        "ttft_ms": round(m.first_token_latency * 1000.0, 3) if m.first_token_latency else None,
+        "num_generation_tokens": m.num_generation_tokens,
+    }

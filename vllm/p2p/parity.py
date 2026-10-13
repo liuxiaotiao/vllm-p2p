@@ -19,6 +19,8 @@ vllm-0.14.0 旁边的 `p2p-framework/`，或者用 `--p2p-framework` / 环境变
     partial-sub    Qwen3MoePartialForCausalLM，第 2/3 层只装子集 —— A1 要验的东西
     ref-full       p2p-framework TorchSegmentModel，全装
     ref-sub        p2p-framework TorchSegmentModel，同样的子集，miss_policy=local_topk
+    partial-stats  partial-sub + A5 统计钩子（p2p_stats）—— 输出必须与 partial-sub **逐位相同**，
+                   钩子记下的逐请求 miss 与 body 计数要与 ref-sub 自己数的一致
 
 判据（为什么不直接比贪心输出）：随机权重的 logits 很平，top-1 与 top-2 间距小，两套不同的
 kernel（融合 MoE / paged attention vs 逐专家 matmul）累加顺序不同，argmax 翻一次整条
@@ -88,6 +90,9 @@ PARITY_CFG = {
 
 # 0-based 层 → 驻留专家。第 3 层只有 3 个 < top_k=4：走 min(top_k, n) 那条分支
 PARTIAL = {2: [1, 4, 6, 9, 11, 14], 3: [0, 7, 13]}
+# A5 钩子对拍：前两层按 body 计数（LR 特征的口径），body = prompt 的第 1..4 个 token
+STATS_LR_LAYERS = [0, 1]
+STATS_BODY = "1:5"
 
 PROMPTS = [
     [5, 17, 99, 230, 41, 8, 300, 12],
@@ -108,7 +113,10 @@ def _vllm_child(argv: list[str]) -> int:
     ap.add_argument("--tokens", type=int, required=True)
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--stats-dir", default="")
     a = ap.parse_args(argv)
+    if a.stats_dir:
+        os.environ["VLLM_P2P_STATS_DIR"] = a.stats_dir      # worker 进程继承
 
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
@@ -120,7 +128,18 @@ def _vllm_child(argv: list[str]) -> int:
     llm = LLM(**kw)
     sp = SamplingParams(temperature=0.0, max_tokens=a.tokens, logprobs=5, ignore_eos=True,
                         detokenize=False)
-    outs = llm.generate([TokensPrompt(prompt_token_ids=p) for p in PROMPTS], sp)
+    if a.stats_dir:
+        # 每条带上 p2p_id 与 body 区间（与网关转发时一样经 extra_args 进 worker）
+        sps = [SamplingParams(temperature=0.0, max_tokens=a.tokens, logprobs=5, ignore_eos=True,
+                              detokenize=False,
+                              extra_args={"p2p_id": f"p{i}", "p2p_body": STATS_BODY})
+               for i in range(len(PROMPTS))]
+        outs = llm.generate([TokensPrompt(prompt_token_ids=p) for p in PROMPTS], sps)
+        # 最后一批的「结束」要等下一步调度才送到 worker —— 再跑一条，把它们送出去
+        llm.generate([TokensPrompt(prompt_token_ids=[3, 4, 5])],
+                     SamplingParams(temperature=0.0, max_tokens=1, detokenize=False))
+    else:
+        outs = llm.generate([TokensPrompt(prompt_token_ids=p) for p in PROMPTS], sp)
     res = []
     for o in outs:
         c = o.outputs[0]
@@ -135,9 +154,11 @@ def _vllm_child(argv: list[str]) -> int:
 
 
 def _run_vllm(ckpt: Path, dtype: str, overrides: dict | None, tokens: int, eager: bool,
-              out: Path) -> dict:
+              out: Path, stats_dir: Path | None = None) -> dict:
     cmd = [sys.executable, "-m", "vllm.p2p.parity", "_vllm", "--ckpt", str(ckpt),
            "--dtype", dtype, "--tokens", str(tokens), "--out", str(out)]
+    if stats_dir is not None:
+        cmd += ["--stats-dir", str(stats_dir)]
     if overrides is not None:
         cmd += ["--overrides", json.dumps(overrides)]
     if eager:
@@ -169,6 +190,19 @@ class _Ref:
         assert not rep.missing, rep.missing[:3]
         self.m = TorchSegmentModel(mc, le, tensors, device=device, miss_policy="local_topk")
         self.torch = torch
+
+    def stats(self, ids: list[int], body: tuple[int, int]) -> tuple[dict, int, int]:
+        """沿 ids 做一次 prefill，返回 (body 位置上的逐层 LayerStat, miss (token,层) 数, token×层)。"""
+        import numpy as np
+
+        torch = self.torch
+        m = np.zeros(len(ids), dtype=bool)
+        m[body[0]:min(body[1], len(ids))] = True
+        req = f"s{len(ids)}-{ids[0]}"
+        with torch.no_grad():
+            _, st = self.m.forward(req, self.m.embed_tokens(ids), count_mask=m)
+        self.m.drop_kv(req)
+        return st.layers, st.miss_token_layer, st.n_token_layer
 
     def teacher_forced(self, prompt: list[int], gen: list[int]) -> list[dict]:
         """沿 prompt+gen 做一次 prefill，返回生成的每一步的 log_softmax（top-5 + 选中 token）。"""
@@ -246,10 +280,17 @@ def main(argv: list[str] | None = None) -> int:
     full_ov = {"architectures": [ARCH], "p2p_layer_experts": {}}
     part_ov = {"architectures": [ARCH],
                "p2p_layer_experts": {str(k): v for k, v in PARTIAL.items()}}
+    stats_ov = dict(part_ov, p2p_stats={"lr_layers": STATS_LR_LAYERS}, p2p_channel="parity")
+    stats_dir = wd / "stats"
+    if stats_dir.exists():
+        for f in stats_dir.glob("*.jsonl"):
+            f.unlink()
     runs = {}
-    for name, ov in (("stock", None), ("partial-full", full_ov), ("partial-sub", part_ov)):
+    for name, ov in (("stock", None), ("partial-full", full_ov), ("partial-sub", part_ov),
+                     ("partial-stats", stats_ov)):
         print(f"  vLLM {name} …", flush=True)
-        runs[name] = _run_vllm(ckpt, a.dtype, ov, a.tokens, a.eager, wd / f"{name}.json")
+        runs[name] = _run_vllm(ckpt, a.dtype, ov, a.tokens, a.eager, wd / f"{name}.json",
+                               stats_dir if name == "partial-stats" else None)
         print(f"    架构 {runs[name]['arch']}")
 
     ref_full = _Ref(ckpt, {}, a.device)
@@ -296,6 +337,46 @@ def main(argv: list[str] | None = None) -> int:
                    f"max |Δlogprob| {pt:.4f}（噪声底 {fl:.4f}，阈值 3×底+{tol:g}）"))
     checks.append(("top-5 重合", min(c["top5_overlap"] for c in part) >= 0.8,
                    f"最低 {min(c['top5_overlap'] for c in part):.0%}"))
+
+    # 4. A5 钩子：不改输出；记下的统计与参考实现自己数的一致
+    same = all(x["tokens"] == y["tokens"] and _cmp_steps(x["steps"], y["steps"])["max_lp_diff"]
+               <= 1e-5 for x, y in zip(runs["partial-sub"]["prompts"],
+                                       runs["partial-stats"]["prompts"]))
+    checks.append(("开统计钩子不改输出（≡ partial-sub）", same, "逐 token、逐 logprob"))
+    recs = {}
+    for f in sorted(stats_dir.glob("*.jsonl")):
+        for ln in f.read_text(encoding="utf-8").splitlines():
+            d = json.loads(ln)
+            if d.get("p2p_id"):
+                recs[d["p2p_id"]] = d
+    got_all = all(f"p{i}" in recs for i in range(len(PROMPTS)))
+    checks.append(("钩子为每条请求落了一行", got_all, f"{len(recs)}/{len(PROMPTS)} 条（{stats_dir}）"))
+    if got_all:
+        import numpy as np
+
+        from p2pmoe.runtime.model import LayerStat
+
+        b0, b1 = (int(x) for x in STATS_BODY.split(":"))
+        eq = tot = 0
+        dm = []
+        for i, p in enumerate(PROMPTS):
+            gen = runs["partial-stats"]["prompts"][i]["tokens"]
+            seen = list(p) + list(gen[:-1])          # 最后一个生成的 token 没有再进模型
+            lay, miss, ntl = ref_part.stats(seen, (b0, b1))
+            r = recs[f"p{i}"]
+            hook_miss = r["prefill"]["miss_token_layer"] + r["decode"]["miss_token_layer"]
+            hook_ntl = r["prefill"]["n_token_layer"] + r["decode"]["n_token_layer"]
+            dm.append(abs(hook_miss - miss) / max(ntl, 1))
+            for l0b in STATS_LR_LAYERS:
+                h = LayerStat.from_wire(r["lr_layers"][str(l0b + 1)])
+                tot += 1
+                eq += bool(np.array_equal(h.count, lay[l0b + 1].count))
+            if hook_ntl != ntl or r["n_seen"] != len(seen):
+                dm.append(1.0)
+        checks.append(("钩子的 body 逐层计数 = 参考实现", eq >= 0.9 * tot,
+                       f"{eq}/{tot} 层完全相同（随机权重上 fp 舍入偶尔会让并列的 top-k 换位）"))
+        checks.append(("钩子的 miss = 参考实现", max(dm) <= 0.02,
+                       f"max |Δmiss 率| = {max(dm):.4f}"))
 
     print()
     ok = True

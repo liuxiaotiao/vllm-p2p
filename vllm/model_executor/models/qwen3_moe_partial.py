@@ -38,6 +38,14 @@ PP 各级只建自己用得到的东西
 vLLM 的加载器是严格的（`default_loader.py`：每个参数都要有权重），会直接报错。
 这里按 Llama 的做法把用不到的换成 `PPMissingLayer`（加载器遇到它就跳过）。
 
+A5 统计钩子（hf_overrides 里有 `p2p_stats` 才开）
+----------------------------------------------
+每个 MoE 层（装全的层也算）在路由之后多走一个自定义算子 `vllm.p2p_route_select`：
+它返回交给 `FusedMoE` 的那份路由打分（与不开钩子时同一个张量运算，数值不变），顺带把
+**全量** softmax 的 top-k 写进 `vllm/p2p/stats.py` 的固定显存缓冲区。算子对 torch.compile
+是黑盒、在 CUDA Graph 里随图重放，所以开着钩子也能用 CUDA Graph。逐请求的切分与落盘在
+model runner 里做（见 `stats.py`）。
+
 逐专家核对
 ----------
 严格检查是**按参数**的：`experts.w13_weight` 是 n 个专家堆在一起的一个参数，只要其中
@@ -63,12 +71,14 @@ from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models import qwen3_moe as _q
 from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index
+from vllm.p2p import stats as _p2p_stats
 from vllm.p2p.layout import (
     LayoutError,
     expert_key,
     localize_expert_name,
     parse_layer_experts,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -79,6 +89,34 @@ SUPPORTED_MISS_POLICIES = ("local_topk",)
 # TODO(drop / drop_noscale)：全量 softmax 取 top-k、缺失的权重置 0（drop_noscale）或
 # 再重归一（drop）。走 FusedMoE 的 custom_routing_function，把全局专家号映射成本地号、
 # 缺失的映到任一本地专家且权重为 0。实验没用到，先不做。
+
+
+# --------------------------------------------------------------------------- #
+# A5：路由打分 → FusedMoE 的那一步，顺带记全量 top-k
+# --------------------------------------------------------------------------- #
+def p2p_route_select(router_logits: torch.Tensor, resident_idx: torch.Tensor,
+                     slot: int) -> torch.Tensor:
+    """返回 `router_logits[:, resident_idx]`（交给 FusedMoE），并把全量 top-k 记进统计缓冲区。
+
+    做成自定义算子是为了让「写缓冲区」这个副作用对 torch.compile 不可见、又不会被当成死代码
+    删掉（输出被 FusedMoE 用着）。装全的层传 arange(E)，返回的就是同一份打分。"""
+    st = _p2p_stats.get_collector()
+    if st is not None and slot >= 0:
+        st.capture(slot, router_logits)
+    return router_logits.index_select(-1, resident_idx)
+
+
+def _p2p_route_select_fake(router_logits: torch.Tensor, resident_idx: torch.Tensor,
+                           slot: int) -> torch.Tensor:
+    return router_logits.new_empty((router_logits.shape[0], resident_idx.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="p2p_route_select",
+    op_func=p2p_route_select,
+    mutates_args=[],
+    fake_impl=_p2p_route_select_fake,
+)
 
 
 _PARSED: dict[int, dict[int, tuple[int, ...]]] = {}
@@ -109,9 +147,18 @@ class PartialQwen3MoeSparseMoeBlock(_q.Qwen3MoeSparseMoeBlock):
         config = vllm_config.model_config.hf_text_config
         layer = extract_layer_index(prefix)
         resident = _layer_experts_of(config).get(layer)
+        st = _p2p_stats.get_collector()
         if resident is None:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
             self.resident: tuple[int, ...] | None = None
+            self.p2p_slot: int | None = None
+            if st is not None:
+                if self.is_sequence_parallel or self.enable_eplb or self.ep_size != 1:
+                    raise ValueError("A5 统计钩子不支持 sequence-parallel MoE / EP / EPLB")
+                self.p2p_slot = st.register_layer(layer, None)
+                self.register_buffer(
+                    "resident_idx", torch.arange(int(config.num_experts), dtype=torch.long),
+                    persistent=False)
             return
 
         nn.Module.__init__(self)
@@ -164,15 +211,20 @@ class PartialQwen3MoeSparseMoeBlock(_q.Qwen3MoeSparseMoeBlock):
         # （layout.localize_expert_name），两处必须一致。
         self.register_buffer(
             "resident_idx", torch.tensor(self.resident, dtype=torch.long), persistent=False)
+        self.p2p_slot = st.register_layer(layer, self.resident) if st is not None else None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.resident is None:
+        if self.resident is None and self.p2p_slot is None:
             return super().forward(hidden_states)
         assert hidden_states.dim() <= 2
         is_input_1d = hidden_states.dim() == 1
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         router_logits, _ = self.gate(hidden_states)                 # [T, E] 全量
-        local_logits = router_logits.index_select(-1, self.resident_idx)   # [T, n]
+        if self.p2p_slot is None:
+            local_logits = router_logits.index_select(-1, self.resident_idx)   # [T, n]
+        else:
+            local_logits = torch.ops.vllm.p2p_route_select(
+                router_logits, self.resident_idx, self.p2p_slot)
         out = self.experts(hidden_states=hidden_states, router_logits=local_logits)
         return out.squeeze(0) if is_input_1d else out
 
@@ -206,10 +258,23 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
             self_le = _layer_experts_of(config)
         except LayoutError as e:
             raise ValueError(f"hf_overrides 的 p2p_layer_experts 有误：{e}") from e
+        st = self._make_stats(vllm_config, config)
+        _p2p_stats.set_collector(st)
         with _partial_blocks():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.p2p_layer_experts = self_le
         self.p2p_miss_policy = policy
+        if st is not None:
+            sc = vllm_config.scheduler_config
+            cc = vllm_config.compilation_config
+            cap = max(int(sc.max_num_batched_tokens),
+                      int(getattr(cc, "max_cudagraph_capture_size", None) or 0)) + 16
+            dev = (torch.device("cuda", torch.cuda.current_device())
+                   if torch.cuda.is_available() else torch.device("cpu"))
+            st.allocate(cap, dev)
+            logger.info("p2p 统计钩子：%d 个 MoE 层（%s），LR 层 %s，写 %s",
+                        len(st.layers), f"{st.layers[0]}–{st.layers[-1]}" if st.layers else "无",
+                        [l for l in st.lr_layers if l in st.layers] or "无", st.path)
 
         # PP：只建这一级用得到的（见模块文档「PP 各级只建自己用得到的东西」）
         pp = get_pp_group()
@@ -230,6 +295,18 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
                 "p2p 部分专家：%s 层 [%d, %d)，其中 %d 层只装子集（层均 %.1f/%d 个专家），"
                 "miss_policy=%s", getattr(config, "p2p_channel", ""), here.start, here.stop,
                 len(part), avg, int(config.num_experts), policy)
+
+    @staticmethod
+    def _make_stats(vllm_config: VllmConfig, config) -> "_p2p_stats.RouteStats | None":
+        raw = getattr(config, "p2p_stats", None)
+        if not raw:
+            return None
+        raw = raw if isinstance(raw, dict) else {}
+        return _p2p_stats.RouteStats(
+            n_experts=int(config.num_experts), top_k=int(config.num_experts_per_tok),
+            norm_topk=bool(getattr(config, "norm_topk_prob", True)),
+            lr_layers=raw.get("lr_layers", ()), channel=getattr(config, "p2p_channel", ""),
+            pp_rank=get_pp_group().rank_in_group)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if isinstance(self.lm_head, PPMissingLayer):
