@@ -357,3 +357,22 @@ def test_max_num_seqs_is_passed_to_every_rank(tmp_path) -> None:
     assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out)]) == 0
     cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
     assert not any("--max-num-seqs" in x["cmd"] for c in cj["channels"] for x in c["commands"])
+
+
+def test_max_num_seqs_per_channel_override(tmp_path) -> None:
+    if not (PLAN.exists() and HOSTS.exists()):
+        pytest.skip("清单或 hosts 不在")
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--max-num-seqs", "8",
+                        "--max-num-seqs-channel", "no_robots-0=32"]) == 0
+    cj = json.loads((out / "channels.json").read_text(encoding="utf-8"))
+    by = {c["name"]: c for c in cj["channels"]}
+    assert by["no_robots-0"]["max_num_seqs"] == 32 and by["gsm8k-0"]["max_num_seqs"] == 8
+    assert all("--max-num-seqs 32 " in x["cmd"] for x in by["no_robots-0"]["commands"])
+    assert all("--max-num-seqs 8 " in x["cmd"] for x in by["gsm8k-0"]["commands"])
+    # 写错通道名 / 格式：直接报错，不悄悄忽略
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--max-num-seqs-channel", "no_robot=32"]) == 2
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out),
+                        "--max-num-seqs-channel", "no_robots-0"]) == 2

@@ -471,6 +471,21 @@ def parse_gpu_mem_node(items: Sequence[str]) -> dict[str, float]:
     return out
 
 
+def parse_channel_int(items: Sequence[str], flag: str = "--max-num-seqs-channel") -> dict[str, int]:
+    """["no_robots-0=32"] → {"no_robots-0": 32}。"""
+    out: dict[str, int] = {}
+    for it in items:
+        name, eq, val = str(it).partition("=")
+        try:
+            n = int(val)
+        except ValueError:
+            n = 0
+        if not eq or not name.strip() or n <= 0:
+            raise LayoutError(f"{flag} {it!r} 要写成 通道名=正整数，如 no_robots-0=32")
+        out[name.strip()] = n
+    return out
+
+
 def describe(ch: Channel, dtype: str = "", forced: Sequence[str] = ()) -> str:
     segs = "  →  ".join(
         f"{s.node}:{s.lo}–{s.hi}"
@@ -519,6 +534,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-num-seqs", type=int, default=None,
                     help="每条通道同时调度的请求数上限（vLLM 默认 256）。显存压得很紧的末级"
                          "（N05/N07/N08/N13）在采样器预热（按这个数造假请求）时可能 OOM，降到 128 能省出几百 MB")
+    ap.add_argument("--max-num-seqs-channel", action="append", default=[], metavar="通道=N",
+                    help="逐通道覆盖 --max-num-seqs，可重复，如 --max-num-seqs-channel no_robots-0=32"
+                         "（只有显存紧的那条通道要压小；压小的通道在闭环里会在 vLLM 里排队）")
     ap.add_argument("--stats", action="store_true",
                     help="开 A5 统计钩子：逐请求的全量路由 top-k、后段 miss、前 L₀ 层 LR 特征，"
                          "落到各节点的 $VLLM_P2P_STATS_DIR（默认 /tmp/p2p_stats）")
@@ -542,6 +560,16 @@ def main(argv: list[str] | None = None) -> int:
         gmn = parse_gpu_mem_node(args.gpu_mem_node)
     except LayoutError as e:
         print(f"✗ {e}", file=sys.stderr)
+        return 2
+    try:
+        mns = parse_channel_int(args.max_num_seqs_channel)
+    except LayoutError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    bad = sorted(set(mns) - {ch.name for ch in chans})
+    if bad:
+        print(f"✗ --max-num-seqs-channel 里的 {bad} 不是通道名（有的是 "
+              f"{[ch.name for ch in chans]}）", file=sys.stderr)
         return 2
     known = {v for ch in chans for v in ch.nodes}
     stray = sorted(set(gmn) - known)
@@ -579,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
                  "port": args.port, "overrides": str(ov),
                  "gpu_mem": {v: gmn.get(v, args.gpu_mem) for v in ch.nodes},
                  "prefix_caching": bool(args.prefix_caching),
+                 "max_num_seqs": mns.get(ch.name, args.max_num_seqs),
                  "stats": stats,
                  "stages": [{"node": s.node, "role": s.role, "layers": [s.lo, s.hi],
                              "n_experts": round(sum(len(e) for e in s.layer_experts.values())
@@ -592,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
                                   gpu_mem_node=gmn,
                                   attention_backend=args.attention_backend or None,
                                   prefix_caching=args.prefix_caching,
-                                  max_num_seqs=args.max_num_seqs)
+                                  max_num_seqs=mns.get(ch.name, args.max_num_seqs))
             entry["api"] = f"http://{hosts[ch.nodes[0]].host}:{args.port}/v1"
             entry["commands"] = [{"node": v, "host": hosts[v].host, "cmd": c} for v, c in cmds]
             sh = args.out / f"{ch.name}.sh"
