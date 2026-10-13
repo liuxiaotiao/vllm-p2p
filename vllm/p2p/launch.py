@@ -57,7 +57,27 @@ def venv_of(cmd: str) -> str | None:
     return None
 
 
-def remote_start(cmd: str, channel: str, node: str, env: dict[str, str]) -> str:
+NET_VARS = ("GLOO_SOCKET_IFNAME", "NCCL_SOCKET_IFNAME", "VLLM_HOST_IP")
+
+
+def remote_net(host: str) -> str:
+    """在远端找出「承载 host 这个 IP 的网卡」，导出 Gloo / NCCL / vLLM 用的网卡与地址。
+
+    不设的话 Gloo 用 hostname 解析出本机地址，Ubuntu 的 /etc/hosts 默认把 hostname 指到
+    127.0.1.1 —— 每一级都对外宣告 127.0.1.1，别的节点连过去就是 Connection refused
+    （第一次跑 gsm8k-0 就栽在这：`Gloo connectFullMesh failed … remote=[127.0.1.1]`）。
+    各节点网卡名可能不同（不同子网），所以按 IP 在每台上现查，而不是写死一个名字。
+    """
+    ip = shlex.quote(host)
+    return (f"P2P_IF=$(ip -o -4 addr show 2>/dev/null | awk -v ip={ip} "
+            "'{split($4,a,\"/\"); if (a[1]==ip) {print $2; exit}}'); "
+            f"[ -n \"$P2P_IF\" ] || {{ echo \"本机没有地址为 {host} 的网卡（ip -o -4 addr 查不到）\" >&2; exit 3; }}; "
+            "export GLOO_SOCKET_IFNAME=$P2P_IF NCCL_SOCKET_IFNAME=$P2P_IF; "
+            f"export VLLM_HOST_IP={ip}; ")
+
+
+def remote_start(cmd: str, channel: str, node: str, env: dict[str, str],
+                 host: str | None = None) -> str:
     """远端执行的 shell：后台起 vllm serve，输出写日志，ssh 断开后进程不退。
 
     `cmd` 原样放进 `bash -c`（里面有 `$(cat overrides.json)`，要由远端 bash 展开）。
@@ -69,12 +89,14 @@ def remote_start(cmd: str, channel: str, node: str, env: dict[str, str]) -> str:
     venv = venv_of(cmd)
     act = (f"export VIRTUAL_ENV={shlex.quote(venv)}; export PATH={shlex.quote(venv + '/bin')}:$PATH; "
            if venv else "")
+    # 网卡探测在外层做（失败时 ssh 直接返回非 0、报错可见）；--env 给的同名变量排在后面，覆盖探测结果
+    net = remote_net(host) if host else ""
     exports = act + "".join(f"export {k}={shlex.quote(v)}; " for k, v in sorted(env.items()))
     log = log_path(channel, node)
     inner = f"{exports}exec env {cmd}"
     # 注意是 `cd /tmp;` 不是 `cd /tmp &&`：`A && B &` 会把整个 `A && B` 放进一个后台子 shell，
     # 它一直占着 ssh 的输出管道，ssh 就要等到 vllm 退出才返回（实测卡死过）。
-    return (f"cd /tmp || exit 1; nohup bash -c {shlex.quote(inner)} > {shlex.quote(log)} 2>&1 "
+    return (f"cd /tmp || exit 1; {net}nohup bash -c {shlex.quote(inner)} > {shlex.quote(log)} 2>&1 "
             f"< /dev/null & echo $!")
 
 
@@ -153,7 +175,7 @@ def cmd_start(c: dict, user: str, env: dict[str, str], wait: float) -> int:
             return 1
     # 先起 headless 的各级，最后起 node_rank 0（它起 API 服务、等各级连上）
     for st in sorted(c["commands"], key=lambda s: "--node-rank 0 " in s["cmd"]):
-        r = _ssh(st["host"], user, remote_start(st["cmd"], name, st["node"], env))
+        r = _ssh(st["host"], user, remote_start(st["cmd"], name, st["node"], env, st["host"]))
         if r.returncode != 0:
             print(f"  ✗ {st['node']}@{st['host']} 启动失败：{r.stderr.strip()[:300]}")
             return 1

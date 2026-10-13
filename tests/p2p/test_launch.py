@@ -79,3 +79,25 @@ def test_venv_is_put_on_path() -> None:
     script = L.remote_start(cmd, NAME, "N01", {})
     assert "export PATH=/home/ubuntu/venvs/vllm-p2p/bin:$PATH" in script
     assert "VIRTUAL_ENV=/home/ubuntu/venvs/vllm-p2p" in script
+
+
+def test_net_pins_cluster_nic() -> None:
+    import shutil
+    import subprocess
+
+    import pytest
+    if not shutil.which("ip"):
+        pytest.skip("没有 ip 命令（iproute2）")
+    sh = L.remote_net("127.0.0.1") + 'echo "$GLOO_SOCKET_IFNAME|$NCCL_SOCKET_IFNAME|$VLLM_HOST_IP"'
+    r = subprocess.run(["bash", "-c", sh], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "lo|lo|127.0.0.1"
+    r = subprocess.run(["bash", "-c", L.remote_net("10.255.255.254") + "echo no"],
+                       capture_output=True, text=True)
+    assert r.returncode == 3 and "10.255.255.254" in r.stderr and "no" not in r.stdout
+
+
+def test_user_env_overrides_detected_nic() -> None:
+    cmd = f"VLLM_PP_LAYER_PARTITION=8 /v/bin/vllm serve /w {FLAG} {NAME}"
+    script = L.remote_start(cmd, NAME, "N01", {"GLOO_SOCKET_IFNAME": "eth9"}, "192.168.1.2")
+    assert script.index("GLOO_SOCKET_IFNAME=$P2P_IF") < script.index("GLOO_SOCKET_IFNAME=eth9")
