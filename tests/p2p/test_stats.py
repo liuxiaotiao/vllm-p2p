@@ -161,3 +161,33 @@ def test_parse_body() -> None:
     assert S.parse_body([[0, 3]]) == [(0, 3)]
     assert S.parse_body("") is None and S.parse_body(None) is None
     assert S.body_string([(1, 4), (7, 9)]) == "1:4,7:9"
+
+
+def test_front_emits_lr_once_when_prompt_completes(tmp_path) -> None:
+    """B-1 前段（emit_lr）：prompt 分两块算 —— 第一块后不交，算完那一步交一次（与一次算完的
+    统计一样），之后不再交；prefill_only 时纯 decode 步不拷贝；不落盘。"""
+    st = S.RouteStats(n_experts=E, top_k=K, norm_topk=True, lr_layers=(3, 4), channel="f",
+                      pp_rank=0, out_dir=str(tmp_path), emit_lr=True, write=False,
+                      prefill_only=True)
+    for l, res in LAYERS.items():
+        st.register_layer(l, res)
+    st.allocate(256, "cpu")
+    ref = make(tmp_path / "ref")
+    lg = np.random.default_rng(3).standard_normal((9, len(LAYERS), E)).astype(np.float32)
+    reqs = {"a": req(8, "A", "2:7")}
+    step(st, {"a": lg[:5]}, {"a": np.arange(5)}, reqs)
+    assert st.take_lr("a") is None                      # prompt 还没算完
+    step(st, {"a": lg[5:8]}, {"a": np.arange(5, 8)}, reqs)
+    got = st.take_lr("a")
+    assert got is not None and st.take_lr("a") is None  # 只交一次
+    step(ref, {"a": lg[:8]}, {"a": np.arange(8)}, reqs)
+    assert got == ref._lr_wire(ref._acc["a"])
+    assert set(got) == {"4", "5"} and got["4"]["t"] == 5 and got["4"]["m"] == 1
+
+    # decode 步：缓冲区里放垃圾也不该被读（prefill_only 直接返回），upto 不动
+    upto = st._acc["a"].upto
+    st.capture(0, torch.full((1, E), float("nan")))
+    st.on_step(["a"], [1], np.array([8]), reqs)
+    assert st._acc["a"].upto == upto
+    st.finish(["a"])
+    assert not (tmp_path / "f_pp0.jsonl").exists()      # write=False

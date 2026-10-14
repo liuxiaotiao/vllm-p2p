@@ -54,6 +54,15 @@ def test_split_channels_into_fronts_and_backs(cj, tmp_path) -> None:
                 assert ov["p2p_layer_experts"] == want_le and "p2p_stage" not in ov
                 assert ov["p2p_channel"] == e["name"] and "p2p_stats" in ov
     assert by["back-no_robots-0"]["max_num_seqs"] == 32
+    # 前段默认开前段出口识别的统计：前 L₀ 层、交给协调器、不落盘、只统计 prefill
+    fcmd = by[st["fronts"][0]]["commands"][0]["cmd"]
+    fov = json.loads(shlex.split(fcmd.split(" --hf-overrides ", 1)[1])[0])
+    assert fov["p2p_stats"] == {"lr_layers": list(range(8)), "emit_lr": True, "write": False,
+                                "prefill_only": True}
+    st2 = stages.stages_from_channels(src, front_lr=False)
+    fcmd2 = {c["name"]: c for c in st2["channels"]}[st2["fronts"][0]]["commands"][0]["cmd"]
+    fov2 = json.loads(shlex.split(fcmd2.split(" --hf-overrides ", 1)[1])[0])
+    assert "emit_lr" not in fov2.get("p2p_stats", {})
 
 
 def test_commands_fit_launch_and_agent(cj) -> None:

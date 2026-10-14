@@ -14,9 +14,22 @@
 `POST /v1/completions`（流式 SSE 或一次返回）、`GET /p2p/channels`、`GET /p2p/records`、
 `POST /p2p/reset`、`GET /health`。不同的是请求的路径：
 
-    进来 → 挑在飞最少的前段（任何 task 都行）→ 前段 prefill → 在 **p2p_task 的后段**里挑
-    在飞最少的绑定（oracle；B1 的 LR 版在这里换成按前段出口统计识别）→ 之后每个 token
-    在前段与后段之间来回（见 tiered.py），绑定不再变。
+    进来 → 挑一个前段（任何 task 都行）→ 前段 prefill（顺带数前 L₀ 层的逐层路由）→ 定 task →
+    在这个 task 的后段里挑在飞最少的绑定 → 之后每个 token 在前段与后段之间来回（见 tiered.py），
+    前段、后段都不再变。
+
+三种模式（与 A 的网关同名同义）：
+
+* `oracle`：task 用请求自带的 `p2p_task`；
+* `lr`（**B-1 的目标形态**）：task 由**前段出口识别**判 —— 前段在 prompt 算完的那一批输出里交出
+  前 L₀ 层（只数 body token）的逐层 top-k 计数，网关里的协调器用 p2p-framework 的
+  `LRClassifier`（与 A4 识别服务同一个选择器文件、同一套阈值）判出 task。不像 A4 要把前 L₀ 层
+  单独再算一遍：前段本来就在算这几层，识别只多一次 LR（亚毫秒）。判给没有后段的类 / 低置信时
+  与 p2p-framework 一样退到先验最大的池。请求里带的 `p2p_task` 只用来记对错；
+* `shadow`：按 `p2p_task` 绑定，同时记下前段出口识别的结果（量准确率、不影响路由）。
+
+    python vllm/p2p/tiered_gateway.py --stages … --model-dir … --mode lr \
+        --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz
 
 只支持贪心（temperature 0）与 token id 的 prompt（bench 就是这么发的）。停止条件：模型的
 EOS（generation_config 优先，同 vLLM 的默认）+ max_tokens + max_model_len。
@@ -36,7 +49,9 @@ from typing import Mapping, Sequence
 if __package__ in (None, ""):                       # 按文件路径运行：把源码树放上 sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-__all__ = ["IncrementalDetok", "load_stop_ids", "make_app", "main"]
+__all__ = ["IncrementalDetok", "load_stop_ids", "make_lr_classify", "make_app", "main"]
+
+MODES = ("oracle", "lr", "shadow")
 
 
 def load_stop_ids(model_dir: str | Path) -> tuple[int | None, list[int]]:
@@ -92,6 +107,42 @@ class IncrementalDetok:
         return delta
 
 
+def make_lr_classify(*, lr_model: str, l0: int, n_experts: int, tasks: Mapping[str, float],
+                     lr_classes: str | None = None, lr_features: str | None = None,
+                     lr_feature_fn: str | None = None, tau_hi: float | None = None,
+                     tau_lo: float = 0.40):
+    """→ (classify, clf)。`classify(feat, info)`：前段交出的 {层号(1-based): LayerStat 线上格式}
+    → 与 A4 识别服务同格式的判定（task / conf / zone / scores / raw / label …）。
+    要先把 p2p-framework 放上 sys.path（`identifier.use_p2p_framework`）。"""
+    import numpy as np
+    from p2pmoe.runtime.lr_classifier import LRClassifier, verdict_label
+    from p2pmoe.runtime.model import LayerStat, MoEStats
+
+    from vllm.p2p.identifier import verdict_wire
+
+    clf = LRClassifier.load(lr_model, l0=int(l0), n_experts=int(n_experts), priors=dict(tasks),
+                            class_map=lr_classes, features=lr_features,
+                            feature_fn=lr_feature_fn, tau_hi=tau_hi, tau_lo=tau_lo)
+    E = int(n_experts)
+
+    def classify(feat: Mapping, info: Mapping) -> dict:
+        st = MoEStats(hist=np.zeros(E, dtype=np.float64),
+                      layers={int(l): LayerStat.from_wire(d) for l, d in feat.items()})
+        v = clf.predict_stats(st)
+        body = info.get("body")
+        return {**verdict_wire(v), "label": verdict_label(v), "n_prompt": info.get("n_prompt"),
+                "n_body": sum(int(b) - int(a) for a, b in body) if body else None}
+
+    return classify, clf
+
+
+def _n_experts(sj: Mapping, model_dir: str | Path) -> int:
+    if sj.get("n_experts"):
+        return int(sj["n_experts"])
+    cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    return int(cfg["num_experts"])
+
+
 def _finish_reason(f: str | None) -> str | None:
     if f is None:
         return None
@@ -101,9 +152,15 @@ def _finish_reason(f: str | None) -> str | None:
 
 
 def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracle",
-             max_model_len: int = 4096):
-    """co：已经 start() 过的 TieredCoordinator；stages：名字 → stages.json 里的条目。"""
+             max_model_len: int = 4096, needs_body: bool = False, identifier: str | None = None):
+    """co：已经 start() 过的 TieredCoordinator（lr / shadow 模式要带 classify）；
+    stages：名字 → stages.json 里的条目。"""
     from aiohttp import web
+
+    if mode not in MODES:
+        raise ValueError(f"mode={mode!r}；可选 {MODES}")
+    if mode in ("lr", "shadow") and co.classify is None:
+        raise ValueError(f"{mode} 模式要协调器带 classify（前段出口识别）")
 
     records: list[dict] = []
 
@@ -151,12 +208,21 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             return bad(400, "分段网关只收 token id 的 prompt（bench 就是这么发的）", rec)
         if float(body.get("temperature") or 0.0) != 0.0:
             return bad(400, "分段网关只支持贪心（temperature 0）", rec)
-        if mode == "oracle" and not task:
-            return bad(400, "oracle 模式要在请求里给 p2p_task", rec)
-        if not any(b.task == task for b in co.backs):
-            # 与 A 的网关一致：task 没有后段 → 立刻 503，不偷偷塞给别的 task 的后段
-            have = sorted({b.task for b in co.backs if b.task})
-            return bad(503, f"task {task!r} 没有后段（有的是 {have}）", rec)
+        body_ranges = body.get("p2p_body")
+        if mode in ("oracle", "shadow"):
+            if not task:
+                return bad(400, f"{mode} 模式要在请求里给 p2p_task", rec)
+            if not any(b.task == task for b in co.backs):
+                # 与 A 的网关一致：task 没有后段 → 立刻 503，不偷偷塞给别的 task 的后段
+                have = sorted({b.task for b in co.backs if b.task})
+                return bad(503, f"task {task!r} 没有后段（有的是 {have}）", rec)
+        if mode in ("lr", "shadow") and needs_body and not body_ranges:
+            msg = ("识别器只数 body token —— 请求里要带 p2p_body（bench 用 p2p-framework 的 "
+                   "encode_body 构造，与选择器训练时同一口径）")
+            if mode == "lr":
+                return bad(400, msg, rec)
+            rec["shadow"] = {"error": msg}
+        rec["task"] = task if mode != "lr" else None
         max_tokens = int(body.get("max_tokens") or 16)
         max_tokens = max(1, min(max_tokens, max_model_len - len(ids)))
         stream = bool(body.get("stream"))
@@ -171,13 +237,27 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             """第一个 token 出来时绑定早已发生：把前段 / 后段记进路由记录与响应头。"""
             back = req.back.name if req.back else None
             front = req.front.name if req.front else None
-            rec.update(channel=back, front=front, t_first_byte=time.time(),
+            rec.update(channel=back, front=front, t_first_byte=time.time(), task=req.task,
                        front_nodes=list((stages.get(front) or {}).get("nodes", [])),
                        back_nodes=list((stages.get(back) or {}).get("nodes", [])))
-            hdr.update({"X-P2P-Channel": back or "", "X-P2P-Front": front or ""})
+            hdr.update({"X-P2P-Channel": back or "", "X-P2P-Front": front or "",
+                        "X-P2P-Task": req.task or ""})
+            v = req.info.get("verdict")
+            if v is not None:
+                # bench 的 identify 列按 A4 识别服务的字段名读
+                v = dict(v, compute_ms=v.get("lr_ms"), queue_ms=0.0)
+                if mode == "lr":
+                    rec["verdict"] = v
+                    rec["route_ms"] = v.get("lr_ms") or 0.0
+                    hdr["X-P2P-LR"] = json.dumps({k: v.get(k) for k in
+                                                  ("task", "label", "conf", "zone")},
+                                                 ensure_ascii=True, separators=(",", ":"))
+                elif rec.get("shadow") is None:
+                    rec["shadow"] = v
 
         try:
-            async for ev in co.stream(ids, max_tokens, task=task, rid=pid, timeout=600.0):
+            async for ev in co.stream(ids, max_tokens, task=task, rid=pid, timeout=600.0,
+                                      body=body_ranges):
                 kind = ev[0]
                 if kind == "req":
                     req = ev[1]
@@ -248,7 +328,7 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
     async def get_channels(_):
         st = co.state()
         return web.json_response({
-            "mode": mode, "kind": "tiered", "identifier": None,
+            "mode": mode, "kind": "tiered", "identifier": identifier,
             "tasks": sorted({b["task"] for b in st["backs"] if b["task"]}),
             # bench 把这些当「通道」：名字要能在 stages.json 里查到 task / 节点
             "channels": [{"name": b["name"], "task": b["task"], "inflight": b["inflight"],
@@ -299,7 +379,7 @@ async def _amain(a) -> int:
     for c in (*fronts, *backs):
         cl = RemoteClient(c["zmq"])
         try:
-            info = await cl.connect(timeout=a.connect_timeout)
+            info = await cl.connect(timeout=a.connect_timeout, direct=not a.via_coordinator)
         except Exception as e:                                    # noqa: BLE001
             raise SystemExit(f"连不上 {c['name']}（{c['zmq']}）：{e}\n先 python3 vllm/p2p/launch.py "
                              f"--channels {a.stages} status {c['name']}") from None
@@ -313,15 +393,33 @@ async def _amain(a) -> int:
     be = [e for e in engines if e.role == "back"]
     eos, stop_ids = load_stop_ids(a.model_dir)
     tok = Tokenizer.from_file(str(Path(a.model_dir) / "tokenizer.json"))
+    classify, clf, ident_desc = None, None, None
+    if a.mode in ("lr", "shadow"):
+        from vllm.p2p.identifier import parse_tasks, use_p2p_framework
+
+        use_p2p_framework(a.p2p_framework)
+        have = sorted({b.task for b in be if b.task})
+        tasks = parse_tasks(a.tasks) if a.tasks else {u: 1.0 for u in have}
+        if set(tasks) - set(have):
+            raise SystemExit(f"--tasks 里 {sorted(set(tasks) - set(have))} 没有后段（有的是 {have}）")
+        classify, clf = make_lr_classify(
+            lr_model=a.lr_model, l0=int(sj["l0"]), n_experts=_n_experts(sj, a.model_dir),
+            tasks=tasks, lr_classes=a.lr_classes, lr_features=a.lr_features,
+            lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo)
+        ident_desc = f"前段出口 LR（{Path(a.lr_model).name}）"
+        print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
     co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
-                           front_pick=a.front_pick)
+                           front_pick=a.front_pick, direct=not a.via_coordinator,
+                           classify=classify, route="lr" if a.mode == "lr" else "task")
     co.start()
-    app = make_app(co, stages=entries, tokenizer=tok, mode="oracle",
-                   max_model_len=a.max_model_len)
+    app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
+                   max_model_len=a.max_model_len,
+                   needs_body=bool(clf is not None and clf.needs_body), identifier=ident_desc)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, a.host, a.port).start()
-    print(f"分段网关（oracle，前段按 {a.front_pick} 挑）：前段 {[e.name for e in fe]}，后段 "
+    print(f"分段网关（{a.mode}，前段按 {a.front_pick} 挑，"
+          f"{'经协调器转' if a.via_coordinator else '前后段直连'}）：前段 {[e.name for e in fe]}，后段 "
           f"{ {u: [b.name for b in be if b.task == u] for u in sorted({b.task for b in be})} }；"
           f"停止 token {stop_ids}；监听 {a.host}:{a.port}", flush=True)
     try:
@@ -344,8 +442,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=9100, help="默认 9100（A 的网关占着 9000）")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--connect-timeout", type=float, default=30.0)
+    ap.add_argument("--via-coordinator", action="store_true",
+                    help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
+                         "协调器与引擎不在同一网段时每跳多一个往返）")
     ap.add_argument("--front-pick", choices=("speed", "least"), default="speed",
                     help="选前段：speed =（在飞+1）×实测每位置耗时最小（默认）；least = 在飞最少")
+    ap.add_argument("--mode", choices=MODES, default="oracle",
+                    help="oracle：按请求的 p2p_task 绑；lr：按前段出口识别的结果绑（B-1 目标形态）；"
+                         "shadow：按 p2p_task 绑，只记识别结果")
+    g = ap.add_argument_group("前段出口识别（--mode lr / shadow）")
+    g.add_argument("--p2p-framework", default=None, help="p2p-framework 源码目录（默认自动找）")
+    g.add_argument("--lr-model",
+                   default="/home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz")
+    g.add_argument("--tasks", default=None,
+                   help="部署的 task 与先验，如 gsm8k=1,mbpp=1（默认 = 后段的 task，先验各 1）")
+    g.add_argument("--lr-classes", default=None)
+    g.add_argument("--lr-features", default=None)
+    g.add_argument("--lr-feature-fn", default=None)
+    g.add_argument("--tau-hi", type=float, default=None)
+    g.add_argument("--tau-lo", type=float, default=0.40)
     a = ap.parse_args(argv)
     try:
         return asyncio.run(_amain(a))

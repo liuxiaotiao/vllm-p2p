@@ -147,6 +147,9 @@ class EngineCoreOutput(
     # P2P B-1 前段引擎：本步各位置的残差流 hidden（[n, hidden_size]），从位置 p2p_pos 起。
     p2p_pos: int = -1
     p2p_hidden: torch.Tensor | None = None
+    # 只在 prompt 算完的那一批里有：前 L₀ 层的逐层路由计数（{层号: LayerStat 线上格式}），
+    # 协调器拿它跑 LR、决定绑哪个后段
+    p2p_feat: dict[str, Any] | None = None
 
     @property
     def finished(self) -> bool:

@@ -1118,6 +1118,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
         p2p_hidden = model_runner_output.p2p_hidden
+        p2p_feat = model_runner_output.p2p_feat
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1287,6 +1288,7 @@ class Scheduler(SchedulerInterface):
                         num_nans_in_logits=request.num_nans_in_logits,
                         p2p_pos=-1 if p2p_item is None else p2p_item[0],
                         p2p_hidden=None if p2p_item is None else p2p_item[1],
+                        p2p_feat=p2p_feat.get(req_id) if p2p_feat else None,
                     )
                 )
             else:

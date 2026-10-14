@@ -10,8 +10,10 @@
 一条请求的一生（协议见 `vllm/p2p/stage.py`）：
 
     1. 进前段引擎（token prompt）。前段 prefill，交出 prompt 每个位置的残差流 hidden。
-    2. prompt 的 hidden 收齐 → **绑定**一个后段（同 task 的后段里挑负载最轻的；B1 换成 LR）
-       → 以 prompt_embeds 进那个后段。后段 prefill，采样出第 1 个 token。
+    2. prompt 的 hidden 收齐 → **绑定**一个后段 → 以 prompt_embeds 进那个后段。后段 prefill，
+       采样出第 1 个 token。绑哪个：先定 task —— oracle 用请求自带的；`route="lr"` 时用前段在
+       prompt 算完那一批输出里交出的前 L₀ 层路由统计（`p2p_feat`）跑 `classify` 判出来的 ——
+       再在这个 task 的后段里挑负载最轻的。
     3. 循环：后段的 token ──p2p_append──▶ 前段算这一位置的 hidden ──p2p_feed──▶ 后段采下一个。
     4. 后段结束（EOS / 长度）→ 前段那条 abort。
 
@@ -117,13 +119,13 @@ async def _fire_utility(client, method: str, *args):
 
 def _core_request(rid: str, *, prompt: list[int] | None, embeds: torch.Tensor | None,
                   max_tokens: int, eos: int | None, logprobs: int, ignore_eos: bool,
-                  stop_ids: Sequence[int], arrival: float):
+                  stop_ids: Sequence[int], arrival: float, extra_args: dict | None = None):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine import EngineCoreRequest
 
     sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, detokenize=False,
                         logprobs=logprobs or None, ignore_eos=ignore_eos,
-                        stop_token_ids=list(stop_ids) or None)
+                        stop_token_ids=list(stop_ids) or None, extra_args=extra_args or None)
     return EngineCoreRequest(
         request_id=rid, prompt_token_ids=prompt, mm_features=None, sampling_params=sp,
         pooling_params=None, eos_token_id=eos, arrival_time=arrival, lora_request=None,
@@ -144,10 +146,14 @@ def _lp_rows(lp) -> list[dict[int, float]]:
 class _Req:
     __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
                  "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
-                 "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b")
+                 "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b", "feat", "body",
+                 "true_task")
 
-    def __init__(self, rid, prompt, max_tokens, task, loop):
+    def __init__(self, rid, prompt, max_tokens, task, loop, body=None):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
+        self.true_task = task                # 请求自带的 task（lr 模式下 task 会换成判出来的）
+        self.body = body                     # body token 区间（前段只数这些位置的路由）
+        self.feat: dict | None = None        # 前段交出的前 L₀ 层路由统计（prompt 算完时）
         self.n_prompt = len(prompt)
         self.front: Engine | None = None
         self.back: Engine | None = None
@@ -176,6 +182,7 @@ class _Req:
         return {
             "rid": self.rid, "front": self.front.name if self.front else None,
             "back": self.back.name if self.back else None, "task": self.task,
+            "true_task": self.true_task,
             "n_prompt": self.n_prompt, "tokens": self.tokens, "logprobs": self.lps,
             "finish": self.finish, "ttft_ms": ttft, "tpot_ms": tpot,
             "front_prefill_ms": (self.t_front - self.t_arrive) * 1e3 if self.t_front else None,
@@ -189,23 +196,39 @@ class _Req:
 class TieredCoordinator:
     """若干前段 + 若干后段。`generate()` / `stream()` 可以并发调用。
 
-    前段：每条请求挑在飞最少的前段（任何 task 都能用任何前段）。
-    后段：前段 prefill 完以后在**同 task** 的后段里挑 —— `bind`：`least`（在飞最少，平手轮流）/
-    `rr`（轮流）/ 一个函数 `f(req_info: dict, candidates: list[Engine]) -> Engine`（B1 的识别后绑定
-    从这里接）。task 没有对应后段时用全部后段。"""
+    前段：每条请求挑一个前段（任何 task 都能用任何前段；`front_pick` 见 `_pick_front`）。
+    后段：前段 prefill 完以后先定 task、再在**这个 task** 的后段里挑 —— `bind`：`least`（在飞最少，
+    平手轮流）/ `rr`（轮流）/ 一个函数 `f(req_info: dict, candidates: list[Engine]) -> Engine`。
+    task 没有对应后段时用全部后段。
+
+    识别（`classify(feat: dict, req_info: dict) -> verdict dict`，至少有 "task"）：前段在 prompt
+    算完的那一批输出里交出前 L₀ 层的逐层路由统计（`EngineCoreOutput.p2p_feat`），绑定前调它。
+    `route="task"`（默认）：只记下结果（shadow，绑定仍按请求自带的 task）；`route="lr"`：按判出的
+    task 绑定。结果放在 `result()["info"]["verdict"]`。"""
 
     def __init__(self, fronts: Engine | Sequence[Engine], backs: Sequence[Engine], *,
                  bind: str | Callable = "least", eos: int | None = None,
                  stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0,
-                 front_pick: str = "speed"):
+                 front_pick: str = "speed", direct: bool = False,
+                 classify: Callable[[dict, dict], dict] | None = None, route: str = "task"):
         fronts = [fronts] if isinstance(fronts, Engine) else list(fronts)
         if front_pick not in ("speed", "least"):
             raise ValueError(f"front_pick={front_pick!r}；可选 speed / least")
         self.front_pick = front_pick
+        if route not in ("task", "lr"):
+            raise ValueError(f"route={route!r}；可选 task / lr")
+        if route == "lr" and classify is None:
+            raise ValueError('route="lr" 要给 classify')
+        self.classify, self.route = classify, route
+        # 直连（remote.AgentBridge 的 K_ROUTE）：绑定后每 token 的 hidden / token 由前后段代理
+        # 直接互发，协调器只收 token（流式、判结束）。要求所有引擎都是远端代理。
+        self.direct = bool(direct)
         if not fronts:
             raise ValueError("至少要一个前段")
         if not backs:
             raise ValueError("至少要一个后段")
+        if direct and not all(hasattr(e.client, "send_route") for e in (*fronts, *backs)):
+            raise ValueError("direct=True 要所有引擎都是远端代理（RemoteClient）")
         self.fronts, self.backs = fronts, list(backs)
         self.bind, self.eos, self.stop_ids = bind, eos, tuple(stop_ids)
         self.ignore_eos, self.logprobs = ignore_eos, logprobs
@@ -254,19 +277,25 @@ class TieredCoordinator:
 
     # ---- 请求 ----
     async def submit(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
-                     rid: str | None = None) -> _Req:
-        """把一条请求送进前段，返回它的状态对象（`events` 队列里陆续有 token）。"""
+                     rid: str | None = None, body=None) -> _Req:
+        """把一条请求送进前段，返回它的状态对象（`events` 队列里陆续有 token）。
+        `body`：body token 区间 [[a, b], …]（prompt 下标）—— 前段的识别统计只数这些位置。"""
         self._check_errors()
         rid = rid or f"t{next(self._ids)}"
         if rid in self.reqs:
             raise ValueError(f"请求号 {rid} 正在用")
-        r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop())
+        body = [(int(a), int(b)) for a, b in body] if body else None
+        r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop(),
+                                  body=body)
         f = r.front = self._pick_front()
         f.inflight += 1
+        xa = {"p2p_id": rid}
+        if body:
+            xa["p2p_body"] = ",".join(f"{a}:{b}" for a, b in body)
         # 前段这条永远不会自己结束（不采样、不查停止条件）：max_tokens 只是 Request 的必填项
         await f.add(_core_request(
             rid, prompt=list(prompt), embeds=None, max_tokens=max_tokens + 1, eos=None,
-            logprobs=0, ignore_eos=True, stop_ids=(), arrival=time.time()))
+            logprobs=0, ignore_eos=True, stop_ids=(), arrival=time.time(), extra_args=xa))
         return r
 
     async def cancel(self, r: _Req) -> None:
@@ -284,10 +313,10 @@ class TieredCoordinator:
                 r.back.inflight -= 1
 
     async def stream(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
-                     rid: str | None = None, timeout: float | None = None):
+                     rid: str | None = None, timeout: float | None = None, body=None):
         """异步生成器：先产出 ("req", 请求状态对象)，再逐批 ("tok", [token…])，最后
         ("done", result)。`timeout` 是两次产出之间最多等多久（不是整条的总时长）。"""
-        r = await self.submit(prompt, max_tokens, task=task, rid=rid)
+        r = await self.submit(prompt, max_tokens, task=task, rid=rid, body=body)
         try:
             yield ("req", r)
             while True:
@@ -307,8 +336,9 @@ class TieredCoordinator:
             self.reqs.pop(r.rid, None)
 
     async def generate(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
-                       rid: str | None = None, timeout: float | None = None) -> dict:
-        async for ev in self.stream(prompt, max_tokens, task=task, rid=rid, timeout=timeout):
+                       rid: str | None = None, timeout: float | None = None, body=None) -> dict:
+        async for ev in self.stream(prompt, max_tokens, task=task, rid=rid, timeout=timeout,
+                                    body=body):
             if ev[0] == "done":
                 return ev[1]
         raise RuntimeError("流在 done 之前结束了")
@@ -355,15 +385,41 @@ class TieredCoordinator:
         least = [b for b in cands if b.inflight == low]
         return least[k % len(least)]
 
+    def _identify(self, r: _Req) -> None:
+        """前段出口识别：用前段交出的前 L₀ 层统计判 task。识别失败不能让请求卡住 ——
+        记下原因，lr 模式下在全部后段里挑最闲的（**不**偷看请求自带的 task：那是用来记对错的）。"""
+        t0 = time.perf_counter()
+        info = {"rid": r.rid, "task": r.true_task, "n_prompt": r.n_prompt,
+                "front": r.front.name if r.front else None, "body": r.body}
+        try:
+            if r.feat is None:
+                raise RuntimeError("前段没有交出识别统计（前段引擎没开 p2p_stats.emit_lr？）")
+            v = dict(self.classify(r.feat, info))
+        except Exception as e:                       # noqa: BLE001
+            v = {"task": None, "error": f"{type(e).__name__}: {e}"}
+        v["lr_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
+        r.info["verdict"] = v
+        if self.route == "lr":
+            r.task = v.get("task")
+
     async def _bind(self, r: _Req) -> None:
+        if self.classify is not None:
+            self._identify(r)
         b = r.back = self._pick(r)
         b.inflight += 1
         b.n_bound += 1
         r.t_bound = time.perf_counter()
+        if self.direct:
+            # 先给后段下路由（与 add 同一条 socket，必在 add 之前到）：它出的 token 直接给前段
+            await b.client.send_route(r.rid, r.front.client.address, 0)
         await b.add(_core_request(
             r.rid, prompt=None, embeds=r.stream.take(), max_tokens=r.max_tokens, eos=self.eos,
             logprobs=self.logprobs, ignore_eos=self.ignore_eos, stop_ids=self.stop_ids,
             arrival=time.time()))
+        if self.direct:
+            # 前段：prompt 之后位置的 hidden 直接给后段（后段的第一个 token 至少要等它 prefill 完，
+            # 这条一定先到；万一没到，前段代理会先攒着）
+            await r.front.client.send_route(r.rid, b.client.address, r.n_prompt)
 
     # ---- 两个方向的搬运 ----
     async def _front_loop(self, f: Engine) -> None:
@@ -377,6 +433,9 @@ class TieredCoordinator:
                     r = self.reqs.get(o.request_id)
                     if r is None or o.p2p_hidden is None or r.front is not f:
                         continue
+                    ft = getattr(o, "p2p_feat", None)
+                    if ft is not None and r.feat is None:
+                        r.feat = ft           # prompt 算完的那一批：前 L₀ 层的识别统计
                     got = r.stream.add(o.p2p_pos, o.p2p_hidden)
                     if got is None:
                         continue          # 前段被抢占后重算，送来的是旧位置
@@ -386,6 +445,8 @@ class TieredCoordinator:
                         if r.stream.next >= r.n_prompt:
                             r.t_front = now
                             await self._bind(r)
+                    elif self.direct:
+                        continue          # 直连：前段代理已经直接发给后段了（抢占重算的旧行）
                     else:
                         r.t_hid.append(now)
                         if o.request_id in meta:
@@ -393,6 +454,14 @@ class TieredCoordinator:
                             f.observe(meta[o.request_id])
                         b = r.back
                         feeds.setdefault(b.name, (b, []))[1].append(pack_rows(r.rid, start, rows))
+                if self.direct and meta:
+                    # 直连转走的那些位置：输出没回来，只回来了「引擎内毫秒」
+                    seen = {o.request_id for o in outs.outputs}
+                    for rid, ms in meta.items():
+                        r = self.reqs.get(rid)
+                        if rid not in seen and r is not None and r.back is not None:
+                            r.eng_f.append(ms)
+                            f.observe(ms)
                 for b, items in feeds.values():
                     await b.fire("p2p_feed", items)
         except asyncio.CancelledError:
@@ -436,7 +505,7 @@ class TieredCoordinator:
                             r.done.set_result(res)
                         r.events.put_nowait(("done", res))
                         self.reqs.pop(r.rid, None)
-                    elif o.new_token_ids:
+                    elif o.new_token_ids and not self.direct:
                         appends.setdefault(f.name, (f, []))[1].append(
                             [r.rid, [int(t) for t in o.new_token_ids]])
                 for f, items in appends.values():

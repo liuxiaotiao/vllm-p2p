@@ -3179,11 +3179,17 @@ class GPUModelRunner(
         starts = self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()
         rows = hidden_states[:num_tokens].to("cpu")
         parts = torch.split(rows, num_scheduled_tokens_np[:num_reqs].tolist())
+        # prompt 刚算完的请求：前 L₀ 层的 LR 特征（统计钩子在 execute_model 里已经累加过这一步）
+        feats = None
+        st = p2p_stats.get_collector()
+        if st is not None and st.emit_lr:
+            feats = {r: f for r in req_ids if (f := st.take_lr(r)) is not None} or None
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},
             kv_connector_output=kv_connector_output,
             p2p_hidden={r: (int(s0), h) for r, s0, h in zip(req_ids, starts, parts)},
+            p2p_feat=feats,
         )
 
     def execute_model(

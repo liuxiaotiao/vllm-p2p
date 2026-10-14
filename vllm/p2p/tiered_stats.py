@@ -77,7 +77,38 @@ def main(argv=None) -> int:
               f"{f(s['front_eng']):>9}{f(s['back_leg']):>8}{f(s['back_eng']):>9}   {tail:>22}")
     print("（单位 ms；TPOT = (总时延 − 首 token) / (生成数 − 1)；腿是每条请求的中位数再取中位数；\n"
           " 「引擎内」= 代理收到这条请求的输入到送出它的输出（排队 + 调度 + 前向），腿 − 引擎内 ≈ 网络 + 协调器）")
+    ident = summarise_ident(rb)
+    if ident:
+        print(f"\n前段出口识别（lr 模式）：绑对 task {ident['ok']}/{ident['n']}"
+              f"（{100 * ident['ok'] / ident['n']:.1f}%）；LR 耗时中位数 {f(ident['lr_ms'])} ms；"
+              f"区间 {ident['zones']}")
+        tasks = sorted({t for pair in ident["matrix"] for t in pair})
+        head = "真实 \\ 绑到"
+        print(f"  {head:<14}" + "".join(f"{t:>12}" for t in tasks))
+        for u in tasks:
+            if any(k[0] == u for k in ident["matrix"]):
+                print(f"  {u:<14}" + "".join(f"{ident['matrix'].get((u, t), 0) or '·':>12}"
+                                             for t in tasks))
+        if ident["wrong"]:
+            print(f"  绑错的（前 10 条）：{ident['wrong'][:10]}")
     return 0
+
+
+def summarise_ident(rows):
+    """lr 模式的结果：真实 task × 绑到的 task、准确率、LR 耗时、置信区间分布。"""
+    rs = [r for r in rows if r.get("correct") is not None and r.get("true_task")]
+    if not rs:
+        return None
+    m = defaultdict(int)
+    zones = defaultdict(int)
+    for r in rs:
+        m[(r["true_task"], r.get("task") or "?")] += 1
+        zones[r.get("zone") or "?"] += 1
+    return {"n": len(rs), "ok": sum(bool(r["correct"]) for r in rs), "matrix": dict(m),
+            "zones": dict(zones),
+            "lr_ms": _med([(r.get("identify") or {}).get("compute_ms") for r in rs]),
+            "wrong": [f"{r['req']}:{r['true_task']}→{r.get('task')}" for r in rs
+                      if not r["correct"]]}
 
 
 if __name__ == "__main__":

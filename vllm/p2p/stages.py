@@ -9,6 +9,8 @@
 每条通道「前段节点 → 后段节点们」拆成：
 
 * 一个**前段引擎** `front-<节点>`：只建层 [0, L₀)，全专家（不分 task，所有请求共用）；单卡；
+  默认开前段出口识别的统计（prompt 算完时交出前 L₀ 层的逐层路由计数，网关 `--mode lr` 用它
+  决定绑哪个后段；`--no-front-lr` 关掉）；
 * 一个**后段引擎** `back-<通道>`：层 [L₀, L)，驻留集、各节点的切层（`VLLM_PP_LAYER_PARTITION`
   取通道原来的后几项）、显存比例、`--max-num-seqs` 都与 A 的那条通道相同；PP 跨原来的后段节点。
 
@@ -89,7 +91,7 @@ def agent_command(*, python: str, name: str, model_dir: str, role: str, layers: 
 def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                          front_max_num_seqs: int = 64, front_gpu_mem: float | None = None,
                          port: int = 8300, master_port: int = 29600,
-                         overrides_of=None, eager: bool = False) -> dict:
+                         overrides_of=None, eager: bool = False, front_lr: bool = True) -> dict:
     """channels.json 的内容 → stages.json 的内容。`overrides_of(channel) -> dict` 读通道的
     hf_overrides（默认读 channel["overrides"] 指的文件）。"""
     l0, n_layers, model_dir = int(cj["l0"]), int(cj["n_layers"]), cj["model_dir"]
@@ -126,7 +128,13 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
             fname = f"front-{fnode}"
             fov = {"architectures": [ARCH], "p2p_layer_experts": {}, "p2p_channel": fname,
                    "p2p_miss_policy": ov.get("p2p_miss_policy", "local_topk")}
-            if ov.get("p2p_stats") is not None:
+            if front_lr:
+                # 前段出口识别：prompt 算完时交出前 L₀ 层（只数 body token）的逐层路由计数，
+                # 协调器跑 LR 决定绑哪个后段。只统计 prefill、不落盘
+                lr = (ov.get("p2p_stats") or {}).get("lr_layers") or list(range(l0))
+                fov["p2p_stats"] = {"lr_layers": [int(x) for x in lr], "emit_lr": True,
+                                    "write": False, "prefill_only": True}
+            elif ov.get("p2p_stats") is not None:
                 fov["p2p_stats"] = ov["p2p_stats"]
             fgm = front_gpu_mem if front_gpu_mem is not None else gm.get(fnode, 0.9)
             fronts[fnode] = {
@@ -188,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8300, help="代理的 HTTP 端口（ZMQ = 它 + 1）")
     ap.add_argument("--master-port", type=int, default=29600)
     ap.add_argument("--eager", action="store_true", help="所有分段引擎 --enforce-eager（排错用）")
+    ap.add_argument("--no-front-lr", action="store_true",
+                    help="前段不开识别统计（只能 oracle；默认开，lr / shadow 模式要它）")
     a = ap.parse_args(argv)
     src = Path(a.channels)
     cj = json.loads(src.read_text(encoding="utf-8"))
@@ -195,7 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         st = stages_from_channels(cj, only=only, front_max_num_seqs=a.front_max_num_seqs,
                                   front_gpu_mem=a.front_gpu_mem, port=a.port,
-                                  master_port=a.master_port, eager=a.eager)
+                                  master_port=a.master_port, eager=a.eager,
+                                  front_lr=not a.no_front_lr)
     except (ValueError, OSError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2

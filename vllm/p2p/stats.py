@@ -26,6 +26,11 @@ p2p-framework 的节点在每层前向时顺带记两样东西（`runtime/torch_
 body token 区间放进 `vllm_xargs.p2p_body`（"a:b,c:d"，prompt 里的 token 下标）。
 没给 body 时按整条 prompt 计（`masked=False`），与 p2p-framework 不开 count_body 时一致。
 
+B-1 前段引擎（`p2p_stats.emit_lr`）：不落盘，而是在一条请求的 prompt 算完的那一步把前 L₀ 层的
+逐层计数（`take_lr`，与 `LayerStat.to_wire` 同格式）交给 model runner，随前段输出送到协调器，
+协调器跑 LR 决定绑哪个后段（`tiered.py`）。这时只要 prefill 的统计：一步里所有请求都已过了
+prompt 时连 GPU→CPU 拷贝都省掉（`prefill_only`）。
+
 开销：只在 hf_overrides 里有 `p2p_stats` 时才启用；启用后每步多一次 GPU→CPU 拷贝
 （decode 时几 KB，prefill 时几 MB）与一次同步。量时延的正式实验可以不开 —— 两者的
 前向数值相同（单测与 parity 里核对过）。
@@ -106,6 +111,8 @@ class _Acc:
     lr_count: dict[int, np.ndarray] = field(default_factory=dict)
     lr_mass: dict[int, np.ndarray] = field(default_factory=dict)
     lr_tok: dict[int, int] = field(default_factory=dict)
+    lr_sent: bool = False
+    """B-1 前段：这条请求的 LR 特征已经交出去了（只交一次）。"""
 
 
 class RouteStats:
@@ -113,7 +120,8 @@ class RouteStats:
 
     def __init__(self, *, n_experts: int, top_k: int, norm_topk: bool,
                  lr_layers: Sequence[int] = (), channel: str = "", pp_rank: int = 0,
-                 out_dir: str | None = None):
+                 out_dir: str | None = None, emit_lr: bool = False, write: bool = True,
+                 prefill_only: bool = False):
         self.E = int(n_experts)
         self.k = int(top_k)
         self.norm_topk = bool(norm_topk)
@@ -130,6 +138,9 @@ class RouteStats:
         d = Path(out_dir or os.environ.get(STATS_DIR_ENV) or DEFAULT_DIR)
         self.path = d / f"{self.channel}_pp{self.pp_rank}.jsonl"
         self.n_written = 0
+        self.emit_lr = bool(emit_lr)          # B-1 前段：prompt 算完时交出 LR 特征（take_lr）
+        self.write = bool(write)              # 请求结束时写 JSONL
+        self.prefill_only = bool(prefill_only)  # 只统计 prompt 位置（decode 步不拷贝）
 
     # -- 构造期：模型逐层登记 ------------------------------------------------ #
     def register_layer(self, layer: int, resident: Sequence[int] | None) -> int:
@@ -178,6 +189,8 @@ class RouteStats:
         T = int(np.sum(num_scheduled))
         if T <= 0 or self.topi is None or not self.layers:
             return
+        if self.prefill_only and not self._wants(req_ids, num_scheduled):
+            return                      # 这一步全是 decode：不拷贝、不同步
         if T > self.capacity:
             # 不该发生（缓冲区按 max_num_batched_tokens 分配）；宁可丢这一步也不越界
             return
@@ -207,6 +220,15 @@ class RouteStats:
             acc.n_steps += 1
             off += n
 
+    def _wants(self, req_ids, num_scheduled) -> bool:
+        for rid, n in zip(req_ids, num_scheduled):
+            if int(n) <= 0:
+                continue
+            acc = self._acc.get(rid)
+            if acc is None or acc.upto < acc.n_prompt:
+                return True
+        return False
+
     def _account(self, acc: _Acc, ids: np.ndarray, ws: np.ndarray, pos: np.ndarray) -> None:
         keep = pos >= acc.upto
         if not keep.any():
@@ -225,7 +247,7 @@ class RouteStats:
             acc.pre_miss_mass += float(miss_mass[pre].sum())
             acc.layer_miss_pre += miss_any[pre].sum(0)
             self._lr(acc, ids[pre], ws[pre], pos[pre])
-        if dec.any():
+        if dec.any() and not self.prefill_only:
             acc.dec_tok_layer += int(dec.sum()) * L
             acc.dec_miss_tl += int(miss_any[dec].sum())
             acc.dec_miss_mass += float(miss_mass[dec].sum())
@@ -258,12 +280,35 @@ class RouteStats:
             np.add.at(mas, ids[:, li, :].reshape(-1), ws[:, li, :].reshape(-1).astype(np.float64))
             acc.lr_tok[l] = acc.lr_tok.get(l, 0) + int(ids.shape[0])
 
+    # -- B-1 前段：prompt 算完 → LR 特征 ------------------------------------- #
+    def take_lr(self, rid: str) -> dict | None:
+        """这条请求的 prompt 刚算完（且还没交过）→ {层号(1-based): LayerStat 线上格式}；否则 None。
+        没有 LR 层时交出空字典（协调器据此知道「特征就这些」，LR 会退到先验并说明原因）。"""
+        acc = self._acc.get(rid)
+        if acc is None or acc.lr_sent or acc.n_prompt <= 0 or acc.upto < acc.n_prompt:
+            return None
+        acc.lr_sent = True
+        return self._lr_wire(acc)
+
+    def _lr_wire(self, acc: _Acc) -> dict:
+        masked = acc.body is not None
+        lr = {}
+        for l in sorted(acc.lr_count):
+            c, w = acc.lr_count[l], acc.lr_mass[l]
+            nz = np.flatnonzero(c)
+            # 与 p2p-framework `LayerStat.to_wire` 同格式；键是 **1-based**（规划器口径）
+            lr[str(l + 1)] = {"i": nz.tolist(), "c": c[nz].astype(int).tolist(),
+                              "w": [round(float(x), 6) for x in w[nz]],
+                              "t": int(acc.lr_tok.get(l, 0)), "e": self.E,
+                              **({"m": 1} if masked else {})}
+        return lr
+
     # -- runner：请求结束 ----------------------------------------------------- #
     def finish(self, req_ids) -> None:
         rows = []
         for rid in req_ids:
             acc = self._acc.pop(rid, None)
-            if acc is not None:
+            if acc is not None and self.write:
                 rows.append(self.record(rid, acc))
         if not rows:
             return
@@ -278,15 +323,7 @@ class RouteStats:
 
     def record(self, rid: str, acc: _Acc) -> dict:
         masked = acc.body is not None
-        lr = {}
-        for l in sorted(acc.lr_count):
-            c, w = acc.lr_count[l], acc.lr_mass[l]
-            nz = np.flatnonzero(c)
-            # 与 p2p-framework `LayerStat.to_wire` 同格式；键是 **1-based**（规划器口径）
-            lr[str(l + 1)] = {"i": nz.tolist(), "c": c[nz].astype(int).tolist(),
-                              "w": [round(float(x), 6) for x in w[nz]],
-                              "t": int(acc.lr_tok.get(l, 0)), "e": self.E,
-                              **({"m": 1} if masked else {})}
+        lr = self._lr_wire(acc)
         return {
             "req_id": rid, "p2p_id": acc.p2p_id, "channel": self.channel,
             "pp_rank": self.pp_rank, "layers": [l + 1 for l in self.layers],

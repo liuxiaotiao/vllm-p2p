@@ -365,7 +365,10 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
             n_experts=int(config.num_experts), top_k=int(config.num_experts_per_tok),
             norm_topk=bool(getattr(config, "norm_topk_prob", True)),
             lr_layers=raw.get("lr_layers", ()), channel=getattr(config, "p2p_channel", ""),
-            pp_rank=get_pp_group().rank_in_group)
+            pp_rank=get_pp_group().rank_in_group,
+            # B-1 前段：prompt 算完时把 LR 特征随输出交给协调器（不落盘、decode 步不拷贝）
+            emit_lr=bool(raw.get("emit_lr", False)), write=bool(raw.get("write", True)),
+            prefill_only=bool(raw.get("prefill_only", False)))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if isinstance(self.lm_head, PPMissingLayer):

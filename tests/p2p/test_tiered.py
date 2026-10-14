@@ -438,7 +438,8 @@ class _ToyTok:
         return "".join(chr(97 + i % 26) for i in ids if not (skip_special_tokens and i == EOS))
 
 
-def test_remote_agents_and_gateway_end_to_end(configs) -> None:
+@pytest.mark.parametrize("direct", [False, True], ids=["via-coordinator", "direct"])
+def test_remote_agents_and_gateway_end_to_end(configs, direct) -> None:
     pytest.importorskip("zmq")
     aiohttp = pytest.importorskip("aiohttp")
     from aiohttp.test_utils import TestClient, TestServer
@@ -469,11 +470,12 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
         engines = []
         for k, (name, role, task) in enumerate(spec):
             cl = RemoteClient(f"tcp://127.0.0.1:{port0 + k}")
-            info = await cl.connect(timeout=10)
+            info = await cl.connect(timeout=10, direct=direct)
             assert info["name"] == name and info["role"] == role
             clients.append(cl)
             engines.append(Engine(name, role, cl, task=task))
-        co = TieredCoordinator(engines[:2], engines[2:], eos=EOS, ignore_eos=False)
+        co = TieredCoordinator(engines[:2], engines[2:], eos=EOS, ignore_eos=False,
+                               direct=direct)
         co.start()
         stages = {n: {"nodes": [f"N-{n}"]} for n, _, _ in spec}
         app = make_app(co, stages=stages, tokenizer=_ToyTok(), max_model_len=256)
@@ -511,6 +513,10 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
             assert nob.status == 503 and "没有后段" in (await nob.json())["error"]["message"]
             recs = (await (await client.get("/p2p/records")).json())["records"]
             chans = await (await client.get("/p2p/channels")).json()
+            await asyncio.sleep(0.1)
+            n_direct = sum(br.n_direct for br in bridges)
+            assert (n_direct > 0) == direct           # 直连时前后段代理之间真的互发了
+            assert not any(br.routes or br.held for br in bridges)   # 路由都收干净了
             return res, nonstream, recs, chans, cores
         finally:
             await client.close()
@@ -551,6 +557,208 @@ def test_remote_agents_and_gateway_end_to_end(configs) -> None:
     han = list("中".encode())
     assert d.push([ord("a")]) == "a" and d.push(han[:2]) == "" and d.push(han[2:]) == "中"
     assert d.flush() == "" and d.text == "a中"
+
+
+# --------------------------------------------------------------------------- #
+# 前段出口识别：前段在 prompt 算完那一步交出「特征」，协调器判 task、按它绑后段
+# --------------------------------------------------------------------------- #
+def body_class(prompt: list[int], body) -> int:
+    """假识别器的「真值」：body token 之和的奇偶。"""
+    return sum(prompt[p] for a, b in body for p in range(a, b)) % 2
+
+
+class LRFrontRunner(FrontRunner):
+    """FrontRunner + 统计钩子的替身：prompt 算完的那一步交一次 p2p_feat（只数 body token，
+    body 从请求的 extra_args 里读 —— 钉住 body 一路传到了 worker）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.meta: dict[str, tuple[int, list]] = {}
+
+    def step(self, so):
+        from vllm.p2p.stats import parse_body
+
+        for nr in so.scheduled_new_reqs:
+            if nr.req_id not in self.meta:
+                xa = nr.sampling_params.extra_args or {}
+                self.meta[nr.req_id] = (len(nr.prompt_token_ids), parse_body(xa.get("p2p_body")))
+        out = super().step(so)
+        comp, feats = _computed(so), {}
+        for rid, n in so.num_scheduled_tokens.items():
+            n_prompt, body = self.meta.get(rid, (0, None))
+            if body is not None and comp[rid] < n_prompt <= comp[rid] + n:
+                t = self.toks[rid]
+                feats[rid] = {"cls": body_class(t[:n_prompt], body), "n": n_prompt}
+        for rid in so.finished_req_ids:
+            self.meta.pop(rid, None)
+        out.p2p_feat = feats or None
+        return out
+
+
+def _toy_classify(feat, info):
+    if "cls" not in feat:
+        raise KeyError("没有 cls")
+    return {"task": f"t{feat['cls']}", "label": f"t{feat['cls']}", "conf": 1.0, "zone": "commit",
+            "n_prompt": info["n_prompt"]}
+
+
+@pytest.mark.parametrize("mode", ["lr", "shadow"])
+def test_front_exit_identification_end_to_end(configs, mode) -> None:
+    """2 前段 + 后段 t0×2、t1×1，全隔着 ZMQ（直连）+ 网关：lr 模式按前段交出的特征绑
+    （请求自带的 p2p_task 故意一半是错的，绑定不受影响、只记对错）；shadow 按标注绑、只记识别。"""
+    pytest.importorskip("zmq")
+    pytest.importorskip("aiohttp")
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from vllm.p2p.remote import AgentBridge, RemoteClient
+    from vllm.p2p.tiered import Engine, TieredCoordinator
+    from vllm.p2p.tiered_gateway import make_app
+
+    rng = random.Random(11)
+    prompts = [[rng.randrange(3, V) for _ in range(rng.randint(6, 40))] for _ in range(12)]
+    bodies = [[[1, len(p) - 2]] for p in prompts]
+    truth = [f"t{body_class(p, b)}" for p, b in zip(prompts, bodies)]
+    assert set(truth) == {"t0", "t1"}
+    labels = [t if i % 2 else "t9" for i, t in enumerate(truth)]   # lr：一半标签是错的
+    if mode == "shadow":
+        labels = truth
+    MAXT = 8
+
+    async def go():
+        cores, bridges, tasks, clients, engines = [], [], [], [], []
+        spec = [("front-A", "front", None), ("front-B", "front", None),
+                ("back-t0-0", "back", "t0"), ("back-t0-1", "back", "t0"),
+                ("back-t1-0", "back", "t1")]
+        port0 = 27000 + random.Random().randrange(2000)
+        for k, (name, role, task) in enumerate(spec):
+            core = FakeCore(make_sched(configs[role], 64),
+                            LRFrontRunner() if role == "front" else BackRunner(), 50 + k)
+            core._ensure()
+            br = AgentBridge(core, f"tcp://127.0.0.1:{port0 + k}",
+                             {"name": name, "role": role, "task": task, "layers": [0, 2],
+                              "pp": 1, "max_num_seqs": 16})
+            cores.append(core)
+            bridges.append(br)
+            tasks.append(asyncio.get_running_loop().create_task(br.run()))
+        for k, (name, role, task) in enumerate(spec):
+            cl = RemoteClient(f"tcp://127.0.0.1:{port0 + k}")
+            await cl.connect(timeout=10, direct=True)
+            clients.append(cl)
+            engines.append(Engine(name, role, cl, task=task))
+        co = TieredCoordinator(engines[:2], engines[2:], eos=EOS, direct=True,
+                               classify=_toy_classify, route="lr" if mode == "lr" else "task")
+        co.start()
+        app = make_app(co, stages={n: {"nodes": [f"N-{n}"]} for n, _, _ in spec},
+                       tokenizer=_ToyTok(), mode=mode, max_model_len=256, needs_body=True,
+                       identifier="toy")
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            async def one(i):
+                r = await client.post("/v1/completions", json={
+                    "prompt": prompts[i], "max_tokens": MAXT, "temperature": 0.0,
+                    "p2p_task": labels[i], "p2p_id": f"q{i}", "p2p_body": bodies[i]})
+                assert r.status == 200, await r.text()
+                d = await r.json()
+                return {"text": d["choices"][0]["text"], "channel": r.headers["X-P2P-Channel"],
+                        "task": r.headers["X-P2P-Task"]}
+
+            res = await asyncio.gather(*(one(i) for i in range(len(prompts))))
+            nobody = await client.post("/v1/completions", json={
+                "prompt": prompts[0], "max_tokens": 2, "temperature": 0.0, "p2p_task": "t0"})
+            recs = {r["id"]: r for r in
+                    (await (await client.get("/p2p/records")).json())["records"]}
+            await asyncio.sleep(0.1)
+            assert not any(br.routes or br.held for br in bridges)
+            return res, nobody.status, recs, cores
+        finally:
+            await client.close()
+            await co.close()
+            for t in tasks:
+                t.cancel()
+            for c in cores:
+                c.close()
+            for cl in clients:
+                cl.shutdown()
+
+    res, nobody, recs, cores = asyncio.run(go())
+    tok = _ToyTok()
+    for i, (p, r) in enumerate(zip(prompts, res)):
+        assert r["text"] == tok.decode(mono(p, MAXT, EOS))
+        # 两种模式下绑定的都是真 task 的后段：lr 靠识别（标签一半是错的），shadow 靠标签
+        assert r["task"] == truth[i] and r["channel"].startswith(f"back-{truth[i]}-")
+        rec = recs[f"q{i}"]
+        assert rec["true_task"] == labels[i] and rec["task"] == truth[i]
+        v = rec["verdict"] if mode == "lr" else rec["shadow"]
+        assert v["task"] == truth[i] and v["compute_ms"] is not None
+        assert (rec["verdict"] is None) == (mode == "shadow")
+    assert {r["channel"] for r in res if r["task"] == "t0"} == {"back-t0-0", "back-t0-1"}
+    # lr：识别器要 body，没带 body 直接 400；shadow 照常按标签跑、识别记下「没法判」
+    assert nobody == (400 if mode == "lr" else 200)
+    assert not any(c.sched.requests for c in cores)
+
+
+def test_front_exit_identify_failure_does_not_peek_at_label() -> None:
+    """识别抛错（或前段没交特征）：lr 模式下不偷看请求自带的 task，在全部后段里挑。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, _Req
+
+    backs = [Engine("b0", "back", None, task="t0"), Engine("b1", "back", None, task="t1")]
+    co = TieredCoordinator(Engine("f", "front", None), backs, classify=_toy_classify, route="lr")
+    loop = asyncio.new_event_loop()
+    try:
+        r = _Req("x", [1, 2, 3], 4, "t1", loop)
+        r.front = co.front
+        co._identify(r)
+        assert r.task is None and "前段没有交出" in r.info["verdict"]["error"]
+        r.feat = {"bogus": 1}
+        co._identify(r)
+        assert r.task is None and "KeyError" in r.info["verdict"]["error"]
+        r.feat = {"cls": 1}
+        co._identify(r)
+        assert r.task == "t1" and co._pick(r).name == "b1"
+    finally:
+        loop.close()
+    with pytest.raises(ValueError):
+        TieredCoordinator(Engine("f", "front", None), backs, route="lr")
+
+
+def test_lr_classify_reads_route_stats_wire() -> None:
+    """真的选择器文件 + 统计钩子交出的格式：前 L₀ 层齐了能判（不退先验报错），缺层时退先验并说明。"""
+    fw = ROOT.parent / "p2p-framework"
+    npz = fw / "selector" / "selector_body_L8_params.npz"
+    if not npz.is_file():
+        pytest.skip("旁边没有 p2p-framework 的选择器文件")
+    import sys
+
+    import numpy as np
+
+    sys.path.insert(0, str(fw))
+    from vllm.p2p.stats import RouteStats
+    from vllm.p2p.tiered_gateway import make_lr_classify
+
+    E, K, L0 = 128, 8, 8
+    classify, clf = make_lr_classify(lr_model=str(npz), l0=L0, n_experts=E,
+                                     tasks={"gsm8k": 1.0, "mbpp": 1.0})
+    st = RouteStats(n_experts=E, top_k=K, norm_topk=True, lr_layers=range(L0), channel="f",
+                    emit_lr=True, write=False, prefill_only=True)
+    for l in range(L0):
+        st.register_layer(l, None)
+    st.allocate(64, "cpu")
+    lg = torch.from_numpy(np.random.default_rng(0).standard_normal((20, E)).astype(np.float32))
+    for slot in range(L0):
+        st.capture(slot, lg)
+    from types import SimpleNamespace
+    reqs = {"r": SimpleNamespace(num_prompt_tokens=20, sampling_params=SimpleNamespace(
+        extra_args={"p2p_id": "r", "p2p_body": "3:17"}))}
+    st.on_step(["r"], [20], np.arange(20), reqs)
+    feat = st.take_lr("r")
+    assert sorted(int(k) for k in feat) == list(range(1, L0 + 1))
+    v = classify(feat, {"n_prompt": 20, "body": [[3, 17]]})
+    assert v["task"] in ("gsm8k", "mbpp") and not v.get("error") and v["n_body"] == 14
+    assert v["label"] and v["zone"] in ("commit", "observe", "prior")
+    del feat["8"]
+    v2 = classify(feat, {"n_prompt": 20, "body": [[3, 17]]})
+    assert v2["zone"] == "prior" and v2.get("error")
 
 
 def test_tiered_stats_groups_by_path(tmp_path, capsys) -> None:

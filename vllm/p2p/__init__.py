@@ -33,7 +33,9 @@
   每条通道的后段节点组成一个后段引擎）、`vllm/p2p/stage_agent.py`（每个分段引擎首节点上的代理：
   本机 EngineCore + 给协调器的 ZMQ 入口；其余节点 headless worker）、`vllm/p2p/remote.py`
   （协调器 ↔ 代理的线路，`RemoteClient` 与 `AsyncMPClient` 同接口）、`vllm/p2p/tiered_gateway.py`
-  （OpenAI 兼容网关 + 协调器，bench / report / compare 原样可用）。
+  （OpenAI 兼容网关 + 协调器，bench / report / compare 原样可用；`--mode lr` = 前段出口识别：前段在
+  prompt 算完时交出前 L₀ 层的路由统计（`stats.RouteStats.take_lr` → `EngineCoreOutput.p2p_feat`），
+  协调器跑 LR 定 task、再绑该 task 最闲的后段，路径此后不变）。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）
