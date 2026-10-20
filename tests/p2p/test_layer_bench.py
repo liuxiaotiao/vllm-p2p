@@ -175,3 +175,77 @@ def test_overrides_only_list_experts_when_partial() -> None:
     # 与模型读驻留集的解析器同口径（越界、空集都会报错）
     from vllm.p2p.layout import parse_layer_experts
     assert len(parse_layer_experts(ov["p2p_layer_experts"], 3, 128)[1]) == 64
+
+
+def _fake_worker(n_layers, n_exp, kv_blocks=10, block=16):
+    import torch
+    from torch import nn
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = nn.Parameter(torch.zeros(n_exp, 2 * 6, 8, dtype=torch.float16))
+            self.w2_weight = nn.Parameter(torch.zeros(n_exp, 8, 6, dtype=torch.float16))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Linear(8, 8, bias=False).half()
+            self.input_layernorm = nn.LayerNorm(8, elementwise_affine=True).half()
+            self.mlp = nn.Module()
+            self.mlp.gate = nn.Linear(8, 128, bias=False).half()
+            self.mlp.experts = Experts()
+
+    inner = nn.Module()
+    inner.layers = nn.ModuleList([Layer() for _ in range(n_layers)])
+    inner.start_layer, inner.end_layer = 0, n_layers
+    inner.embed_tokens = nn.Embedding(100, 8).half()
+    model = nn.Module()
+    model.model = inner
+    model.lm_head = nn.Linear(8, 100, bias=False).half()
+    kv = [torch.zeros(2, kv_blocks, block, 1, 4, dtype=torch.float16) for _ in range(n_layers)]
+    mr = SimpleNamespace(get_model=lambda: model, kv_caches=kv)
+    return SimpleNamespace(model_runner=mr, cache_config=SimpleNamespace(num_gpu_blocks=kv_blocks,
+                                                                         block_size=block))
+
+
+def test_mem_probe_counts_each_layer_exactly() -> None:
+    m = LB.mem_probe(_fake_worker(3, 5))
+    lay = m["layers"][0]
+    per_exp = (12 * 8 + 8 * 6) * 2
+    assert len(m["layers"]) == 3 and lay["n_experts"] == 5
+    assert lay["experts_bytes"] == 5 * per_exp and lay["router_bytes"] == 8 * 128 * 2
+    assert lay["attn_norm_bytes"] == (8 * 8 + 8 + 8) * 2
+    assert m["non_layer_param_bytes"] == (100 * 8 + 100 * 8) * 2          # embed + lm_head
+    assert m["kv_bytes"] == 3 * 2 * 10 * 16 * 4 * 2 and m["kv_tokens"] == 160
+    # KV 张量共享存储时只算一次
+    w = _fake_worker(2, 5)
+    w.model_runner.kv_caches = [w.model_runner.kv_caches[0]] * 2
+    assert LB.mem_probe(w)["kv_bytes"] == 2 * 10 * 16 * 4 * 2
+
+
+def test_summarise_memory_fits_per_layer_and_fixed() -> None:
+    MiB = LB.MiB
+
+    def probe(L, E):
+        lay = {"bytes": (40 + E * 9) * MiB, "experts_bytes": E * 9 * MiB, "router_bytes": 1 * MiB,
+               "attn_norm_bytes": 39 * MiB, "n_experts": E}
+        kv = 2000 * MiB
+        params = L * lay["bytes"] + 1200 * MiB
+        used = params + kv + 900 * MiB + L * 5 * MiB          # 固定 900 + 每层 5（图池 / 激活）
+        return {"layers": [lay] * L, "param_bytes": params, "non_layer_param_bytes": 1200 * MiB,
+                "kv_bytes": kv, "kv_tokens": 2000 * MiB // (L * 2048), "kv_layers": L,
+                "device_total": 24000 * MiB, "device_free": 24000 * MiB - used,
+                "torch_peak_allocated": params + kv + 300 * MiB + L * 2 * MiB}
+
+    runs = [{"layers": L, "experts": 64, "decode": {"1": 1.0 + L}, "prefill": {},
+             "mem": {"after_init": probe(L, 64), "after_run": probe(L, 64)}} for L in (2, 6)]
+    m = LB.summarise({"runs": runs})["memory"]["64"]
+    assert m["weight_mib_per_layer"] == pytest.approx(40 + 64 * 9)
+    assert m["mib_per_expert"] == pytest.approx(9) and m["experts_per_layer"] == 64
+    assert m["non_layer_weight_mib"] == pytest.approx(1200)
+    assert m["kv_kib_per_token_per_layer"] == pytest.approx(2.0, rel=1e-3)
+    assert m["device_non_kv_mib_per_layer"] == pytest.approx(40 + 64 * 9 + 5, abs=0.1)
+    assert m["device_non_kv_mib_fixed"] == pytest.approx(1200 + 900, abs=1)
+    assert m["activation_peak_mib_per_layer"] == pytest.approx(2, abs=0.01)
+    assert m["activation_peak_mib_fixed"] == pytest.approx(300, abs=1)

@@ -38,8 +38,15 @@ fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的
 随机权重的路由近似均匀，batch > 1 时碰到的专家数比真实路由（偏斜）略多 —— decode 的单条
 （B=1）几乎不受影响，大 batch 的数偏保守。
 
+显存（`memory[E]`）：引擎起好后、量完后各在 worker 里查一次（`collective_rpc`）——
+* 每层权重：逐层数参数字节（注意力 + norm / 路由 / 专家，及每个专家多少），是精确值，不是估的；
+* 层外权重：embed_tokens + lm_head + 最后的 norm；
+* KV：每 token 每层多少字节（按 vLLM 实际分配的 KV 张量算），本次能放多少 token；
+* 运行时峰值：PyTorch 分配器的峰值 − 权重 − KV（激活、采样缓冲等），按层数拟合出「每层」与「固定」两部分；
+* 整卡非 KV 占用：(显存总量 − 空闲) − KV，同样拟合成每层 + 固定（固定部分含 CUDA 上下文、CUDA Graph 池）。
+
 输出（每台一个 JSON）里 `decode[E][B]` / `prefill[E][P]` 是每层毫秒，`summary.ms_per_layer`
-是给规划器的那个数（默认 E=128、B=1 的 decode）。
+是给规划器的那个数（默认 E=128、B=1 的 decode），`memory[E]` 是上面的显存账。
 
 `cluster` 与 `topo` 只用标准库，控制机上按文件路径直接跑。
 """
@@ -94,14 +101,135 @@ def fit_per_layer(points: Mapping[int, float]) -> tuple[float, float]:
     return slope, my - slope * mx
 
 
+MiB = 1024 ** 2
+
+
+def _bytes(mod) -> int:
+    return sum(p.numel() * p.element_size() for p in mod.parameters()) if mod is not None else 0
+
+
+def _storage_bytes(tensors) -> int:
+    """KV 张量（可能嵌套在 list 里、可能共享存储）的总字节数，按存储去重。"""
+    seen, tot = set(), 0
+
+    def walk(x):
+        nonlocal tot
+        if isinstance(x, (list, tuple)):
+            for y in x:
+                walk(y)
+            return
+        if not hasattr(x, "untyped_storage"):
+            return
+        st_ = x.untyped_storage()
+        key = (st_.data_ptr(), st_.nbytes())
+        if key not in seen:
+            seen.add(key)
+            tot += st_.nbytes()
+    walk(tensors)
+    return tot
+
+
+def mem_probe(worker) -> dict:
+    """在 worker 进程里跑（`LLM.collective_rpc`）：逐层权重、层外权重、KV、PyTorch 与整卡显存。"""
+    import torch
+
+    mr = worker.model_runner
+    model = mr.get_model() if hasattr(mr, "get_model") else mr.model
+    inner = model.model
+    layers = []
+    for i in range(int(getattr(inner, "start_layer", 0)), int(getattr(inner, "end_layer", len(inner.layers)))):
+        lay = inner.layers[i]
+        mlp = getattr(lay, "mlp", None)
+        experts = getattr(mlp, "experts", None)
+        w13 = getattr(experts, "w13_weight", None)
+        n_exp = int(w13.shape[0]) if w13 is not None else 0
+        tot, ex, rt = _bytes(lay), _bytes(experts), _bytes(getattr(mlp, "gate", None))
+        layers.append({"idx": i, "bytes": tot, "experts_bytes": ex, "router_bytes": rt,
+                       "attn_norm_bytes": tot - ex - rt, "n_experts": n_exp})
+    params = _bytes(model)
+    cc = getattr(worker, "cache_config", None) or getattr(mr, "cache_config", None)
+    blocks = int(getattr(cc, "num_gpu_blocks", 0) or 0)
+    bsz = int(getattr(cc, "block_size", 0) or 0)
+    out = {"layers": layers, "param_bytes": params,
+           "non_layer_param_bytes": params - sum(l["bytes"] for l in layers),
+           "kv_bytes": _storage_bytes(getattr(mr, "kv_caches", [])), "kv_tokens": blocks * bsz,
+           "kv_layers": len(layers)}
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        out.update(torch_allocated=torch.cuda.memory_allocated(), torch_reserved=torch.cuda.memory_reserved(),
+                   torch_peak_allocated=torch.cuda.max_memory_allocated(),
+                   device_total=total, device_free=free)
+    return out
+
+
+def summarise_memory(runs: Sequence[Mapping]) -> dict:
+    """同一档专家数、不同层数的几次 → 每层 / 固定 的显存账（MiB）。runs[i]["mem"] = {"after_init",
+    "after_run"}（`mem_probe` 的输出）。"""
+    rs = [r for r in runs if (r.get("mem") or {}).get("after_init")]
+    if not rs:
+        return {}
+
+    def med(xs):
+        xs = [x for x in xs if x is not None]
+        return round(st.median(xs), 3) if xs else None
+
+    per = []
+    for r in rs:
+        m = r["mem"]["after_init"]
+        ls = m["layers"]
+        n = max(len(ls), 1)
+        per.append({
+            "L": int(r["layers"]),
+            "w": sum(l["bytes"] for l in ls) / n / MiB,
+            "attn": sum(l["attn_norm_bytes"] for l in ls) / n / MiB,
+            "router": sum(l["router_bytes"] for l in ls) / n / MiB,
+            "exp": sum(l["experts_bytes"] for l in ls) / n / MiB,
+            "per_exp": (sum(l["experts_bytes"] for l in ls) / max(sum(l["n_experts"] for l in ls), 1) / MiB),
+            "n_exp": sum(l["n_experts"] for l in ls) / n,
+            "nonlayer": m["non_layer_param_bytes"] / MiB,
+            "kv_tok_layer": (m["kv_bytes"] / (m["kv_tokens"] * m["kv_layers"])
+                             if m.get("kv_tokens") and m.get("kv_layers") else None),
+            "kv_tokens": m.get("kv_tokens"),
+            "device_non_kv": ((m["device_total"] - m["device_free"] - m["kv_bytes"]) / MiB
+                              if m.get("device_total") else None),
+            "peak_act": (((r["mem"].get("after_run") or m).get("torch_peak_allocated", 0)
+                          - m["param_bytes"] - m["kv_bytes"]) / MiB if m.get("device_total") else None),
+            "device_total": m.get("device_total"),
+        })
+    out = {
+        "experts_per_layer": med([p["n_exp"] for p in per]),
+        "weight_mib_per_layer": med([p["w"] for p in per]),
+        "attn_norm_mib_per_layer": med([p["attn"] for p in per]),
+        "router_mib_per_layer": med([p["router"] for p in per]),
+        "experts_mib_per_layer": med([p["exp"] for p in per]),
+        "mib_per_expert": med([p["per_exp"] for p in per]),
+        "non_layer_weight_mib": med([p["nonlayer"] for p in per]),
+        "kv_kib_per_token_per_layer": (round(med([p["kv_tok_layer"] for p in per]) / 1024, 4)
+                                       if med([p["kv_tok_layer"] for p in per]) else None),
+        "kv_tokens": {str(p["L"]): p["kv_tokens"] for p in per},
+        "device_total_mib": med([p["device_total"] / MiB if p["device_total"] else None for p in per]),
+    }
+    for key, name in (("device_non_kv", "device_non_kv"), ("peak_act", "activation_peak")):
+        pts = {p["L"]: p[key] for p in per if p[key] is not None}
+        out[f"{name}_mib"] = {str(k): round(v, 1) for k, v in sorted(pts.items())}
+        if len(pts) >= 2:
+            sl, ic = fit_per_layer(pts)
+            out[f"{name}_mib_per_layer"] = round(sl, 2)
+            out[f"{name}_mib_fixed"] = round(ic, 1)
+    return out
+
+
 def summarise(raw: Mapping, *, ref_experts: int = 128, ref_batch: int = 1) -> dict:
     """各子进程的原始耗时 → 每层毫秒。raw = {"runs": [{"layers", "experts", "decode": {B: ms},
     "prefill": {P: ms}}, …], 其余字段原样带上}。"""
     by_e: dict[int, list] = {}
     for r in raw["runs"]:
         by_e.setdefault(int(r["experts"]), []).append(r)
-    decode, prefill, overhead = {}, {}, {}
+    decode, prefill, overhead, memory = {}, {}, {}, {}
     for e, runs in sorted(by_e.items(), reverse=True):
+        mem = summarise_memory(runs)
+        if mem:
+            memory[str(e)] = mem
         if len({int(r["layers"]) for r in runs}) < 2:
             continue
         bs = sorted({int(b) for r in runs for b in r["decode"]})
@@ -120,7 +248,8 @@ def summarise(raw: Mapping, *, ref_experts: int = 128, ref_batch: int = 1) -> di
                 prefill[str(e)][str(p)] = round(fit_per_layer(pts)[0], 4)
     ref = (decode.get(str(ref_experts)) or {}).get(str(ref_batch))
     out = {k: v for k, v in raw.items() if k != "runs"}
-    out.update(decode=decode, prefill=prefill, decode_overhead_ms=overhead, runs=raw["runs"],
+    out.update(decode=decode, prefill=prefill, decode_overhead_ms=overhead, memory=memory,
+               runs=raw["runs"],
                summary={"ms_per_layer": ref, "ref_experts": ref_experts, "ref_batch": ref_batch,
                         "definition": "decode 一步、每层、毫秒（batch = ref_batch 条请求同时 decode 时"
                                       "每条请求每层等的时间；上下文 = context 个 token）"})
@@ -188,10 +317,16 @@ def topo_with_measurements(topo: Mapping, results: Sequence[Mapping], *, ref_bat
         n.setdefault("compute_capacity_orig", n["compute_capacity"])
         # 旧版规划器只认 compute_capacity：按实测改成同比例，它算出来的相对快慢也对
         n["compute_capacity"] = round(top * fastest / n["ms_per_layer"], 1)
+    mem_by_gpu = {}
+    for res in results:
+        if res.get("memory"):
+            mem_by_gpu.setdefault(gpu_key(res.get("gpu", "")), res["memory"])
     out["ms_per_layer_meta"] = {
         "source": "vllm/p2p/layer_bench.py", "ref_batch": rb_used, "ref_experts": re_used,
         "unit": "ms / 层 / token（decode）", "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "gpus": {g: round(v, 4) for g, v in sorted(gpu_ms.items())}}
+        "gpus": {g: round(v, 4) for g, v in sorted(gpu_ms.items())},
+        # 规划器的显存账（ModelSpec 每层权重 / KV、A2b 的引擎开销）可以拿这个对：每层精确值 + 固定开销
+        "memory_mib": mem_by_gpu}
     return out, notes
 
 
@@ -275,6 +410,8 @@ def _worker(argv: Sequence[str]) -> int:
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    # collective_rpc 要把 mem_probe 这个函数发给 worker（按模块路径引用，worker 里同样 import 得到）
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     from vllm import LLM
 
@@ -295,10 +432,22 @@ def _worker(argv: Sequence[str]) -> int:
     t0 = time.perf_counter()
     llm = LLM(**kw)
     print(f"  [L={a.layers} E={a.experts}] 引擎起好 {time.perf_counter() - t0:.0f}s", flush=True)
+
+    def probe():
+        try:
+            return llm.collective_rpc(mem_probe)[0]
+        except Exception as e:                               # noqa: BLE001 — 显存账查不到不影响计时
+            print(f"    （显存查询失败：{type(e).__name__}: {e}）", flush=True)
+            return None
+    m0 = probe()
+    if m0:
+        w = sum(l["bytes"] for l in m0["layers"]) / max(len(m0["layers"]), 1) / MiB
+        print(f"    显存：每层权重 {w:.1f} MiB，层外权重 {m0['non_layer_param_bytes'] / MiB:.0f} MiB，"
+              f"KV {m0['kv_bytes'] / MiB:.0f} MiB（{m0['kv_tokens']} token）", flush=True)
     res = measure(llm, batches=batches, context=a.context, decode_steps=a.decode_steps,
                   prefill_lens=prefill, repeats=a.repeats, vocab=int(cfg["vocab_size"]),
                   log=lambda s: print(s, flush=True))
-    res.update(layers=a.layers, experts=a.experts)
+    res.update(layers=a.layers, experts=a.experts, mem={"after_init": m0, "after_run": probe()})
     Path(a.out).write_text(json.dumps(res), encoding="utf-8")
     return 0
 
@@ -332,6 +481,7 @@ def cmd_run(a) -> int:
           f"上下文 {a.context}，prefill {a.prefill}，{'eager' if a.eager else 'CUDA Graph'}", flush=True)
     env = dict(os.environ)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    env.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     runs = []
     with tempfile.TemporaryDirectory(prefix="layer_bench_") as td:
         mdir = _prepare_model_dir(Path(a.model_dir), Path(td) / "model")
@@ -355,7 +505,7 @@ def cmd_run(a) -> int:
                     return 2
                 if not a.verbose:
                     for ln in (p.stdout or "").splitlines():
-                        if ln.startswith("  [") or ln.startswith("    "):
+                        if ln.startswith("  [") or ln.startswith("    "):   # 进度、计时、显存行
                             print(ln, flush=True)
                 runs.append(json.loads(out.read_text(encoding="utf-8")))
     try:
@@ -382,6 +532,18 @@ def print_table(res: Mapping) -> None:
         pf = (res.get("prefill") or {}).get(e) or {}
         if pf:
             print(f"  E={e:<4} prefill " + "  ".join(f"P={p}:{v:.2f}" for p, v in pf.items()))
+    for e, m in (res.get("memory") or {}).items():
+        def g(k, fmt="{:.1f}"):
+            v = m.get(k)
+            return "—" if v is None else fmt.format(v)
+        print(f"  E={e:<4} 显存/层  权重 {g('weight_mib_per_layer')} MiB"
+              f"（注意力+norm {g('attn_norm_mib_per_layer')}、路由 {g('router_mib_per_layer', '{:.2f}')}、"
+              f"专家 {g('experts_mib_per_layer')} = {g('experts_per_layer', '{:.0f}')} × "
+              f"{g('mib_per_expert', '{:.2f}')}）  KV {g('kv_kib_per_token_per_layer', '{:.2f}')} KiB/token")
+        print(f"  E={e:<4} 显存/固定 层外权重 {g('non_layer_weight_mib', '{:.0f}')} MiB  "
+              f"运行时峰值 每层 {g('activation_peak_mib_per_layer')} + 固定 {g('activation_peak_mib_fixed', '{:.0f}')} MiB  "
+              f"整卡非 KV 每层 {g('device_non_kv_mib_per_layer')} + 固定 {g('device_non_kv_mib_fixed', '{:.0f}')} MiB"
+              f"  （KV 可放 {m.get('kv_tokens')} token）")
     sm = res.get("summary") or {}
     print(f"  → 规划器用的 ms_per_layer = {sm.get('ms_per_layer')}"
           f"（E={sm.get('ref_experts')}、B={sm.get('ref_batch')} 的 decode）")
