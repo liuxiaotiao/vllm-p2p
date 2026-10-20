@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""vllm/p2p/layer_bench.py：每层耗时的拟合、汇总、写拓扑，以及量法本身（假引擎 + 假时钟，不要 GPU）。"""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from vllm.p2p import layer_bench as LB
+
+
+def test_gpu_key_matches_topology_roles() -> None:
+    assert LB.gpu_key("NVIDIA A30") == "A30" == LB.gpu_key("A30")
+    assert LB.gpu_key("Quadro RTX 6000") == "RTX6000" == LB.gpu_key("RTX6000")
+    assert LB.gpu_key("Tesla T4") == "T4"
+
+
+def test_fit_per_layer() -> None:
+    assert LB.fit_per_layer({2: 10.0, 6: 18.0}) == pytest.approx((2.0, 6.0))
+    s, c = LB.fit_per_layer({1: 5.1, 3: 9.0, 5: 12.9})
+    assert s == pytest.approx(1.95) and c == pytest.approx(3.1, abs=0.05)
+    with pytest.raises(ValueError):
+        LB.fit_per_layer({2: 1.0})
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def perf_counter(self):
+        return self.t
+
+
+class _FakeLLM:
+    """一步 decode = 开销 + 层数 × 每层(batch)；prefill = 开销 + 层数 × 每层(长度)。时间推进假时钟。"""
+
+    def __init__(self, clock, layers, per_layer_dec, per_layer_pre, overhead=3.0):
+        self.c, self.L, self.dec, self.pre, self.oh = clock, layers, per_layer_dec, per_layer_pre, overhead
+        self.calls = []
+
+    def generate(self, prompts, sp, use_tqdm=False):
+        b, p = len(prompts), len(prompts[0]["prompt_token_ids"])
+        self.calls.append((b, p, sp.max_tokens))
+        ms = self.oh + self.L * self.pre(p * b)                      # prefill + 第一个 token
+        ms += (sp.max_tokens - 1) * (self.oh + self.L * self.dec(b))
+        self.c.t += ms / 1e3
+
+
+def test_measure_and_summarise_recover_per_layer_time(monkeypatch) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(LB, "time", SimpleNamespace(perf_counter=clock.perf_counter))
+
+    def dec(b):
+        return 0.4 + 0.05 * b
+
+    def pre(n):
+        return 0.002 * n
+
+    runs = []
+    for e in (128, 64):
+        for l in (2, 6):
+            llm = _FakeLLM(clock, l, dec if e == 128 else (lambda b: dec(b) * 0.9), pre)
+            r = LB.measure(llm, batches=[1, 4], context=32, decode_steps=16, prefill_lens=[128, 512],
+                           repeats=2, vocab=1000)
+            r.update(layers=l, experts=e)
+            runs.append(r)
+            # 每个 batch：预热 1 次 + 每次重复两条（1 个 token / 1+K 个）；没有命中前缀缓存的可能：每次新 prompt
+            assert (4, 32, 17) in llm.calls and (1, 512, 1) in llm.calls
+    res = LB.summarise({"node": "N01", "gpu": "NVIDIA A30", "runs": runs})
+    assert res["decode"]["128"]["1"] == pytest.approx(0.45, abs=1e-3)
+    assert res["decode"]["128"]["4"] == pytest.approx(0.60, abs=1e-3)
+    assert res["decode"]["64"]["4"] == pytest.approx(0.54, abs=1e-3)
+    assert res["decode_overhead_ms"]["128"]["1"] == pytest.approx(3.0, abs=1e-2)   # 与层数无关的部分被分出来
+    assert res["prefill"]["128"]["512"] == pytest.approx(1.024, abs=1e-3)
+    assert res["summary"]["ms_per_layer"] == pytest.approx(0.45, abs=1e-3)
+    assert res["node"] == "N01" and len(res["runs"]) == 4
+
+
+def _res(node, gpu, ms):
+    return {"node": node, "gpu": gpu, "decode": {"128": {"1": ms, "4": ms * 1.5}},
+            "summary": {"ref_batch": 1, "ref_experts": 128}}
+
+
+TOPO = {"nodes": [{"id": "N01", "compute_capacity": 165000.0, "memory_capacity": 24, "role": "A30"},
+                  {"id": "N02", "compute_capacity": 165000.0, "memory_capacity": 24, "role": "A30"},
+                  {"id": "N09", "compute_capacity": 130500.0, "memory_capacity": 24, "role": "RTX6000"},
+                  {"id": "N12", "compute_capacity": 65000.0, "memory_capacity": 16, "role": "T4"}],
+        "edges": [{"u": "N01", "v": "N02", "bandwidth": 1000, "propagation_delay": 0.1}]}
+
+
+def test_topo_with_measurements() -> None:
+    out, notes = LB.topo_with_measurements(TOPO, [_res("N01", "NVIDIA A30", 0.5),
+                                                  _res("N09", "Quadro RTX 6000", 1.9),
+                                                  _res("N12", "Tesla T4", 3.25)])
+    by = {n["id"]: n for n in out["nodes"]}
+    assert by["N01"]["ms_per_layer"] == 0.5 and "本机" in by["N01"]["ms_per_layer_src"]
+    assert by["N02"]["ms_per_layer"] == 0.5 and "同卡型" in by["N02"]["ms_per_layer_src"]
+    assert by["N09"]["ms_per_layer"] == 1.9 and by["N12"]["ms_per_layer"] == 3.25
+    # 旧规划器只看 compute_capacity：改成与实测同比例，原值留着
+    assert by["N01"]["compute_capacity"] == 165000.0 and by["N12"]["compute_capacity_orig"] == 65000.0
+    assert by["N12"]["compute_capacity"] == pytest.approx(165000 * 0.5 / 3.25, rel=1e-3)
+    assert out["edges"] == TOPO["edges"] and TOPO["nodes"][0].get("ms_per_layer") is None   # 原对象不动
+    assert out["ms_per_layer_meta"]["gpus"] == {"A30": 0.5, "RTX6000": 1.9, "T4": 3.25}
+    # 换 batch 取值
+    out4, _ = LB.topo_with_measurements(TOPO, [_res("N01", "A30", 0.5), _res("N09", "RTX6000", 1.9),
+                                               _res("N12", "T4", 3.25)], ref_batch=4)
+    assert {n["id"]: n["ms_per_layer"] for n in out4["nodes"]}["N09"] == pytest.approx(2.85)
+    # 缺卡型：默认报错；allow_missing 时按原算力比例换算并标出来
+    with pytest.raises(ValueError, match="T4"):
+        LB.topo_with_measurements(TOPO, [_res("N01", "A30", 0.5), _res("N09", "RTX6000", 1.9)])
+    out3, notes3 = LB.topo_with_measurements(TOPO, [_res("N01", "A30", 0.5), _res("N09", "RTX6000", 1.9)],
+                                             allow_missing=True)
+    n12 = {n["id"]: n for n in out3["nodes"]}["N12"]
+    assert n12["ms_per_layer"] == pytest.approx(1.9 * 130500 / 65000, rel=1e-3) and notes3
+    with pytest.raises(ValueError, match="B=2"):
+        LB.topo_with_measurements(TOPO, [_res("N01", "A30", 0.5)], ref_batch=2, allow_missing=True)
+
+
+def test_topo_cli_and_planner_reads_it(tmp_path, capsys) -> None:
+    t = tmp_path / "topo.json"
+    t.write_text(json.dumps(TOPO))
+    rs = []
+    for node, gpu, ms in (("N01", "NVIDIA A30", 0.5), ("N09", "Quadro RTX 6000", 1.9), ("N12", "Tesla T4", 3.25)):
+        p = tmp_path / f"{node}.json"
+        p.write_text(json.dumps(_res(node, gpu, ms)))
+        rs.append(str(p))
+    out = tmp_path / "topo_measured.json"
+    assert LB.main(["topo", "--topo", str(t), "--results", *rs, "--out", str(out)]) == 0
+    assert LB.main(["topo", "--topo", str(t), "--results", *rs, "--out", str(t)]) == 2   # 不覆盖原文件
+    assert "N12" in capsys.readouterr().out
+
+    fw = LB.Path(__file__).resolve().parents[3] / "p2p-framework"
+    if not (fw / "p2pmoe" / "planner" / "from_data.py").is_file():
+        pytest.skip("旁边没有 p2p-framework")
+    import sys
+    sys.path.insert(0, str(fw))
+    from p2pmoe.planner.from_data import load_topology
+
+    ms = {n.id: n.ms_per_layer for n in load_topology(out).nodes}
+    assert ms == {"N01": 0.5, "N02": 0.5, "N09": 1.9, "N12": 3.25}
+    old = {n.id: n.ms_per_layer for n in load_topology(t).nodes}     # 没有实测：旧口径
+    assert old["N01"] == 0.35 and old["N12"] == pytest.approx(0.35 * 165000 / 65000, abs=1e-4)
+
+
+def test_cluster_picks_one_node_per_gpu_type(tmp_path) -> None:
+    h = tmp_path / "hosts.txt"
+    h.write_text("# 注释\nN01  192.168.1.2:9101   # A30 24GB\nN02  192.168.1.3:9101 # A30\n"
+                 "N09  192.168.3.4:9101   # RTX6000 24GB\nN12 192.168.3.5:9101 # T4 16GB\n"
+                 "N15 192.168.4.4 # T4\n")
+    hosts = LB.parse_hosts(h)
+    assert hosts["N09"] == ("192.168.3.4", "RTX6000") and hosts["N15"] == ("192.168.4.4", "T4")
+    assert LB.pick_nodes(hosts, None) == ["N01", "N09", "N12"]
+    assert LB.pick_nodes(hosts, "all") == ["N01", "N02", "N09", "N12", "N15"]
+    assert LB.pick_nodes(hosts, "N02,N15") == ["N02", "N15"]
+    with pytest.raises(SystemExit):
+        LB.pick_nodes(hosts, "N99")
+    a = SimpleNamespace(model_dir="/w", layers="2,6", experts="128,64", batches="1,4", prefill="128",
+                        context=512, decode_steps=64, repeats=3, gpu_mem=0.85, ref_batch=1,
+                        ref_experts=128, eager=False, force=False, repo="/home/ubuntu/vllm-p2p",
+                        python="/home/ubuntu/venvs/vllm-p2p/bin/python")
+    cmd = LB.remote_command("N09", a)
+    assert cmd.startswith("cd /home/ubuntu/vllm-p2p && /home/ubuntu/venvs/vllm-p2p/bin/python -m "
+                          "vllm.p2p.layer_bench run ")
+    assert "--node N09" in cmd and "--out /tmp/layer_bench_N09.json" in cmd and "--eager" not in cmd
+
+
+def test_overrides_only_list_experts_when_partial() -> None:
+    assert "p2p_layer_experts" not in LB._overrides(2, 128, 128)
+    ov = LB._overrides(3, 64, 128)
+    assert ov["num_hidden_layers"] == 3 and ov["architectures"] == [LB.ARCH]
+    assert sorted(ov["p2p_layer_experts"]) == ["0", "1", "2"] and len(ov["p2p_layer_experts"]["2"]) == 64
+    # 与模型读驻留集的解析器同口径（越界、空集都会报错）
+    from vllm.p2p.layout import parse_layer_experts
+    assert len(parse_layer_experts(ov["p2p_layer_experts"], 3, 128)[1]) == 64

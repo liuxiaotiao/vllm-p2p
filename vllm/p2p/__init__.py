@@ -36,6 +36,8 @@
   （OpenAI 兼容网关 + 协调器，bench / report / compare 原样可用；`--mode lr` = 前段出口识别：前段在
   prompt 算完时交出前 L₀ 层的路由统计（`stats.RouteStats.take_lr` → `EngineCoreOutput.p2p_feat`），
   协调器跑 LR 定 task、再绑该 task 最闲的后段，路径此后不变）。
+* `vllm/p2p/layer_bench.py` —— 各型 GPU 上「一层」的实测耗时（同一套 vLLM kernel、随机权重、
+  两种层数相减），写进 p2p-framework 规划器的拓扑文件（节点的 `ms_per_layer`）。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）
