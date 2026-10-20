@@ -14,11 +14,11 @@ A30 4 ms / RTX 6000 15 ms / T4 26 ms（8 层）—— 卡型之间差 3.7–6.5 
     python -m vllm.p2p.layer_bench run --model-dir /home/ubuntu/p2p-framework/weights-q3-30b \\
         --out results/layer_bench_N01.json
 
-    # 2. 在控制机上一次量所有卡型（每种卡型挑一台，ssh 过去跑 run，结果收回来）
+    # 2. 在控制机上量所有节点（各台同时 ssh 过去跑 run，结果收回来，按卡型取均值）
     python3 vllm/p2p/layer_bench.py cluster --hosts /home/ubuntu/p2p-framework/task/hosts.txt \\
         --out-dir results/layer_bench
 
-    # 3. 把结果写进规划器的拓扑文件（新文件；原文件不动）
+    # 3. 把结果写进规划器的拓扑文件（新文件；原文件不动）：每个节点用它这种卡型的均值
     python3 vllm/p2p/layer_bench.py topo --topo /home/ubuntu/p2p-framework/task/topo_fabric_mbps.json \\
         --results results/layer_bench/*.json --out /home/ubuntu/p2p-framework/task/topo_measured.json
 
@@ -26,13 +26,16 @@ A30 4 ms / RTX 6000 15 ms / T4 26 ms（8 层）—— 卡型之间差 3.7–6.5 
 ----------------
 不要 checkpoint：拿 `--model-dir` 里的 config.json（层的形状），用 vLLM 的 `load_format=dummy`
 （随机权重）起**整模型引擎**，只是把层数改小。同一组参数起两次（默认 2 层、6 层），每次量
-「batch B 条请求、上下文 C 个 token 时，一步 decode 的耗时」与「长 P 的 prompt 一次 prefill 的耗时」，
+「batch B 条请求、上下文 C 个 token 时，一步 decode 的耗时」与「长 P 的 prompt 一次 prefill 的耗时」
+（C、P 默认都是 128, 256, …, 1024，`--lengths 起:止:步长`），
 两次相减除以层数差 = **一层**的耗时。embed、lm_head、采样、调度这些与层数无关的开销在相减时抵掉了。
 kernel 与部署时相同：`Qwen3MoePartialForCausalLM`（每层只建 E 个专家，`--experts` 可量几档）、
 fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的子进程里起引擎。
 
 * decode 一步：先发 B 条长 C 的随机 prompt 只生成 1 个 token（= prefill + 1 步），再发同样的
-  B 条生成 1+K 个，两者之差 / K = 一步 decode。重复 `--repeats` 次取中位数。
+  B 条生成 1+K 个，两者之差 / K = 一步 decode（上下文从 C 涨到 C+K，取的是这一段的平均）。
+  重复 `--repeats` 次取中位数。`max_num_batched_tokens` 设成 max(B)×max(C)，让 B 条的 prefill
+  一步做完、不和 decode 混在同一步里。
 * prefill：B=1、长 P 的 prompt 只生成 1 个 token 的耗时（每条 prompt 都是新随机的，不命中前缀缓存）。
 
 随机权重的路由近似均匀，batch > 1 时碰到的专家数比真实路由（偏斜）略多 —— decode 的单条
@@ -45,8 +48,12 @@ fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的
 * 运行时峰值：PyTorch 分配器的峰值 − 权重 − KV（激活、采样缓冲等），按层数拟合出「每层」与「固定」两部分；
 * 整卡非 KV 占用：(显存总量 − 空闲) − KV，同样拟合成每层 + 固定（固定部分含 CUDA 上下文、CUDA Graph 池）。
 
-输出（每台一个 JSON）里 `decode[E][B]` / `prefill[E][P]` 是每层毫秒，`summary.ms_per_layer`
-是给规划器的那个数（默认 E=128、B=1 的 decode），`memory[E]` 是上面的显存账。
+输出（每台一个 JSON）里 `decode[E][C][B]` / `prefill[E][P]` 是每层毫秒，`memory[E]` 是上面的显存账，
+`summary.ms_per_layer` 是给规划器的那个数（默认 E=128、B=1、各上下文长度取均值的 decode）。
+
+多台（`cluster`）：默认量**全部节点**，再按卡型对每一项取**均值**（`summary_by_gpu.json`，另记每台的
+`ms_per_layer` 与最快 / 最慢之比，看同型卡之间差多少）；`topo` 默认给每个节点写它这种卡型的均值
+（`--per-node` 改用各台自己的）。
 
 `cluster` 与 `topo` 只用标准库，控制机上按文件路径直接跑。
 """
@@ -67,13 +74,14 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-__all__ = ["gpu_key", "fit_per_layer", "summarise", "topo_with_measurements", "main"]
+__all__ = ["gpu_key", "fit_per_layer", "parse_lengths", "summarise", "aggregate",
+           "topo_with_measurements", "main"]
 
 ARCH = "Qwen3MoePartialForCausalLM"
 DEFAULT_LAYERS = (2, 6)
 DEFAULT_EXPERTS = (128, 64)
 DEFAULT_BATCHES = (1, 2, 4, 8, 16)
-DEFAULT_PREFILL = (128, 512, 2048)
+DEFAULT_LENGTHS = "128:1024:128"           # prefill 长度与 decode 上下文：128, 256, …, 1024
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
        "-o", "StrictHostKeyChecking=accept-new"]
 
@@ -87,6 +95,28 @@ def gpu_key(name: str) -> str:
     for p in ("NVIDIA ", "TESLA ", "QUADRO ", "GEFORCE "):
         s = s.replace(p, "")
     return re.sub(r"[\s\-_]", "", s)
+
+
+def parse_lengths(spec: str) -> list[int]:
+    """「128:1024:128」→ [128, 256, …, 1024]；「128,512,1024」→ 原样。"""
+    spec = str(spec).strip()
+    if ":" in spec:
+        parts = [int(x) for x in spec.split(":")]
+        if len(parts) == 2:
+            parts.append(parts[0])
+        a, b, step = parts
+        if a <= 0 or b < a or step <= 0:
+            raise ValueError(f"长度 {spec!r} 要写成 起:止:步长（正整数，止 ≥ 起）")
+        return list(range(a, b + 1, step))
+    out = [int(x) for x in spec.split(",") if x.strip()]
+    if not out or min(out) <= 0:
+        raise ValueError(f"长度 {spec!r} 不对")
+    return out
+
+
+def _mean(xs):
+    xs = [float(x) for x in xs if isinstance(x, (int, float))]
+    return sum(xs) / len(xs) if xs else None
 
 
 def fit_per_layer(points: Mapping[int, float]) -> tuple[float, float]:
@@ -219,9 +249,10 @@ def summarise_memory(runs: Sequence[Mapping]) -> dict:
     return out
 
 
-def summarise(raw: Mapping, *, ref_experts: int = 128, ref_batch: int = 1) -> dict:
-    """各子进程的原始耗时 → 每层毫秒。raw = {"runs": [{"layers", "experts", "decode": {B: ms},
-    "prefill": {P: ms}}, …], 其余字段原样带上}。"""
+def summarise(raw: Mapping, *, ref_experts: int = 128, ref_batch: int = 1,
+              ref_context: str | int = "mean") -> dict:
+    """各子进程的原始耗时 → 每层毫秒。raw = {"runs": [{"layers", "experts", "decode": {C: {B: ms}},
+    "prefill": {P: ms}, "mem": …}, …], 其余字段原样带上}。"""
     by_e: dict[int, list] = {}
     for r in raw["runs"]:
         by_e.setdefault(int(r["experts"]), []).append(r)
@@ -232,66 +263,124 @@ def summarise(raw: Mapping, *, ref_experts: int = 128, ref_batch: int = 1) -> di
             memory[str(e)] = mem
         if len({int(r["layers"]) for r in runs}) < 2:
             continue
-        bs = sorted({int(b) for r in runs for b in r["decode"]})
+        cs = sorted({int(c) for r in runs for c in r["decode"]})
         decode[str(e)], overhead[str(e)] = {}, {}
-        for b in bs:
-            pts = {int(r["layers"]): r["decode"][str(b)] for r in runs if str(b) in r["decode"]}
-            if len(pts) >= 2:
-                s, c = fit_per_layer(pts)
-                decode[str(e)][str(b)] = round(s, 4)
-                overhead[str(e)][str(b)] = round(c, 3)
+        for c in cs:
+            bs = sorted({int(b) for r in runs for b in (r["decode"].get(str(c)) or {})})
+            for b in bs:
+                pts = {int(r["layers"]): r["decode"][str(c)][str(b)] for r in runs
+                       if str(b) in (r["decode"].get(str(c)) or {})}
+                if len(pts) >= 2:
+                    sl, ic = fit_per_layer(pts)
+                    decode[str(e)].setdefault(str(c), {})[str(b)] = round(sl, 4)
+                    overhead[str(e)].setdefault(str(c), {})[str(b)] = round(ic, 3)
         ps = sorted({int(p) for r in runs for p in r["prefill"]})
         prefill[str(e)] = {}
         for p in ps:
             pts = {int(r["layers"]): r["prefill"][str(p)] for r in runs if str(p) in r["prefill"]}
             if len(pts) >= 2:
                 prefill[str(e)][str(p)] = round(fit_per_layer(pts)[0], 4)
-    ref = (decode.get(str(ref_experts)) or {}).get(str(ref_batch))
+    ref = ref_ms(decode, ref_experts=ref_experts, ref_batch=ref_batch, ref_context=ref_context)
     out = {k: v for k, v in raw.items() if k != "runs"}
     out.update(decode=decode, prefill=prefill, decode_overhead_ms=overhead, memory=memory,
                runs=raw["runs"],
                summary={"ms_per_layer": ref, "ref_experts": ref_experts, "ref_batch": ref_batch,
-                        "definition": "decode 一步、每层、毫秒（batch = ref_batch 条请求同时 decode 时"
-                                      "每条请求每层等的时间；上下文 = context 个 token）"})
+                        "ref_context": ref_context,
+                        "definition": "decode 一步、每层、毫秒（ref_batch 条请求同时 decode 时每条请求每层"
+                                      "等的时间；ref_context = mean 时对各上下文长度取均值）"})
+    return out
+
+
+def ref_ms(decode: Mapping, *, ref_experts: int = 128, ref_batch: int = 1,
+           ref_context: str | int = "mean") -> float | None:
+    """decode[E][C][B] → 给规划器的一个数。ref_context="mean"：各上下文长度取均值。"""
+    by_c = decode.get(str(ref_experts)) or {}
+    if str(ref_context) == "mean":
+        v = _mean([d.get(str(ref_batch)) for d in by_c.values()])
+    else:
+        v = (by_c.get(str(ref_context)) or {}).get(str(ref_batch))
+    return None if v is None else round(v, 4)
+
+
+def _nested_mean(objs: Sequence) -> object:
+    """若干个同构的嵌套 dict（叶子是数）→ 逐叶子取均值；有的台缺某个叶子时按有的算。"""
+    vals = [o for o in objs if o is not None]
+    if not vals:
+        return None
+    if all(isinstance(v, Mapping) for v in vals):
+        keys = []
+        for v in vals:
+            keys += [k for k in v if k not in keys]
+        return {k: _nested_mean([v.get(k) for v in vals]) for k in keys}
+    nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if nums:
+        m = sum(nums) / len(nums)
+        return round(m, 4)
+    return vals[0]
+
+
+def aggregate(results: Sequence[Mapping], *, ref_experts: int | None = None, ref_batch: int | None = None,
+              ref_context: str | int | None = None) -> dict:
+    """多台的结果 → 按卡型取均值：{卡型: {n, nodes, decode, prefill, memory, ms_per_layer, …}}。"""
+    by: dict[str, list] = {}
+    for r in results:
+        by.setdefault(gpu_key(r.get("gpu", "")), []).append(r)
+    out = {}
+    for g, rs in sorted(by.items()):
+        sm = rs[0].get("summary") or {}
+        re_ = ref_experts if ref_experts is not None else int(sm.get("ref_experts") or 128)
+        rb = ref_batch if ref_batch is not None else int(sm.get("ref_batch") or 1)
+        rc = ref_context if ref_context is not None else (sm.get("ref_context") or "mean")
+        per = {str(r.get("node") or r.get("host")): ref_ms(r.get("decode") or {}, ref_experts=re_,
+                                                          ref_batch=rb, ref_context=rc) for r in rs}
+        vals = [v for v in per.values() if v is not None]
+        out[g] = {
+            "gpu": rs[0].get("gpu"), "n": len(rs), "nodes": sorted(per),
+            "ms_per_layer": round(sum(vals) / len(vals), 4) if vals else None,
+            "ms_per_layer_nodes": per,
+            "slowest_over_fastest": round(max(vals) / min(vals), 3) if vals and min(vals) > 0 else None,
+            "ref_experts": re_, "ref_batch": rb, "ref_context": rc,
+            "decode": _nested_mean([r.get("decode") for r in rs]),
+            "prefill": _nested_mean([r.get("prefill") for r in rs]),
+            "decode_overhead_ms": _nested_mean([r.get("decode_overhead_ms") for r in rs]),
+            "memory": _nested_mean([r.get("memory") for r in rs]),
+        }
     return out
 
 
 def topo_with_measurements(topo: Mapping, results: Sequence[Mapping], *, ref_batch: int | None = None,
-                           ref_experts: int | None = None, allow_missing: bool = False
+                           ref_experts: int | None = None, ref_context: str | int | None = None,
+                           per_node: bool = False, allow_missing: bool = False
                            ) -> tuple[dict, list[str]]:
     """拓扑 JSON + 若干台的实测结果 → 新拓扑（每个节点加 `ms_per_layer`，`compute_capacity` 按实测
     重算成同比例，原值留在 `compute_capacity_orig`）。返回 (新拓扑, 说明行)。
 
-    取值优先级：这台节点自己量过 → 用它；否则同卡型（拓扑的 role）量过的取中位数；都没有时
-    报错（`allow_missing` 时按原 compute_capacity 相对最近的已测卡型换算，并在说明里标出来）。"""
-    def ref_of(res):
-        sm = res.get("summary") or {}
-        rb = ref_batch if ref_batch is not None else int(sm.get("ref_batch") or 1)
-        re_ = ref_experts if ref_experts is not None else int(sm.get("ref_experts") or 128)
-        v = ((res.get("decode") or {}).get(str(re_)) or {}).get(str(rb))
-        if v is None:
-            raise ValueError(f"{res.get('node') or res.get('host')} 的结果里没有 E={re_}、B={rb} 的 decode"
-                             f"（有的是 { {e: sorted(d) for e, d in (res.get('decode') or {}).items()} }）")
-        return float(v), rb, re_
-
-    by_node, by_gpu = {}, {}
-    rb_used = re_used = None
+    默认每个节点用它这种卡型（拓扑的 role）所有已测节点的**均值**；`per_node` 时量过的节点用自己的、
+    没量过的用卡型均值。某卡型一台都没量时报错（`allow_missing` 时按原 compute_capacity 相对最近的
+    已测节点换算，并在说明里标出来）。"""
+    agg = aggregate(results, ref_experts=ref_experts, ref_batch=ref_batch, ref_context=ref_context)
+    bad = [f"{g}（{a['nodes']}）" for g, a in agg.items() if a["ms_per_layer"] is None]
+    if bad:
+        any_a = next(iter(agg.values()))
+        raise ValueError(f"{bad} 的结果里没有 E={any_a['ref_experts']}、B={any_a['ref_batch']} 的 decode")
+    by_node = {}
     for res in results:
-        v, rb_used, re_used = ref_of(res)
         if res.get("node"):
-            by_node[str(res["node"])] = (v, res)
-        by_gpu.setdefault(gpu_key(res.get("gpu", "")), []).append(v)
-    gpu_ms = {g: st.median(vs) for g, vs in by_gpu.items()}
+            g = gpu_key(res.get("gpu", ""))
+            by_node[str(res["node"])] = (agg[g]["ms_per_layer_nodes"].get(str(res["node"])), res)
+    gpu_ms = {g: a["ms_per_layer"] for g, a in agg.items()}
+    any_a = next(iter(agg.values())) if agg else {}
+    rb_used, re_used, rc_used = any_a.get("ref_batch"), any_a.get("ref_experts"), any_a.get("ref_context")
 
     out = json.loads(json.dumps(topo))
     notes, missing = [], []
     nodes = out["nodes"]
     for n in nodes:
         g = gpu_key(n.get("role", ""))
-        if n["id"] in by_node:
+        if per_node and n["id"] in by_node and by_node[n["id"]][0] is not None:
             ms, src = by_node[n["id"]][0], f"本机实测（{by_node[n['id']][1].get('gpu')}）"
         elif g in gpu_ms:
-            ms, src = gpu_ms[g], f"同卡型 {g} 实测（{len(by_gpu[g])} 台中位数）"
+            ms, src = gpu_ms[g], f"{g} 均值（{agg[g]['n']} 台实测）"
         else:
             missing.append(n)
             continue
@@ -317,16 +406,14 @@ def topo_with_measurements(topo: Mapping, results: Sequence[Mapping], *, ref_bat
         n.setdefault("compute_capacity_orig", n["compute_capacity"])
         # 旧版规划器只认 compute_capacity：按实测改成同比例，它算出来的相对快慢也对
         n["compute_capacity"] = round(top * fastest / n["ms_per_layer"], 1)
-    mem_by_gpu = {}
-    for res in results:
-        if res.get("memory"):
-            mem_by_gpu.setdefault(gpu_key(res.get("gpu", "")), res["memory"])
     out["ms_per_layer_meta"] = {
         "source": "vllm/p2p/layer_bench.py", "ref_batch": rb_used, "ref_experts": re_used,
+        "ref_context": rc_used, "per_node": bool(per_node),
         "unit": "ms / 层 / token（decode）", "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "gpus": {g: round(v, 4) for g, v in sorted(gpu_ms.items())},
+        "gpus_n": {g: a["n"] for g, a in sorted(agg.items())},
         # 规划器的显存账（ModelSpec 每层权重 / KV、A2b 的引擎开销）可以拿这个对：每层精确值 + 固定开销
-        "memory_mib": mem_by_gpu}
+        "memory_mib": {g: a["memory"] for g, a in sorted(agg.items())}}
     return out, notes
 
 
@@ -357,10 +444,10 @@ def _time_generate(llm, prompts, sp) -> float:
     return (time.perf_counter() - t0) * 1e3
 
 
-def measure(llm, *, batches: Sequence[int], context: int, decode_steps: int,
+def measure(llm, *, batches: Sequence[int], contexts: Sequence[int], decode_steps: int,
             prefill_lens: Sequence[int], repeats: int, vocab: int, seed: int = 0,
             log: Callable[[str], None] = lambda s: None) -> dict:
-    """一个已经起好的引擎上：{decode: {B: 一步 decode 毫秒}, prefill: {P: 毫秒}}。"""
+    """一个已经起好的引擎上：{decode: {C: {B: 一步 decode 毫秒}}, prefill: {P: 毫秒}}。"""
     import random
 
     from vllm import SamplingParams
@@ -376,15 +463,17 @@ def measure(llm, *, batches: Sequence[int], context: int, decode_steps: int,
         return SamplingParams(temperature=0.0, max_tokens=n_out, ignore_eos=True, detokenize=False)
 
     out = {"decode": {}, "prefill": {}}
-    for b in batches:
-        _time_generate(llm, prompts(b, context), sp(1 + min(decode_steps, 8)))   # 预热这个形状
-        ds = []
-        for _ in range(repeats):
-            t1 = _time_generate(llm, prompts(b, context), sp(1))
-            tk = _time_generate(llm, prompts(b, context), sp(1 + decode_steps))
-            ds.append((tk - t1) / decode_steps)
-        out["decode"][str(b)] = round(st.median(ds), 4)
-        log(f"    decode B={b:<3} {out['decode'][str(b)]:.3f} ms/步")
+    for c in contexts:
+        row = out["decode"][str(c)] = {}
+        for b in batches:
+            _time_generate(llm, prompts(b, c), sp(1 + min(decode_steps, 8)))   # 预热这个形状
+            ds = []
+            for _ in range(repeats):
+                t1 = _time_generate(llm, prompts(b, c), sp(1))
+                tk = _time_generate(llm, prompts(b, c), sp(1 + decode_steps))
+                ds.append((tk - t1) / decode_steps)
+            row[str(b)] = round(st.median(ds), 4)
+        log(f"    decode C={c:<5} " + "  ".join(f"B={b}:{v:.3f}" for b, v in row.items()) + " ms/步")
     for p in prefill_lens:
         _time_generate(llm, prompts(1, p), sp(1))
         ps = [_time_generate(llm, prompts(1, p), sp(1)) for _ in range(repeats)]
@@ -401,7 +490,7 @@ def _worker(argv: Sequence[str]) -> int:
     ap.add_argument("--experts", type=int, required=True)
     ap.add_argument("--batches", required=True)
     ap.add_argument("--prefill", required=True)
-    ap.add_argument("--context", type=int, required=True)
+    ap.add_argument("--contexts", required=True)
     ap.add_argument("--decode-steps", type=int, required=True)
     ap.add_argument("--repeats", type=int, required=True)
     ap.add_argument("--gpu-mem", type=float, required=True)
@@ -418,11 +507,13 @@ def _worker(argv: Sequence[str]) -> int:
     cfg = json.loads((Path(a.model_dir) / "config.json").read_text(encoding="utf-8"))
     batches = [int(x) for x in a.batches.split(",") if x]
     prefill = [int(x) for x in a.prefill.split(",") if x]
-    mml = max([a.context + a.decode_steps + 8, *(p + 8 for p in prefill)])
+    contexts = [int(x) for x in a.contexts.split(",") if x]
+    mml = max([max(contexts) + a.decode_steps + 8, *(p + 8 for p in prefill)])
     kw = dict(model=a.model_dir, dtype=a.dtype, load_format="dummy", skip_tokenizer_init=True,
               hf_overrides=_overrides(a.layers, a.experts, int(cfg["num_experts"])),
               max_model_len=mml, max_num_seqs=max(batches), gpu_memory_utilization=a.gpu_mem,
-              max_num_batched_tokens=max(mml, max(batches) * a.context),
+              # B 条的 prefill 一步做完，不和 decode 混在同一步里（显存账里的峰值也就按这个算）
+              max_num_batched_tokens=max(mml, max(batches) * max(contexts)),
               enable_prefix_caching=False, enforce_eager=a.eager, seed=0,
               # 与分段引擎相同（stage_agent 关了异步调度）；也让一步 = CPU + GPU 串行，
               # 层数相减才能干净地只剩 GPU 上那几层
@@ -444,7 +535,7 @@ def _worker(argv: Sequence[str]) -> int:
         w = sum(l["bytes"] for l in m0["layers"]) / max(len(m0["layers"]), 1) / MiB
         print(f"    显存：每层权重 {w:.1f} MiB，层外权重 {m0['non_layer_param_bytes'] / MiB:.0f} MiB，"
               f"KV {m0['kv_bytes'] / MiB:.0f} MiB（{m0['kv_tokens']} token）", flush=True)
-    res = measure(llm, batches=batches, context=a.context, decode_steps=a.decode_steps,
+    res = measure(llm, batches=batches, contexts=contexts, decode_steps=a.decode_steps,
                   prefill_lens=prefill, repeats=a.repeats, vocab=int(cfg["vocab_size"]),
                   log=lambda s: print(s, flush=True))
     res.update(layers=a.layers, experts=a.experts, mem={"after_init": m0, "after_run": probe()})
@@ -472,13 +563,15 @@ def cmd_run(a) -> int:
         return 3
     layers = [int(x) for x in a.layers.split(",")]
     experts = [int(x) for x in a.experts.split(",")]
+    prefill = parse_lengths(a.prefill or a.lengths)
+    contexts = parse_lengths(a.contexts or a.lengths)
     cfg = json.loads((Path(a.model_dir) / "config.json").read_text(encoding="utf-8"))
     total_e = int(cfg["num_experts"])
     if any(e > total_e or e < int(cfg["num_experts_per_tok"]) for e in experts):
         raise SystemExit(f"--experts 要在 [{cfg['num_experts_per_tok']}, {total_e}] 之间")
     node = a.node or os.environ.get("P2P_NODE") or os.uname().nodename
     print(f"[layer_bench] {node}：{info.get('gpu')}，层数 {layers} × 专家 {experts}，batch {a.batches}，"
-          f"上下文 {a.context}，prefill {a.prefill}，{'eager' if a.eager else 'CUDA Graph'}", flush=True)
+          f"decode 上下文 {contexts}，prefill {prefill}，{'eager' if a.eager else 'CUDA Graph'}", flush=True)
     env = dict(os.environ)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     env.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -490,7 +583,8 @@ def cmd_run(a) -> int:
                 out = Path(td) / f"L{l}_E{e}.json"
                 cmd = [sys.executable, "-m", "vllm.p2p.layer_bench", "_worker", "--model-dir", str(mdir),
                        "--layers", str(l), "--experts", str(e), "--batches", a.batches,
-                       "--prefill", a.prefill, "--context", str(a.context),
+                       "--prefill", ",".join(map(str, prefill)),
+                       "--contexts", ",".join(map(str, contexts)),
                        "--decode-steps", str(a.decode_steps), "--repeats", str(a.repeats),
                        "--gpu-mem", str(a.gpu_mem), "--dtype", a.dtype,
                        "--attention-backend", a.attention_backend, "--out", str(out)]
@@ -514,10 +608,11 @@ def cmd_run(a) -> int:
     except Exception:                                        # noqa: BLE001
         ver = "?"
     raw = {"node": node, "host": os.uname().nodename, **info, "vllm": ver, "dtype": a.dtype,
-           "attention": a.attention_backend, "cuda_graph": not a.eager, "context": a.context,
+           "attention": a.attention_backend, "cuda_graph": not a.eager, "contexts": contexts,
+           "prefill_lengths": prefill,
            "decode_steps": a.decode_steps, "repeats": a.repeats, "model": cfg.get("architectures"),
            "model_dir": str(a.model_dir), "layers_measured": layers, "runs": runs}
-    res = summarise(raw, ref_experts=a.ref_experts, ref_batch=a.ref_batch)
+    res = summarise(raw, ref_experts=a.ref_experts, ref_batch=a.ref_batch, ref_context=a.ref_context)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     print_table(res)
@@ -525,10 +620,14 @@ def cmd_run(a) -> int:
     return 0
 
 
-def print_table(res: Mapping) -> None:
-    print(f"\n{res.get('node')}  {res.get('gpu')}  （每层毫秒；decode 上下文 {res.get('context')}）")
-    for e, d in (res.get("decode") or {}).items():
-        print(f"  E={e:<4} decode  " + "  ".join(f"B={b}:{v:.3f}" for b, v in d.items()))
+def print_table(res: Mapping, title: str | None = None) -> None:
+    print(f"\n{title or (str(res.get('node')) + '  ' + str(res.get('gpu')))}  （每层毫秒）")
+    for e, by_c in (res.get("decode") or {}).items():
+        bs = sorted({int(b) for d in by_c.values() for b in d})
+        print(f"  E={e:<4} decode  上下文\\batch " + "".join(f"{'B=' + str(b):>9}" for b in bs))
+        for c, d in by_c.items():
+            print(f"  {'':<7}         {c:>8} " + "".join(
+                f"{d[str(b)]:>9.3f}" if str(b) in d else f"{'—':>9}" for b in bs))
         pf = (res.get("prefill") or {}).get(e) or {}
         if pf:
             print(f"  E={e:<4} prefill " + "  ".join(f"P={p}:{v:.2f}" for p, v in pf.items()))
@@ -544,9 +643,11 @@ def print_table(res: Mapping) -> None:
               f"运行时峰值 每层 {g('activation_peak_mib_per_layer')} + 固定 {g('activation_peak_mib_fixed', '{:.0f}')} MiB  "
               f"整卡非 KV 每层 {g('device_non_kv_mib_per_layer')} + 固定 {g('device_non_kv_mib_fixed', '{:.0f}')} MiB"
               f"  （KV 可放 {m.get('kv_tokens')} token）")
-    sm = res.get("summary") or {}
-    print(f"  → 规划器用的 ms_per_layer = {sm.get('ms_per_layer')}"
-          f"（E={sm.get('ref_experts')}、B={sm.get('ref_batch')} 的 decode）")
+    sm = res.get("summary") or res
+    if sm.get("ms_per_layer") is not None:
+        rc = sm.get("ref_context")
+        print(f"  → 规划器用的 ms_per_layer = {sm.get('ms_per_layer')}（E={sm.get('ref_experts')}、"
+              f"B={sm.get('ref_batch')}、{'各上下文均值' if str(rc) == 'mean' else f'上下文 {rc}'} 的 decode）")
 
 
 # --------------------------------------------------------------------------- #
@@ -566,10 +667,10 @@ def parse_hosts(path: str | Path) -> dict[str, tuple[str, str]]:
 
 
 def pick_nodes(hosts: Mapping[str, tuple[str, str]], want: str | None) -> list[str]:
-    """`want`：None = 每种卡型第一台；"all" = 全部；否则逗号分隔的节点名。"""
-    if want == "all":
+    """`want`：None / "all" = 全部；"one-per-gpu" = 每种卡型第一台；否则逗号分隔的节点名。"""
+    if want in (None, "all"):
         return sorted(hosts)
-    if want:
+    if want != "one-per-gpu":
         names = [x.strip() for x in want.split(",") if x.strip()]
         bad = [x for x in names if x not in hosts]
         if bad:
@@ -587,9 +688,13 @@ def pick_nodes(hosts: Mapping[str, tuple[str, str]], want: str | None) -> list[s
 def remote_command(node: str, a) -> str:
     args = ["run", "--model-dir", a.model_dir, "--node", node, "--out", f"/tmp/layer_bench_{node}.json",
             "--layers", a.layers, "--experts", a.experts, "--batches", a.batches,
-            "--prefill", a.prefill, "--context", str(a.context), "--decode-steps", str(a.decode_steps),
+            "--lengths", a.lengths, "--decode-steps", str(a.decode_steps),
             "--repeats", str(a.repeats), "--gpu-mem", str(a.gpu_mem), "--ref-batch", str(a.ref_batch),
-            "--ref-experts", str(a.ref_experts)]
+            "--ref-experts", str(a.ref_experts), "--ref-context", str(a.ref_context)]
+    if a.prefill:
+        args += ["--prefill", a.prefill]
+    if a.contexts:
+        args += ["--contexts", a.contexts]
     if a.eager:
         args.append("--eager")
     if a.force:
@@ -642,10 +747,25 @@ def cmd_cluster(a) -> int:
     for t in ths:
         t.join()
     good = [n for n in nodes if ok.get(n)]
-    print(f"\n{len(good)}/{len(nodes)} 台成功，结果在 {out_dir}/<节点>.json")
-    for n in good:
-        print_table(json.loads((out_dir / f"{n}.json").read_text(encoding="utf-8")))
+    print(f"\n{len(good)}/{len(nodes)} 台成功，每台的结果在 {out_dir}/<节点>.json")
+    if good:
+        results = [json.loads((out_dir / f"{n}.json").read_text(encoding="utf-8")) for n in good]
+        agg = aggregate(results)
+        (out_dir / "summary_by_gpu.json").write_text(json.dumps(agg, ensure_ascii=False, indent=1),
+                                                     encoding="utf-8")
+        print_gpu_summary(agg)
+        print(f"\n按卡型的均值已写 {out_dir}/summary_by_gpu.json")
     return 0 if len(good) == len(nodes) else 2
+
+
+def print_gpu_summary(agg: Mapping) -> None:
+    print(f"\n{'卡型':<10}{'台数':>4}{'ms/层（均值）':>14}{'最慢/最快':>10}  各台")
+    for g, a in agg.items():
+        per = "  ".join(f"{n}:{v}" for n, v in sorted(a["ms_per_layer_nodes"].items()))
+        print(f"{g:<10}{a['n']:>4}{a['ms_per_layer'] if a['ms_per_layer'] is not None else '—':>14}"
+              f"{a['slowest_over_fastest'] or '—':>10}  {per}")
+    for g, a in agg.items():
+        print_table(a, title=f"{g} 均值（{a['n']} 台：{','.join(a['nodes'])}）")
 
 
 # --------------------------------------------------------------------------- #
@@ -654,7 +774,8 @@ def cmd_topo(a) -> int:
     results = [json.loads(Path(p).read_text(encoding="utf-8")) for p in a.results]
     try:
         out, notes = topo_with_measurements(topo, results, ref_batch=a.ref_batch,
-                                            ref_experts=a.ref_experts, allow_missing=a.allow_missing)
+                                            ref_experts=a.ref_experts, ref_context=a.ref_context,
+                                            per_node=a.per_node, allow_missing=a.allow_missing)
     except ValueError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -663,7 +784,8 @@ def cmd_topo(a) -> int:
         return 2
     Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     meta = out["ms_per_layer_meta"]
-    print(f"按 E={meta['ref_experts']}、B={meta['ref_batch']} 的 decode：{meta['gpus']}")
+    print(f"按 E={meta['ref_experts']}、B={meta['ref_batch']}、上下文 {meta['ref_context']} 的 decode，"
+          f"{'各台自己的值' if meta['per_node'] else '卡型均值'}：{meta['gpus']}（台数 {meta['gpus_n']}）")
     print(f"{'节点':<6}{'卡型':<10}{'ms/层':>8}{'原算力':>10}{'新算力':>10}  来源")
     for n in out["nodes"]:
         print(f"{n['id']:<6}{n.get('role', ''):<10}{n['ms_per_layer']:>8.3f}"
@@ -683,14 +805,18 @@ def _common(ap) -> None:
                     help="每层驻留几个专家（128 = 前段全装；后段一般 55–95）")
     ap.add_argument("--batches", default=",".join(map(str, DEFAULT_BATCHES)),
                     help="decode 时同时几条请求")
-    ap.add_argument("--prefill", default=",".join(map(str, DEFAULT_PREFILL)), help="prefill 的 prompt 长度")
-    ap.add_argument("--context", type=int, default=512, help="decode 时每条请求的上下文长度")
-    ap.add_argument("--decode-steps", type=int, default=64)
+    ap.add_argument("--lengths", default=DEFAULT_LENGTHS,
+                    help="prefill 长度与 decode 上下文：起:止:步长 或 逗号列表（默认 128:1024:128）")
+    ap.add_argument("--prefill", default=None, help="只改 prefill 长度（默认同 --lengths）")
+    ap.add_argument("--contexts", default=None, help="只改 decode 上下文（默认同 --lengths）")
+    ap.add_argument("--decode-steps", type=int, default=32, help="每次多生成几个 token 来量 decode")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--eager", action="store_true", help="不用 CUDA Graph（部署时是用的）")
     ap.add_argument("--ref-batch", type=int, default=1, help="summary.ms_per_layer 取哪个 batch")
     ap.add_argument("--ref-experts", type=int, default=128, help="summary.ms_per_layer 取哪档专家数")
+    ap.add_argument("--ref-context", default="mean",
+                    help="summary.ms_per_layer 取哪个上下文长度；mean = 各长度均值（默认）")
     ap.add_argument("--force", action="store_true", help="卡上有别的进程也照量")
 
 
@@ -711,22 +837,27 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--max-used-mb", type=float, default=1024, help="卡上已占超过这么多就拒绝量")
     r.add_argument("--verbose", action="store_true", help="把子进程的 vLLM 日志也打出来")
 
-    c = sub.add_parser("cluster", help="控制机上：ssh 到各卡型的一台节点跑 run，结果收回来")
+    c = sub.add_parser("cluster", help="控制机上：ssh 到各节点跑 run，结果收回来，按卡型取均值")
     _common(c)
     c.add_argument("--hosts", required=True, help="task/hosts.txt（行尾注释里写卡型）")
-    c.add_argument("--nodes", default=None, help="默认每种卡型第一台；all = 全部；或 N01,N09,N12")
+    c.add_argument("--nodes", default=None,
+                   help="默认全部节点；one-per-gpu = 每种卡型第一台；或 N01,N09,N12")
     c.add_argument("--out-dir", default="results/layer_bench")
     c.add_argument("--repo", default="/home/ubuntu/vllm-p2p")
     c.add_argument("--python", default="/home/ubuntu/venvs/vllm-p2p/bin/python")
     c.add_argument("--user", default="ubuntu")
-    c.add_argument("--timeout", type=float, default=3600)
+    c.add_argument("--timeout", type=float, default=7200)
 
     t = sub.add_parser("topo", help="把实测写进规划器的拓扑文件（写新文件）")
     t.add_argument("--topo", required=True, help="原拓扑，如 task/topo_fabric_mbps.json")
-    t.add_argument("--results", nargs="+", required=True, help="run / cluster 的结果 JSON")
+    t.add_argument("--results", nargs="+", required=True,
+                   help="run / cluster 的每台结果 JSON（<out-dir>/N*.json；不要把 summary_by_gpu.json 也传进来）")
     t.add_argument("--out", required=True)
     t.add_argument("--ref-batch", type=int, default=None, help="默认用结果里的 summary.ref_batch")
     t.add_argument("--ref-experts", type=int, default=None)
+    t.add_argument("--ref-context", default=None, help="mean（默认，各上下文均值）或某个长度")
+    t.add_argument("--per-node", action="store_true",
+                   help="量过的节点用自己的值（默认：每个节点都用它这种卡型的均值）")
     t.add_argument("--allow-missing", action="store_true",
                    help="没量到的卡型按原算力比例换算（默认报错）")
 
