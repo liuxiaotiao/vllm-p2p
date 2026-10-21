@@ -799,3 +799,32 @@ def test_front_pick_speed_aware() -> None:
     co2 = TieredCoordinator([fast, slow], [Engine("b", "back", None, task="t")], front_pick="least")
     fast.inflight = slow.inflight = 0
     assert {co2._pick_front().name for _ in range(4)} == {"fast", "slow"}
+
+
+def test_request_stats_mean_std_and_tok_per_s(tmp_path, capsys) -> None:
+    from vllm.p2p import tiered_stats
+
+    def row(task, n, total, ttft):
+        return {"true_task": task, "n_generated": n, "total_ms": total, "prefill_ms": ttft,
+                "front": "N01", "channel": f"back-{task}-0"}
+    rows = [row("g", 11, 1100, 100), row("g", 21, 2200, 200), row("m", 1, 50, 50)]
+    rs = tiered_stats.request_stats(rows)
+    a = rs["all"]
+    assert a["n"] == 3 and a["ttft_ms"]["mean"] == pytest.approx(350 / 3, abs=1e-3)
+    assert a["ttft_ms"]["std"] == pytest.approx(76.376, abs=1e-2)          # 样本标准差
+    # TPOT：只有生成 ≥ 2 个 token 的算（100、100）；token/s = 生成数 / 总时延
+    assert a["tpot_ms"] == {"n": 2, "mean": 100.0, "std": 0.0}
+    assert a["tok_per_s"]["n"] == 3
+    assert a["tok_per_s"]["mean"] == pytest.approx((10 + 21 / 2.2 + 20) / 3, abs=1e-3)
+    assert a["decode_tok_per_s"]["mean"] == pytest.approx(10.0)
+    assert rs["by_task"]["m"]["tpot_ms"]["n"] == 0 and rs["by_task"]["g"]["n"] == 2
+    txt = "\n".join(tiered_stats.format_request_stats(rs))
+    assert "116.7" not in txt and "117 ± 76" in txt and "100.0 ± 0.0" in txt and "—" in txt
+    # tiered_stats 的命令行在最前面打这张表（给了 --a 时两份都打）
+    (tmp_path / "b.json").write_text(json.dumps({"requests": rows}))
+    (tmp_path / "a.json").write_text(json.dumps({"requests": rows[:1]}))
+    assert tiered_stats.main(["--b", str(tmp_path / "b.json"), "--a", str(tmp_path / "a.json")]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("逐请求统计") and "（对照 a.json）" in out
+    from vllm.p2p import bench       # bench 跑完用同一个函数（按文件路径运行时 import 的是同目录那份）
+    assert bench.request_stats(rows) == rs

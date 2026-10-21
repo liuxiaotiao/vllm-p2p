@@ -8,6 +8,9 @@
 「前段 prefill」「绑定」「前段腿」（后段出 token → 前段 hidden 回到协调器）「后段腿」
 （hidden 送出 → 下一个 token 回来）。给了 --a 时再列 A 同一条通道（后段 back-X ↔ 通道 X）的 TPOT。
 每 token 的时间 ≈ 前段腿 + 后段腿；两条腿里都含两次跨机、一次调度、一次前向。
+
+开头先打整体与按 task 的逐请求统计（`request_stats`：TTFT / TPOT 的均值 ± 标准差，每条请求的 token/s 取均值）；
+`bench.py` 跑完也打同一张表、写进结果的 `run.per_request`。
 """
 
 from __future__ import annotations
@@ -27,6 +30,60 @@ def _med(xs):
 def _tpot(r):
     n = int(r.get("n_generated") or 0)
     return (r["total_ms"] - r["prefill_ms"]) / (n - 1) if n > 1 else None
+
+
+def _ms(xs):
+    """→ {n, mean, std}（样本标准差；只有 1 个值时 std = 0）。"""
+    xs = [float(x) for x in xs if isinstance(x, (int, float))]
+    if not xs:
+        return {"n": 0, "mean": None, "std": None}
+    return {"n": len(xs), "mean": round(st.fmean(xs), 3),
+            "std": round(st.stdev(xs), 3) if len(xs) > 1 else 0.0}
+
+
+def _tok_s(r):
+    """一条请求自己的速度：生成 token 数 / 这条从发出到收完的时间（含 TTFT）。"""
+    n = int(r.get("n_generated") or 0)
+    t = float(r.get("total_ms") or 0)
+    return n / (t / 1e3) if n > 0 and t > 0 else None
+
+
+def _decode_tok_s(r):
+    """只看 decode 段：1000 / TPOT。"""
+    tp = _tpot(r)
+    return 1e3 / tp if tp and tp > 0 else None
+
+
+def request_stats(rows) -> dict:
+    """逐请求的 TTFT / TPOT 均值与标准差、每条请求的 token/s 取均值；整体 + 按 task。"""
+    def one(rs):
+        return {"n": len(rs),
+                "ttft_ms": _ms([r.get("prefill_ms") for r in rs]),
+                "tpot_ms": _ms([_tpot(r) for r in rs]),
+                "tok_per_s": _ms([_tok_s(r) for r in rs]),
+                "decode_tok_per_s": _ms([_decode_tok_s(r) for r in rs])}
+    by = defaultdict(list)
+    for r in rows:
+        by[r.get("true_task") or "?"].append(r)
+    return {"all": one(list(rows)), "by_task": {u: one(rs) for u, rs in sorted(by.items())},
+            "note": "均值 ± 样本标准差；tok_per_s = 每条请求 生成 token / 总时延（含 TTFT），"
+                    "decode_tok_per_s = 1000 / TPOT，都是先逐条算再对所有请求取均值"}
+
+
+def format_request_stats(rs: dict) -> list[str]:
+    def f(d, digits=1):
+        if not d or d.get("mean") is None:
+            return "—"
+        return f"{d['mean']:.{digits}f} ± {d['std']:.{digits}f}"
+    head = f"  {'':<12}{'条数':>5}{'TTFT ms':>20}{'TPOT ms':>18}{'token/s':>16}{'decode token/s':>18}"
+    out = ["逐请求统计（均值 ± 标准差）", head]
+    rows = [("全部", rs["all"])] + [(u, v) for u, v in rs["by_task"].items()]
+    for name, v in rows:
+        out.append(f"  {name:<12}{v['n']:>5}{f(v['ttft_ms'], 0):>20}{f(v['tpot_ms']):>18}"
+                   f"{f(v['tok_per_s']):>16}{f(v['decode_tok_per_s']):>18}")
+    out.append("  （token/s = 每条请求 生成 token / 总时延，含首 token；decode token/s = 1000 / TPOT；"
+               "都是逐条算再对所有请求取均值）")
+    return out
 
 
 def summarise_b(rows):
@@ -64,6 +121,13 @@ def main(argv=None) -> int:
     rb = json.loads(a.b.read_text(encoding="utf-8"))["requests"]
     ra = json.loads(a.a.read_text(encoding="utf-8"))["requests"] if a.a else []
     A = summarise_a(ra)
+    for ln in format_request_stats(request_stats(rb)):
+        print(ln)
+    if ra:
+        print(f"（对照 {a.a.name}）")
+        for ln in format_request_stats(request_stats(ra))[2:-1]:
+            print(ln)
+    print()
 
     def f(x):
         return "—" if x is None else f"{x:g}"
