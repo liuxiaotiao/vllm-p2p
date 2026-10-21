@@ -9,8 +9,9 @@
 （hidden 送出 → 下一个 token 回来）。给了 --a 时再列 A 同一条通道（后段 back-X ↔ 通道 X）的 TPOT。
 每 token 的时间 ≈ 前段腿 + 后段腿；两条腿里都含两次跨机、一次调度、一次前向。
 
-开头先打整体与按 task 的逐请求统计（`request_stats`：TTFT / TPOT 的均值 ± 标准差，每条请求的 token/s 取均值）；
-`bench.py` 跑完也打同一张表、写进结果的 `run.per_request`。
+开头先打与 p2p-framework 连续性测试同一格式的汇总（`continuous_report`：各指标的均值 / 标准差 / p50 / p90 /
+p99 / 最大，单请求 token/s 含排队 / 去排队 / 解码，吞吐、识别，按 task 的表，各节点资源占用）；
+`bench.py` 跑完打的也是这张，逐请求统计另写进结果的 `run.per_request`。
 """
 
 from __future__ import annotations
@@ -70,6 +71,150 @@ def request_stats(rows) -> dict:
                     "decode_tok_per_s = 1000 / TPOT，都是先逐条算再对所有请求取均值"}
 
 
+# --------------------------------------------------------------------------- #
+# 与 p2p-framework 连续性测试同一格式的汇总
+# --------------------------------------------------------------------------- #
+def _pct(xs, q):
+    """线性插值分位数（与 numpy.percentile 默认口径相同）。"""
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * q / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def full_stats(xs) -> dict:
+    """→ {n, mean, std, p50, p90, p99, max}（std 为样本标准差）。"""
+    xs = [float(x) for x in xs if isinstance(x, (int, float))]
+    if not xs:
+        return {"n": 0}
+    return {"n": len(xs), "mean": st.fmean(xs), "std": st.stdev(xs) if len(xs) > 1 else 0.0,
+            "p50": _pct(xs, 50), "p90": _pct(xs, 90), "p99": _pct(xs, 99), "max": max(xs)}
+
+
+def _queue(r):
+    return float(r.get("queue_ms") or 0.0) + float(r.get("queue_back_ms") or 0.0)
+
+
+def _tok_s_service(r):
+    """去排队：拿到前后段之后到最后一个 token。"""
+    n = int(r.get("n_generated") or 0)
+    t = float(r.get("total_ms") or 0) - _queue(r)
+    return n / (t / 1e3) if n > 0 and t > 0 else None
+
+
+def _label_ok(r):
+    raw = r.get("raw_scores")
+    lab = str(max(raw, key=raw.get)).split("#")[0] if raw else r.get("task")
+    return None if not r.get("true_task") else lab == r["true_task"]
+
+
+def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
+    """bench 的结果 JSON → 与 p2p-framework 连续性测试同一格式的几张表（文本行）。"""
+    rows = list(doc.get("requests") or [])
+    run = doc.get("run") or {}
+    if not rows:
+        return [f"{title}：没有请求"]
+    # 墙钟：bench 记的；老结果没有时用最后完成的时刻，再没有就用最长的那条（只影响吞吐那一行）
+    wall = (run.get("wall_s") or max(float(r.get("t_done_s") or 0) for r in rows)
+            or max(float(r.get("total_ms") or 0) for r in rows) / 1e3 or 1.0)
+    out = [f"{title}：{len(rows)} 条（超时 {run.get('n_timeout', 0)}），在途 {run.get('inflight', doc.get('concurrency'))}，"
+           f"最大生成 {run.get('max_tokens', doc.get('tokens'))}，墙钟 {wall:.0f}s"]
+    metrics = [
+        ("生成时延 ms", [r["total_ms"] for r in rows], 0),
+        ("TTFT ms", [r["prefill_ms"] for r in rows], 0),
+        ("TTFT(去排队) ms", [r["prefill_ms"] - _queue(r) for r in rows], 0),
+        ("TPOT ms/token", [_tpot(r) for r in rows], 1),
+        ("后段排队 ms", [r.get("queue_back_ms", 0.0) for r in rows], 0),
+        ("生成长度 token", [r.get("n_generated") for r in rows], 0),
+        ("token/s(含排队)", [_tok_s(r) for r in rows], 2),
+        ("token/s(去排队)", [_tok_s_service(r) for r in rows], 2),
+        ("token/s(解码)", [_decode_tok_s(r) for r in rows], 2),
+    ]
+    out.append(f"    {'指标':<20}" + "".join(f"{h:>10}" for h in ("均值", "标准差", "p50", "p90", "p99", "最大")))
+    for name, xs, d in metrics:
+        sv = full_stats(xs)
+        if not sv["n"]:
+            out.append(f"    {name:<20}" + f"{'—':>10}" * 6)
+            continue
+        out.append(f"    {name:<20}" + "".join(f"{sv[k]:>10.{d}f}" for k in ("mean", "std", "p50", "p90", "p99", "max")))
+    out.append("    单请求 token/s：每条请求自己的生成速度（生成 token ÷ 用时），再对全部请求取均值 / 标准差；")
+    out.append("      含排队 = 提交→最后一个 token，去排队 = 拿到前后段→最后一个 token，解码 = 1000 ÷ TPOT")
+    out_tok = sum(int(r.get("n_generated") or 0) for r in rows)
+    in_tok = sum(int(r.get("n_prompt") or 0) for r in rows)
+    stops = run.get("stop_reasons") or {}
+    if not stops:
+        for r in rows:
+            stops[r.get("stop_reason")] = stops.get(r.get("stop_reason"), 0) + 1
+    out.append(f"    吞吐：输出 {out_tok / wall:.2f} token/s，含 prompt {(out_tok + in_tok) / wall:.2f} token/s，"
+               f"{len(rows) / wall * 60:.2f} 请求/分钟（输出共 {out_tok} token；停止原因 {dict(stops)}）")
+    oks = [x for x in (_label_ok(r) for r in rows) if x is not None]
+    if oks and doc.get("gateway_mode", "lr") != "oracle":
+        out.append(f"    识别：{sum(oks)}/{len(oks)} = {100 * sum(oks) / len(oks):.1f}%（选择器自己判的类）；"
+                   f"通道二报警 {sum(int(r.get('alarms', 0)) for r in rows)} 次，"
+                   f"换绑 {sum(int(r.get('rebinds', 0)) for r in rows)} 次")
+    # ---- 按 task ----
+    by = defaultdict(list)
+    for r in rows:
+        by[r.get("true_task") or "?"].append(r)
+    hd = ("条数", "时延均值", "时延p99", "TTFT均值", "TTFT std", "去排队TTFT", "TPOT均值", "TPOT std",
+          "tok/s均值", "tok/s std", "后段排队", "生成均长", "识别", "换绑")
+    out.append("")
+    out.append(f"    {'task':<12}" + "".join(f"{h:>10}" for h in hd))
+    for u, rs in sorted(by.items()):
+        L, T = full_stats([r["total_ms"] for r in rs]), full_stats([r["prefill_ms"] for r in rs])
+        TS = full_stats([r["prefill_ms"] - _queue(r) for r in rs])
+        P, K = full_stats([_tpot(r) for r in rs]), full_stats([_tok_s_service(r) for r in rs])
+        Q, G = full_stats([r.get("queue_back_ms", 0.0) for r in rs]), full_stats([r.get("n_generated") for r in rs])
+        ok = [x for x in (_label_ok(r) for r in rs) if x is not None]
+
+        def v(sv, k, d):
+            return f"{sv[k]:>10.{d}f}" if sv.get("n") else f"{'—':>10}"
+        out.append(f"    {u:<12}{len(rs):>10}" + v(L, "mean", 0) + v(L, "p99", 0) + v(T, "mean", 0)
+                   + v(T, "std", 0) + v(TS, "mean", 0) + v(P, "mean", 1) + v(P, "std", 1)
+                   + v(K, "mean", 2) + v(K, "std", 2) + v(Q, "mean", 0) + v(G, "mean", 0)
+                   + (f"{100 * sum(ok) / len(ok):>9.0f}%" if ok else f"{'—':>10}")
+                   + f"{sum(int(r.get('rebinds', 0)) for r in rs):>10}")
+    out.append("    （tok/s = 单请求 token/s，去排队口径）")
+    # ---- 资源 ----
+    usage = run.get("nodes") or {}
+    if usage:
+        seg = {}
+        for name, c in (doc.get("channels") or {}).items():
+            for n in c.get("nodes") or []:
+                seg.setdefault(n, name)
+        for r in rows:
+            if r.get("front_engine") and r.get("front"):
+                for n in str(r["front"]).split("+"):
+                    seg.setdefault(n, r["front_engine"])
+        out.append("")
+        out.append("  资源占用（连续测试窗口内）")
+        out.append(f"    {'节点':<6}{'段':<18}{'计算占用':>8}{'GPU均值%':>10}{'GPU p95%':>9}"
+                   f"{'显存峰值/总量 MB':>20}{'torch峰值MB':>12}{'功耗W':>8}")
+        gu, mu, mt = [], [], []
+        for n in sorted(usage):
+            u_ = usage[n] or {}
+            if u_.get("error"):
+                out.append(f"    {n:<6}{seg.get(n, '—'):<18}  （{u_['error']}）")
+                continue
+            if u_.get("gpu_util_mean") is not None:
+                gu.append(u_["gpu_util_mean"])
+            if u_.get("mem_used_max_mb"):
+                mu.append(u_["mem_used_max_mb"])
+            if u_.get("mem_total_mb"):
+                mt.append(u_["mem_total_mb"])
+            mem = f"{u_.get('mem_used_max_mb', 0):.0f}/{u_.get('mem_total_mb', 0):.0f}"
+            out.append(f"    {n:<6}{seg.get(n, '—'):<18}{'—':>8}{u_.get('gpu_util_mean', 0):>10.1f}"
+                       f"{u_.get('gpu_util_p95', 0):>9.0f}{mem:>20}{'—':>12}{u_.get('power_mean_w') or 0:>8.0f}")
+        out.append(f"    合计/均值：GPU 利用率 {st.fmean(gu) if gu else 0:.1f}%，显存峰值合计 "
+                   f"{sum(mu):.0f} / {sum(mt):.0f} MB")
+        out.append("    计算占用、torch 峰值：vLLM 不报逐节点的 forward 时长与 PyTorch 显存，记「—」；"
+                   "GPU 利用率 = nvidia-smi 采样（SM 有活的时间比）")
+    return out
+
+
 def format_request_stats(rs: dict) -> list[str]:
     def f(d, digits=1):
         if not d or d.get("mean") is None:
@@ -121,11 +266,13 @@ def main(argv=None) -> int:
     rb = json.loads(a.b.read_text(encoding="utf-8"))["requests"]
     ra = json.loads(a.a.read_text(encoding="utf-8"))["requests"] if a.a else []
     A = summarise_a(ra)
-    for ln in format_request_stats(request_stats(rb)):
+    db = json.loads(a.b.read_text(encoding="utf-8"))
+    for ln in continuous_report(db, title=f"连续性测试（{a.b.name}）"):
         print(ln)
-    if ra:
-        print(f"（对照 {a.a.name}）")
-        for ln in format_request_stats(request_stats(ra))[2:-1]:
+    if a.a:
+        print()
+        for ln in continuous_report(json.loads(a.a.read_text(encoding="utf-8")),
+                                    title=f"对照（{a.a.name}）"):
             print(ln)
     print()
 

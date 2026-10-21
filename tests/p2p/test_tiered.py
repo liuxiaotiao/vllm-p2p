@@ -825,6 +825,36 @@ def test_request_stats_mean_std_and_tok_per_s(tmp_path, capsys) -> None:
     (tmp_path / "a.json").write_text(json.dumps({"requests": rows[:1]}))
     assert tiered_stats.main(["--b", str(tmp_path / "b.json"), "--a", str(tmp_path / "a.json")]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("逐请求统计") and "（对照 a.json）" in out
+    assert out.startswith("连续性测试（b.json）：3 条") and "对照（a.json）：1 条" in out
+    assert "token/s(去排队)" in out and "资源占用" not in out          # 没有 smi 数据时不打资源表
     from vllm.p2p import bench       # bench 跑完用同一个函数（按文件路径运行时 import 的是同目录那份）
     assert bench.request_stats(rows) == rs
+
+
+def test_continuous_report_matches_p2p_framework_layout() -> None:
+    from vllm.p2p import tiered_stats as T
+
+    rows = [{"true_task": "g", "task": "g", "n_generated": 11, "n_prompt": 5, "total_ms": 1100.0,
+             "prefill_ms": 100.0, "queue_ms": 20.0, "queue_back_ms": 30.0, "stop_reason": "eos",
+             "raw_scores": {"g": 0.9, "m": 0.1}, "front": "N01", "front_engine": "front-N01"},
+            {"true_task": "m", "task": "g", "n_generated": 21, "n_prompt": 5, "total_ms": 2100.0,
+             "prefill_ms": 100.0, "stop_reason": "max_tokens", "raw_scores": {"g": 0.6, "m": 0.4},
+             "front": "N01", "front_engine": "front-N01"}]
+    doc = {"requests": rows, "gateway_mode": "lr", "channels": {"back-g-0": {"nodes": ["N07", "N08"]}},
+           "run": {"wall_s": 10.0, "n_timeout": 0, "inflight": 2, "max_tokens": 2048,
+                   "nodes": {"N01": {"gpu_util_mean": 9.3, "gpu_util_p95": 21, "mem_used_max_mb": 100,
+                                     "mem_total_mb": 200, "power_mean_w": 30},
+                             "N07": {"gpu_util_mean": 4.7, "gpu_util_p95": 9, "mem_used_max_mb": 50,
+                                     "mem_total_mb": 200, "power_mean_w": 20}}}}
+    txt = "\n".join(T.continuous_report(doc))
+    assert txt.startswith("连续性测试：2 条（超时 0），在途 2，最大生成 2048，墙钟 10s")
+    line = next(l for l in txt.splitlines() if "token/s(去排队)" in l).split()
+    # 第一条：11 token / (1100 − 50) ms；第二条：21 / 2.1 s → 均值
+    assert float(line[1]) == pytest.approx((11 / 1.05 + 10) / 2, abs=0.01)
+    tpot = next(l for l in txt.splitlines() if l.strip().startswith("TPOT")).split()
+    assert float(tpot[2]) == 100.0 and float(tpot[3]) == 0.0                 # 均值 100、标准差 0
+    assert "吞吐：输出 3.20 token/s，含 prompt 4.20 token/s，12.00 请求/分钟（输出共 32 token；" in txt
+    assert "识别：1/2 = 50.0%" in txt                                          # 第二条选择器判成了 g
+    assert "front-N01" in txt and "back-g-0" in txt and "合计/均值：GPU 利用率 7.0%，显存峰值合计 150 / 400 MB" in txt
+    sv = T.full_stats([1, 2, 3, 4])
+    assert sv["p50"] == 2.5 and sv["p90"] == pytest.approx(3.7) and sv["std"] == pytest.approx(1.2910, abs=1e-4)

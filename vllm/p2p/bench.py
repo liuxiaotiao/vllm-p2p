@@ -52,9 +52,9 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
-    from tiered_stats import format_request_stats, request_stats
+    from tiered_stats import continuous_report, request_stats
 except ImportError:
-    from vllm.p2p.tiered_stats import format_request_stats, request_stats
+    from vllm.p2p.tiered_stats import continuous_report, request_stats
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -509,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     use_p2p_framework(a.p2p_framework)
     from p2pmoe.deploy.continuous import interleave, run_closed_loop, run_metrics
-    from p2pmoe.deploy.control import _log_run, load_cases
+    from p2pmoe.deploy.control import load_cases
     from p2pmoe.runtime.text import TextIO
 
     cj = json.loads(Path(a.channels).read_text(encoding="utf-8"))
@@ -734,10 +734,11 @@ def main(argv: list[str] | None = None) -> int:
         out["run"]["accuracy"] = None
         for v in out["run"]["by_task"].values():
             v["accuracy"] = None
-    _log_run(out["run"])
     out["run"]["per_request"] = request_stats(rows)
-    for ln in format_request_stats(out["run"]["per_request"]):
-        log.info("  %s", ln)
+    # 与 p2p-framework 连续性测试同一格式的汇总（均值 / 标准差 / 分位数、按 task、资源占用）
+    log.info("")
+    for ln in continuous_report(out):
+        log.info("%s", ln)
     if failed:
         log.warning("  失败 %d 条，第一条：%s", len(failed), failed[0])
     a.out.parent.mkdir(parents=True, exist_ok=True)
