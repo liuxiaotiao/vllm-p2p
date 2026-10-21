@@ -709,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
         "classifier": gw_info.get("identifier") and f"识别服务 {gw_info['identifier']}",
         "l0": int(cj.get("l0", 0)),
         "backend": "vllm",
-        "mode": {"oracle": "static", "shadow": "static", "lr": "dynamic"}[mode],
+        "mode": {"oracle": "static", "shadow": "static", "any": "static", "lr": "dynamic"}[mode],
         "gateway_mode": mode,
         "label": a.label,
         "miss_policy": "local_topk",
@@ -729,8 +729,8 @@ def main(argv: list[str] | None = None) -> int:
                              n_timeout=len(dead))
     out["run"]["order"] = a.order
     out["run"]["max_tokens"] = a.max_tokens
-    if mode == "oracle":
-        # 路由按标注，没有识别 —— run_metrics 会拿路由结果当「识别」算出个 100%，去掉免得误读
+    if mode in ("oracle", "any"):
+        # 路由按标注（any：不看 task），没有识别 —— run_metrics 会拿路由结果当「识别」算出个 100%，去掉免得误读
         out["run"]["accuracy"] = None
         for v in out["run"]["by_task"].values():
             v["accuracy"] = None

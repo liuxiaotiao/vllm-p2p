@@ -14,6 +14,8 @@
   「不解耦的代价」：识别耗时（含排队）记在 `route_ms` 里，算进这条请求的首 token 时延；
 * `shadow`：按 `p2p_task` 转发，同时**旁路**问识别服务、只记结果不影响路由 ——
   与 p2p-framework 静态模式下的旁路 LR 同一口径，用来在 E3 里顺带量识别准确率。
+* `any`：不看 task，在**全部**通道里挑在途最少的那条 —— 全专家部署（每条通道都能服务任何 task，
+  如 `plan_full_2ch.json`）走固定通道、不用识别器时用。请求里的 `p2p_task` 只记下来。
 
 同 task 有多条通道时取**在途数最少**的那条（相同时轮转）。某个 task 一条通道都没有时
 立刻返回 503 并说明原因（与 p2p-framework 协调器「容量 0 立即失败」一致），不排队。
@@ -45,7 +47,7 @@ from typing import Mapping, Sequence
 
 __all__ = ["Router", "ChannelInfo", "load_channels", "body_string", "make_app", "main"]
 
-MODES = ("oracle", "lr", "shadow")
+MODES = ("oracle", "lr", "shadow", "any")
 
 
 @dataclass
@@ -90,6 +92,7 @@ class Router:
         for c in self.channels:
             self.by_task.setdefault(c.task, []).append(c)
         self._rr = {u: itertools.count() for u in self.by_task}
+        self._rr_any = itertools.count()
         """每个 task 各自轮转（共用一个计数器的话，别的 task 的请求会让它总落在同一条上）。"""
 
     @property
@@ -105,6 +108,12 @@ class Router:
         low = min(c.inflight for c in cs)
         cands = [c for c in cs if c.inflight == low]
         return cands[next(self._rr[task]) % len(cands)]
+
+    def pick_any(self) -> ChannelInfo:
+        """不看 task：全部通道里在途最少的（平手轮流）。"""
+        low = min(c.inflight for c in self.channels)
+        cands = [c for c in self.channels if c.inflight == low]
+        return cands[next(self._rr_any) % len(cands)]
 
     def state(self) -> list[dict]:
         return [asdict(c) for c in self.channels]
@@ -191,7 +200,9 @@ def make_app(router: Router, *, mode: str, identifier: str | None = None,
         ids = fwd.get("prompt")
         is_ids = isinstance(ids, list) and ids and all(isinstance(x, int) for x in ids)
 
-        if mode in ("oracle", "shadow"):
+        if mode == "any":
+            task = None
+        elif mode in ("oracle", "shadow"):
             if not true_task:
                 return bad(400, f"{mode} 模式要在请求里给 p2p_task", rec)
             task = str(true_task)
@@ -218,15 +229,18 @@ def make_app(router: Router, *, mode: str, identifier: str | None = None,
                 return bad(502, f"识别服务出错：{type(e).__name__}: {e}", rec)
             rec["verdict"] = v
             task = v["task"]
-        rec["task"] = task
         try:
-            ch = router.pick(task)
+            ch = router.pick_any() if mode == "any" else router.pick(task)
         except NoChannel as e:
+            rec["task"] = task
             return bad(503, str(e), rec)
+        if mode == "any":
+            task = ch.task
+        rec["task"] = task
         rec["channel"] = ch.name
         rec["route_ms"] = round((time.perf_counter() - t_recv) * 1000, 3)
         out = with_xargs(dict(fwd, model=ch.name), pid, prange)
-        hdr = {"X-P2P-Id": pid, "X-P2P-Channel": ch.name, "X-P2P-Task": task,
+        hdr = {"X-P2P-Id": pid, "X-P2P-Channel": ch.name, "X-P2P-Task": task or "",
                "X-P2P-Route-Ms": str(rec["route_ms"])}
         if rec["verdict"] is not None:
             hdr["X-P2P-LR"] = json.dumps({k: rec["verdict"].get(k) for k in

@@ -151,7 +151,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     out.append(f"    吞吐：输出 {out_tok / wall:.2f} token/s，含 prompt {(out_tok + in_tok) / wall:.2f} token/s，"
                f"{len(rows) / wall * 60:.2f} 请求/分钟（输出共 {out_tok} token；停止原因 {dict(stops)}）")
     oks = [x for x in (_label_ok(r) for r in rows) if x is not None]
-    if oks and doc.get("gateway_mode", "lr") != "oracle":
+    if oks and doc.get("gateway_mode", "lr") not in ("oracle", "any"):
         out.append(f"    识别：{sum(oks)}/{len(oks)} = {100 * sum(oks) / len(oks):.1f}%（选择器自己判的类）；"
                    f"通道二报警 {sum(int(r.get('alarms', 0)) for r in rows)} 次，"
                    f"换绑 {sum(int(r.get('rebinds', 0)) for r in rows)} 次")

@@ -239,6 +239,40 @@ def test_oracle_end_to_end_and_report(world, tmp_path) -> None:
     assert "连续性测试" in p.stdout
 
 
+def test_any_mode_ignores_task_for_full_expert_channels(world, tmp_path) -> None:
+    """全专家部署（如 plan_full_2ch）：两条通道都能服务任何 task。any 模式不看 p2p_task、不要识别器，
+    在全部通道里挑在途最少的；bench 不因「这个 task 没有通道」跳过 case。"""
+    cs = [G.ChannelInfo("a-0", "a", "http://x"), G.ChannelInfo("b-0", "b", "http://y")]
+    r = G.Router(cs)
+    first = r.pick_any()
+    first.inflight += 1
+    assert r.pick_any() is not first
+    cs[0].inflight = cs[1].inflight = 3
+    assert {r.pick_any().name for _ in range(4)} == {"a-0", "b-0"}
+
+    full = json.loads(world["channels"].read_text(encoding="utf-8"))
+    full["channels"] = [c for c in full["channels"] if c["name"] in ("gsm8k-0", "mbpp-0")]
+    cj = tmp_path / "channels_full2.json"
+    cj.write_text(json.dumps(full))
+    router = G.Router(G.load_channels(cj))
+    port = world["srv"].add(G.make_app(router, mode="any"))
+    rc = B.main(["--gateway", f"http://127.0.0.1:{port}", "--channels", str(cj),
+                 "--cases", str(world["cases"]), "--model-dir", str(world["ckpt"]),
+                 "--p2p-framework", str(FW), "--max-tokens", "6", "--warmup", "1",
+                 "--out", str(tmp_path / "any.json")])
+    assert rc == 0
+    out = json.loads((tmp_path / "any.json").read_text(encoding="utf-8"))
+    rs = out["requests"]
+    assert len(rs) == 9 and not out["failed"] and out["gateway_mode"] == "any"
+    assert {r["true_task"] for r in rs} == set(TASKS)                    # no_robots 也跑了
+    assert {r["channel"] for r in rs} == {"gsm8k-0", "mbpp-0"}           # 两条都用上
+    assert any(r["true_task"] != r["channel"].rsplit("-", 1)[0] for r in rs)   # 不按 task 分
+    assert out["run"]["accuracy"] is None and out["concurrency"] == 2    # 在途默认 = 通道数
+    from vllm.p2p.tiered_stats import continuous_report
+    txt = "\n".join(continuous_report(out))
+    assert "识别：" not in txt and "no_robots" in txt
+
+
 def test_lr_mode_routes_by_identifier(world, tmp_path) -> None:
     gw = gateway(world, "lr")
     out = run_bench(world, gw, tmp_path / "e4.json")
