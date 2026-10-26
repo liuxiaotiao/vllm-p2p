@@ -387,3 +387,51 @@ def test_relative_out_becomes_absolute_in_remote_commands(tmp_path, monkeypatch)
     cj = json.loads((tmp_path / "vc" / "channels.json").read_text(encoding="utf-8"))
     want = f'$(cat {tmp_path / "vc"}/'
     assert all(want in x["cmd"] for c in cj["channels"] for x in c["commands"])
+
+
+def test_manual_plan_without_pairings_or_model_shape(tmp_path) -> None:
+    """p2p-framework `deploy/manual.py` 的清单（如 plan_full_2ch）：没有组合矩阵、model 字段是模型名。
+    layout 按段名编号配对（F{i} ↔ B<task>{i}），层数 / 专家数从 --model-dir 的 config.json 读。"""
+    import sys
+
+    fw = Path(__file__).resolve().parents[3] / "p2p-framework"
+    if not (fw / "p2pmoe" / "deploy" / "manual.py").is_file():
+        pytest.skip("旁边没有 p2p-framework")
+    sys.path.insert(0, str(fw))
+    from p2pmoe.deploy.manual import ManualSpec, build_manual_manifest
+    from p2pmoe.planner.hf_config import PRESETS, model_spec_from_hf
+
+    from vllm.p2p import layout as LY
+
+    cfg = dict(PRESETS["qwen3-30b-a3b"])
+    spec_m, _ = model_spec_from_hf(cfg, name="Qwen3-30B-A3B")
+    lay = ManualSpec.from_dict({"l0": 8, "channels": [
+        {"front": "N01", "back": [{"node": "N02", "layers": [9, 28]}, {"node": "N03", "layers": [29, 48]}]},
+        {"front": "N04", "back": [{"node": "N05", "layers": [9, 28]}, {"node": "N06", "layers": [29, 48]}]},
+    ]}, n_layers=48)
+    man, wired = build_manual_manifest(lay, spec_m, model_name="Qwen3-30B-A3B")
+    plan = json.loads(man.to_json())
+    assert not plan["pairings"]
+    assert LY.manual_wiring(plan) == wired == {"F0": ("Bgeneral0", "general"), "F1": ("Bgeneral1", "general")}
+
+    p = tmp_path / "plan_full_2ch.json"
+    p.write_text(json.dumps(plan))
+    hosts = tmp_path / "hosts.txt"
+    hosts.write_text("".join(f"N0{i} 192.168.1.{i + 1}:9101 # A30\n" for i in range(1, 7)))
+    mdir = tmp_path / "w"
+    mdir.mkdir()
+    (mdir / "config.json").write_text(json.dumps({"num_hidden_layers": 48, "num_experts": 128}))
+    out = tmp_path / "vc"
+    assert LY.main(["--plan", str(p), "--hosts", str(hosts), "--out", str(out),
+                    "--model-dir", str(mdir), "--vllm-bin", "/venv/bin/vllm", "--max-num-seqs", "8"]) == 0
+    cj = json.loads((out / "channels.json").read_text())
+    assert [(c["name"], c["nodes"], c["partition"]) for c in cj["channels"]] == [
+        ("general-0", ["N01", "N02", "N03"], [8, 20, 20]), ("general-1", ["N04", "N05", "N06"], [8, 20, 20])]
+    ov = json.loads((out / "general-0.overrides.json").read_text())
+    assert not ov.get("p2p_layer_experts")                       # 全专家：不列驻留集
+    # 配对信息不全（编号对不上）时仍然要求 --wiring
+    bad = json.loads(json.dumps(plan))
+    bad["segments"]["Bgeneral7"] = bad["segments"].pop("Bgeneral1")
+    assert LY.manual_wiring(bad) is None
+    with pytest.raises(LY.LayoutError, match="--wiring"):
+        LY.pair_static(bad)

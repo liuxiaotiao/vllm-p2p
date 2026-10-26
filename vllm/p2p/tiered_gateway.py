@@ -170,10 +170,12 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         return web.json_response({"error": {"message": msg, "code": status}}, status=status,
                                  dumps=lambda o: json.dumps(o, ensure_ascii=False))
 
-    def chunk(cid, model, text, finish=None, stop_reason=None) -> bytes:
+    def chunk(cid, model, text, finish=None, stop_reason=None, usage=None) -> bytes:
         d = {"id": cid, "object": "text_completion", "created": int(time.time()), "model": model,
              "choices": [{"index": 0, "text": text, "logprobs": None, "finish_reason": finish,
                           "stop_reason": stop_reason}]}
+        if usage is not None:            # stream_options.continuous_usage_stats（与 vLLM 同口径）
+            d["usage"] = usage
         return f"data: {json.dumps(d, ensure_ascii=False)}\n\n".encode("utf-8")
 
     def metrics_of(res: Mapping) -> dict:
@@ -226,6 +228,12 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         max_tokens = int(body.get("max_tokens") or 16)
         max_tokens = max(1, min(max_tokens, max_model_len - len(ids)))
         stream = bool(body.get("stream"))
+        so = body.get("stream_options") or {}
+        cont_usage = bool(so.get("include_usage") and so.get("continuous_usage_stats"))
+
+        def running_usage():
+            return {"prompt_tokens": len(ids), "completion_tokens": n_out,
+                    "total_tokens": len(ids) + n_out}
         cid = f"cmpl-{pid}"
         det = IncrementalDetok(tokenizer, skip_special=body.get("skip_special_tokens", True))
         resp: web.StreamResponse | None = None
@@ -273,7 +281,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                                 **hdr, "Content-Type": "text/event-stream"})
                             await resp.prepare(request)
                     if stream and delta:
-                        await resp.write(chunk(cid, rec["channel"], delta))
+                        await resp.write(chunk(cid, rec["channel"], delta,
+                                               usage=running_usage() if cont_usage else None))
                     continue
                 # done
                 res = ev[1]
@@ -299,7 +308,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                     resp = web.StreamResponse(status=200, headers={
                         **hdr, "Content-Type": "text/event-stream"})
                     await resp.prepare(request)
-                await resp.write(chunk(cid, rec["channel"], tail, fin, sr))
+                await resp.write(chunk(cid, rec["channel"], tail, fin, sr,
+                                       usage=usage if cont_usage else None))
                 u = {"id": cid, "object": "text_completion", "created": int(time.time()),
                      "model": rec["channel"], "choices": [], "usage": usage, "p2p_metrics": met}
                 await resp.write(f"data: {json.dumps(u, ensure_ascii=False)}\n\n".encode())

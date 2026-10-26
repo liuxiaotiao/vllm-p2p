@@ -52,9 +52,9 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
-    from tiered_stats import continuous_report, request_stats
+    from tiered_stats import continuous_report, mark_stats, request_stats
 except ImportError:
-    from vllm.p2p.tiered_stats import continuous_report, request_stats
+    from vllm.p2p.tiered_stats import continuous_report, mark_stats, request_stats
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -101,6 +101,10 @@ class Rec:
     headers: dict = field(default_factory=dict)
     status: int | None = None
     error: str | None = None
+    marks_want: tuple = ()
+    """生成到这些 token 数时打点（--marks）。"""
+    mark_t: dict = field(default_factory=dict)
+    """{k: (时刻, 当时实际已生成的 token 数)} —— 一块里可能不止一个 token，实际数 ≥ k。"""
 
 
 def parse_sse_line(line: bytes) -> dict | None:
@@ -157,6 +161,11 @@ def post_stream(base: str, payload: dict, rec: Rec, timeout: float) -> None:
                     rec.stop_reason = c.get("stop_reason")
             if d.get("usage"):
                 rec.usage = d["usage"]
+                # 每块都带累计的 completion_tokens（continuous_usage_stats）：第一次 ≥ k 时打点
+                n = int(d["usage"].get("completion_tokens") or 0)
+                for k in rec.marks_want:
+                    if n >= k and k not in rec.mark_t:
+                        rec.mark_t[k] = (now, n)
             if d.get("p2p_metrics"):
                 rec.engine = d["p2p_metrics"]
     except Exception as e:                                    # noqa: BLE001
@@ -190,6 +199,24 @@ def _median(xs):
         return 0.0
     m = len(xs) // 2
     return xs[m] if len(xs) % 2 else 0.5 * (xs[m - 1] + xs[m])
+
+
+def mark_rows(rec: Rec) -> dict:
+    """打点 → {k: {n, t_ms（提交→第 k 个 token，含排队）, since_first_ms（首 token→第 k 个）,
+    tpot_ms（到这里为止的平均每 token）, tok_per_s（k / 含排队用时）, decode_tok_per_s}}。"""
+    out = {}
+    for k in sorted(rec.mark_t):
+        t, n = rec.mark_t[k]
+        e = (t - rec.t0) * 1e3
+        sf = (t - rec.t_first) * 1e3 if rec.t_first is not None else None
+        out[str(k)] = {
+            "n": n, "t_ms": round(e, 2),
+            "since_first_ms": round(sf, 2) if sf is not None else None,
+            "tpot_ms": round(sf / (n - 1), 3) if sf and n > 1 else None,
+            "tok_per_s": round(n / (e / 1e3), 3) if e > 0 else None,
+            "decode_tok_per_s": round((n - 1) / (sf / 1e3), 3) if sf and n > 1 else None,
+        }
+    return out
 
 
 def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str, Mapping],
@@ -241,6 +268,7 @@ def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str,
         "traces_complete": False,
         "utilisation": 0.0,
         "token_ms": [round(x, 2) for x in gaps],
+        "marks": mark_rows(rec),
         "t_submit_s": round(rec.t0 - t_run0, 3),
         "t_done_s": round(rec.t_last - t_run0, 3),
         **({"case_id": rec.case_id} if rec.case_id else {}),
@@ -494,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--requests", type=int, default=0, help="0 = 测试集全部")
     ap.add_argument("--order", choices=("interleave", "file"), default="interleave")
     ap.add_argument("--warmup", type=int, default=1, help="每条通道先打几条预热（不计入结果）")
+    ap.add_argument("--marks", default="64,128,256,512,1024",
+                    help="每条请求生成到这些 token 数时打点（结果里 requests[i].marks，汇总里有一张表）")
     ap.add_argument("--req-timeout", type=float, default=3600.0)
     ap.add_argument("--thinking", choices=("off", "on", "default"), default="off")
     ap.add_argument("--smi", action="store_true", help="压测期间在各节点采 nvidia-smi")
@@ -514,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cj = json.loads(Path(a.channels).read_text(encoding="utf-8"))
     channels = {c["name"]: c for c in cj["channels"]}
+    marks = tuple(sorted({int(x) for x in str(a.marks).split(",") if x.strip()}))
     try:
         gw_info = http_json(f"{a.gateway}/p2p/channels")
     except OSError as e:
@@ -554,9 +585,11 @@ def main(argv: list[str] | None = None) -> int:
     def make_rec(i: int, tag: str, task: str | None, payload, max_tokens: int) -> Rec:
         ids, body, prompt, cid = encode(payload)
         rec = Rec(i=i, rid=f"{tag}{i}", true_task=task, payload=payload, ids=ids, body=body,
-                  case_id=cid, prompt=prompt)
+                  case_id=cid, prompt=prompt, marks_want=marks)
         req = {"prompt": ids, "max_tokens": max_tokens, "temperature": 0.0, "stream": True,
-               "stream_options": {"include_usage": True}, "skip_special_tokens": True,
+               # continuous_usage_stats：每块带累计生成数，生成到 --marks 那几档时打点
+               "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+               "skip_special_tokens": True,
                "p2p_id": rec.rid, "p2p_body": [list(x) for x in body]}
         if task:
             req["p2p_task"] = task
@@ -729,12 +762,14 @@ def main(argv: list[str] | None = None) -> int:
                              n_timeout=len(dead))
     out["run"]["order"] = a.order
     out["run"]["max_tokens"] = a.max_tokens
+    out["run"]["marks"] = list(marks)
     if mode in ("oracle", "any"):
         # 路由按标注（any：不看 task），没有识别 —— run_metrics 会拿路由结果当「识别」算出个 100%，去掉免得误读
         out["run"]["accuracy"] = None
         for v in out["run"]["by_task"].values():
             v["accuracy"] = None
     out["run"]["per_request"] = request_stats(rows)
+    out["run"]["marks_stats"] = mark_stats(rows)
     # 与 p2p-framework 连续性测试同一格式的汇总（均值 / 标准差 / 分位数、按 task、资源占用）
     log.info("")
     for ln in continuous_report(out):

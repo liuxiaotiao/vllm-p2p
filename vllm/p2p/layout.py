@@ -169,6 +169,31 @@ def _model_shape(plan: Mapping, n_layers: int | None, n_experts: int | None) -> 
     return L, E
 
 
+def manual_wiring(plan: Mapping) -> dict[str, tuple[str, str]] | None:
+    """p2p-framework `deploy/manual.py` 写出的清单没有组合矩阵，配对隐含在段名里：第 i 条通道是
+    前段 `F{i}` + 后段 `B<task>{i}`。按末尾编号一一配上；前段与后段编号对不齐时返回 None。"""
+    segs = plan["segments"]
+    num = re.compile(r"(\d+)$")
+    fr, bk = {}, {}
+    for sid, info in segs.items():
+        m = num.search(sid)
+        role = str(info.get("role", ""))
+        if not m or role.endswith("standby"):
+            continue
+        if role == "front":
+            fr[m.group(1)] = sid
+        elif role.startswith("back"):
+            bk[m.group(1)] = sid
+    if not fr or set(fr) != set(bk):
+        return None
+    out = {}
+    for i in sorted(fr, key=int):
+        b = bk[i]
+        role = str(segs[b]["role"])
+        out[fr[i]] = (b, role.split(":", 1)[1] if ":" in role else str(segs[b].get("task") or "general"))
+    return out
+
+
 def pair_static(plan: Mapping, wiring: Mapping | None = None) -> dict[str, tuple[str, str]]:
     """前段段 id → (后段段 id, task)。
 
@@ -207,6 +232,9 @@ def pair_static(plan: Mapping, wiring: Mapping | None = None) -> dict[str, tuple
 
     pairings = plan.get("pairings") or []
     if not pairings:
+        manual = manual_wiring(plan)
+        if manual is not None:
+            return manual
         raise LayoutError("清单里没有组合矩阵（pairings），无法自动配对 —— 请给 --wiring")
     used_f: set[str] = set()
     used_b: set[str] = set()
@@ -548,6 +576,16 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = load_plan(args.plan)
     wiring = json.loads(args.wiring.read_text(encoding="utf-8")) if args.wiring else None
+    if (args.n_layers is None or args.n_experts is None) and not _MODEL_TAG.search(str(plan.get("model", ""))):
+        # 手动清单的 model 字段是模型名、没有「48L-…-E128」：本机有 --model-dir 的 config.json 时从它读
+        cfg_path = Path(str(args.model_dir)) / "config.json"
+        if cfg_path.is_file():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            args.n_layers = args.n_layers or int(cfg["num_hidden_layers"])
+            args.n_experts = args.n_experts or int(cfg["num_experts"])
+            print(f"清单里没有层数 / 专家数：按 {cfg_path} 取 {args.n_layers} 层 × {args.n_experts} 专家")
+    if wiring is None and not plan.get("pairings") and manual_wiring(plan) is not None:
+        print(f"清单没有组合矩阵：按段名编号配对 {manual_wiring(plan)}（手动放置的清单）")
     try:
         chans = channels_from_plan(plan, pair_static(plan, wiring),
                                    n_layers=args.n_layers, n_experts=args.n_experts)
@@ -588,7 +626,8 @@ def main(argv: list[str] | None = None) -> int:
     # 没给 --remote-out 时用 --out 的绝对路径（假设各节点上代码目录与这台同路径）
     remote = (args.remote_out or str(args.out.resolve())).rstrip("/")
     summary = []
-    print(f"{len(chans)} 条通道（L₀={plan['l0']}，{'按 --wiring' if wiring else '按 t50 贪心配对'}）")
+    how = ("按 --wiring" if wiring else "按 t50 贪心配对" if plan.get("pairings") else "按段名编号配对")
+    print(f"{len(chans)} 条通道（L₀={plan['l0']}，{how}）")
     for ch in chans:
         auto, old = channel_dtype(ch, hosts, sm75)
         if args.dtype == "auto":

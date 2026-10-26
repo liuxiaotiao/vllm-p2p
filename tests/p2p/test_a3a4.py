@@ -86,6 +86,10 @@ def fake_vllm(name: str, seen: list):
             fin = None if j < n - 1 else ("length" if n == d["max_tokens"] else "stop")
             ch = {"id": "cmpl-x", "choices": [{"index": 0, "text": f"t{j} ",
                                                "finish_reason": fin, "stop_reason": None}]}
+            so = d.get("stream_options") or {}
+            if so.get("include_usage") and so.get("continuous_usage_stats"):   # 与 vLLM 同：每块带累计数
+                ch["usage"] = {"prompt_tokens": len(d["prompt"]), "completion_tokens": j + 1,
+                               "total_tokens": len(d["prompt"]) + j + 1}
             await resp.write(f"data: {json.dumps(ch)}\n\n".encode())
         usage = {"id": "cmpl-x", "choices": [],
                  "usage": {"prompt_tokens": len(d["prompt"]), "completion_tokens": n,
@@ -271,6 +275,31 @@ def test_any_mode_ignores_task_for_full_expert_channels(world, tmp_path) -> None
     from vllm.p2p.tiered_stats import continuous_report
     txt = "\n".join(continuous_report(out))
     assert "识别：" not in txt and "no_robots" in txt
+
+
+def test_bench_marks_at_generated_lengths(world, tmp_path) -> None:
+    """--marks：每条请求生成到第 k 个 token 时打点（靠 continuous_usage_stats 的累计数），
+    没生成到 k 的请求没有这一档；汇总里多一张打点表。"""
+    gw = gateway(world, "oracle")
+    out = run_bench(world, gw, tmp_path / "marks.json", "--marks", "2,4,64")
+    rs = out["requests"]
+    assert out["run"]["marks"] == [2, 4, 64]
+    for r in rs:
+        m = r["marks"]
+        assert "2" in m and "64" not in m                         # 至少 3 个 token；最多 6 个
+        assert ("4" in m) == (r["n_generated"] >= 4)
+        a = m["2"]
+        assert a["n"] == 2 and 0 < a["since_first_ms"] <= a["t_ms"] <= r["total_ms"] + 1
+        assert a["tpot_ms"] == pytest.approx(a["since_first_ms"], rel=1e-3)
+        assert a["tok_per_s"] == pytest.approx(2 / (a["t_ms"] / 1e3), rel=1e-2)
+        if "4" in m:
+            assert m["4"]["t_ms"] >= a["t_ms"] and m["4"]["tpot_ms"] == pytest.approx(
+                m["4"]["since_first_ms"] / 3, rel=1e-3)
+    ms = out["run"]["marks_stats"]
+    assert ms["all"]["2"]["n"] == len(rs) and ms["all"]["4"]["n"] == sum(r["n_generated"] >= 4 for r in rs)
+    from vllm.p2p.tiered_stats import continuous_report
+    txt = "\n".join(continuous_report(out))
+    assert "生成长度打点" in txt and "k=4" in txt
 
 
 def test_lr_mode_routes_by_identifier(world, tmp_path) -> None:

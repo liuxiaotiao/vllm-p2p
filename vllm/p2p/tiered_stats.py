@@ -111,6 +111,53 @@ def _label_ok(r):
     return None if not r.get("true_task") else lab == r["true_task"]
 
 
+def mark_stats(rows) -> dict:
+    """bench 的逐请求打点（requests[i].marks）→ 每一档 k：到达的条数，以及各量的均值 / 标准差 / 分位数；
+    另按 task 给平均 TPOT 与解码 token/s。只统计生成到了 k 的请求（短回答不进长的档）。"""
+    ks = sorted({int(k) for r in rows for k in (r.get("marks") or {})})
+    out = {"all": {}, "by_task": {}}
+    for k in ks:
+        ms = [r["marks"][str(k)] for r in rows if str(k) in (r.get("marks") or {})]
+        out["all"][str(k)] = {"n": len(ms), **{f: full_stats([m.get(f) for m in ms])
+                                               for f in ("t_ms", "since_first_ms", "tpot_ms",
+                                                         "tok_per_s", "decode_tok_per_s")}}
+        by = defaultdict(list)
+        for r in rows:
+            m = (r.get("marks") or {}).get(str(k))
+            if m:
+                by[r.get("true_task") or "?"].append(m)
+        for u, ms_u in by.items():
+            out["by_task"].setdefault(u, {})[str(k)] = {
+                "n": len(ms_u), "tpot_ms": full_stats([m.get("tpot_ms") for m in ms_u]),
+                "decode_tok_per_s": full_stats([m.get("decode_tok_per_s") for m in ms_u])}
+    return out
+
+
+def format_mark_stats(ms: dict) -> list[str]:
+    if not ms.get("all"):
+        return []
+
+    def f(sv, d):
+        return f"{sv['mean']:.{d}f} ± {sv['std']:.{d}f}" if sv.get("n") else "—"
+    out = ["", "    生成长度打点（每条请求生成到第 k 个 token 时；只算生成到了 k 的请求；均值 ± 标准差）",
+           f"    {'k':>6}{'条数':>6}{'提交→第k个 ms':>20}{'首token→第k个 ms':>22}{'平均TPOT ms':>16}"
+           f"{'单请求tok/s':>16}{'解码tok/s':>16}"]
+    for k, v in ms["all"].items():
+        out.append(f"    {k:>6}{v['n']:>6}{f(v['t_ms'], 0):>20}{f(v['since_first_ms'], 0):>22}"
+                   f"{f(v['tpot_ms'], 1):>16}{f(v['tok_per_s'], 2):>16}{f(v['decode_tok_per_s'], 2):>16}")
+    ks = list(ms["all"])
+    out.append(f"    {'按 task：平均TPOT ms（条数）':<26}" + "".join(f"{'k=' + k:>16}" for k in ks))
+    for u, by_k in sorted(ms["by_task"].items()):
+        cells = []
+        for k in ks:
+            v = by_k.get(k)
+            cells.append(f"{v['tpot_ms']['mean']:.1f}（{v['n']}）" if v and v["tpot_ms"].get("n") else "—")
+        out.append(f"    {u:<26}" + "".join(f"{c:>16}" for c in cells))
+    out.append("    提交→第k个 含排队与首 token；平均TPOT = (第k个 − 首token) / (k − 1)；单请求tok/s = k ÷ 提交→第k个；"
+               "解码tok/s = 1000 ÷ 平均TPOT")
+    return out
+
+
 def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     """bench 的结果 JSON → 与 p2p-framework 连续性测试同一格式的几张表（文本行）。"""
     rows = list(doc.get("requests") or [])
@@ -178,6 +225,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
                    + (f"{100 * sum(ok) / len(ok):>9.0f}%" if ok else f"{'—':>10}")
                    + f"{sum(int(r.get('rebinds', 0)) for r in rs):>10}")
     out.append("    （tok/s = 单请求 token/s，去排队口径）")
+    out += format_mark_stats(mark_stats(rows))
     # ---- 资源 ----
     usage = run.get("nodes") or {}
     if usage:

@@ -485,9 +485,10 @@ def test_remote_agents_and_gateway_end_to_end(configs, direct) -> None:
             async def one(i, p):
                 r = await client.post("/v1/completions", json={
                     "prompt": p, "max_tokens": MAXT, "temperature": 0.0, "stream": True,
-                    "p2p_task": "t", "p2p_id": f"q{i}", "stream_options": {"include_usage": True}})
+                    "p2p_task": "t", "p2p_id": f"q{i}",
+                    "stream_options": {"include_usage": True, "continuous_usage_stats": i % 2 == 0}})
                 assert r.status == 200, await r.text()
-                text, usage, fin, met = "", None, None, None
+                text, usage, fin, met, running = "", None, None, None, []
                 async for line in r.content:
                     line = line.strip()
                     if not line.startswith(b"data:") or line == b"data: [DONE]":
@@ -497,8 +498,16 @@ def test_remote_agents_and_gateway_end_to_end(configs, direct) -> None:
                     for c in d.get("choices") or []:
                         text += c["text"]
                         fin = c["finish_reason"] or fin
+                    if d.get("choices") and d.get("usage"):
+                        running.append(d["usage"]["completion_tokens"])
                     usage = d.get("usage") or usage
                     met = d.get("p2p_metrics") or met
+                # continuous_usage_stats：每块带累计生成数，单调不减、最后等于总数；没要就不带
+                if i % 2 == 0:
+                    assert running and running == sorted(running)
+                    assert running[-1] == usage["completion_tokens"]
+                else:
+                    assert not running
                 return {"text": text, "usage": usage, "finish": fin, "metrics": met,
                         "channel": r.headers.get("X-P2P-Channel"),
                         "front": r.headers.get("X-P2P-Front")}
