@@ -164,10 +164,37 @@ def segment_stats(rows) -> dict:
     return out
 
 
-def format_segment_stats(ss: dict) -> list[str]:
+CUM_KS = (64, 128, 256, 512, 1024, 2048)
+
+
+def cumulative_stats(rows, ks=CUM_KS) -> dict:
+    """首 token → 第 k 个 token 的平均间隔（ms / token）= (第 k 个 − 首 token) / (k − 1)。
+    有第 k 个的打点就用打点；没有这一档打点、但这条正好生成了 k 个（如 max_tokens=2048 截断的）时，
+    用整条的 (总时延 − 首 token) / (k − 1)。只统计生成到了 k 的请求。"""
+    names = [f"1→{k}" for k in ks]
+    out = {"segments": names, "all": {}, "by_task": {}}
+    for k, name in zip(ks, names):
+        vals, by = [], defaultdict(list)
+        for r in rows:
+            m = (r.get("marks") or {}).get(str(k))
+            v = None
+            if m and m.get("since_first_ms") is not None and (m.get("n") or 0) > 1:
+                v = m["since_first_ms"] / (m["n"] - 1)
+            elif not m and int(r.get("n_generated") or 0) == k and k > 1:
+                v = (float(r["total_ms"]) - float(r["prefill_ms"])) / (k - 1)
+            if v is not None:
+                vals.append(v)
+                by[r.get("true_task") or "?"].append(v)
+        out["all"][name] = full_stats(vals)
+        for u, vs in by.items():
+            out["by_task"].setdefault(u, {})[name] = full_stats(vs)
+    return out
+
+
+def format_segment_stats(ss: dict, title: str | None = None, note: str | None = None) -> list[str]:
     if not ss.get("segments"):
         return []
-    out = ["", "    分段生成间隔（相邻两个打点之间平均每个 token 的毫秒数；只算两端都生成到了的请求）",
+    out = ["", "    " + (title or "分段生成间隔（相邻两个打点之间平均每个 token 的毫秒数；只算两端都生成到了的请求）"),
            f"    {'区间（第几个 token）':<18}{'条数':>6}" + "".join(
                f"{h:>10}" for h in ("均值", "标准差", "p50", "p90", "p99", "最大"))]
     for name in ss["segments"]:
@@ -182,8 +209,8 @@ def format_segment_stats(ss: dict) -> list[str]:
         cells = [f"{by[n]['mean']:.1f}（{by[n]['n']}）" if by.get(n, {}).get("n") else "—"
                  for n in ss["segments"]]
         out.append(f"    {u:<24}" + "".join(f"{c:>14}" for c in cells))
-    out.append("    1→64 = (第 64 个 − 首 token) / 63；其余 = (第 k₂ 个 − 第 k₁ 个) / (k₂ − k₁)，"
-               "k 用打点时实际已生成的 token 数")
+    out.append("    " + (note or "1→64 = (第 64 个 − 首 token) / 63；其余 = (第 k₂ 个 − 第 k₁ 个) / (k₂ − k₁)，"
+                              "k 用打点时实际已生成的 token 数"))
     return out
 
 
@@ -281,6 +308,10 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     out.append("    （tok/s = 单请求 token/s，去排队口径）")
     out += format_mark_stats(mark_stats(rows))
     out += format_segment_stats(segment_stats(rows))
+    out += format_segment_stats(
+        cumulative_stats(rows),
+        title="累计生成间隔（首 token → 第 k 个 token，平均每个 token 的毫秒数；只算生成到了 k 的请求）",
+        note="1→k = (第 k 个 − 首 token) / (k − 1)；1→2048 没有打点时用正好生成 2048 个的请求整条的 TPOT")
     # ---- 资源 ----
     usage = run.get("nodes") or {}
     if usage:

@@ -886,3 +886,22 @@ def test_segment_stats_between_marks() -> None:
     txt = "\n".join(T.format_segment_stats(ss))
     assert "分段生成间隔" in txt and "64→128" in txt and "10.0" in txt
     assert T.segment_stats([{"true_task": "g"}])["segments"] == []
+
+
+def test_cumulative_stats_from_first_token() -> None:
+    from vllm.p2p import tiered_stats as T
+
+    rows = [{"true_task": "g", "n_generated": 2048, "total_ms": 2047.0 + 100, "prefill_ms": 100.0,
+             "marks": {"64": {"n": 64, "t_ms": 730, "since_first_ms": 630},
+                       "1024": {"n": 1025, "t_ms": 10340, "since_first_ms": 10240}}},
+            {"true_task": "m", "n_generated": 100, "total_ms": 1000.0, "prefill_ms": 100.0,
+             "marks": {"64": {"n": 64, "t_ms": 1360, "since_first_ms": 1260}}}]
+    cs = T.cumulative_stats(rows)
+    assert cs["segments"] == ["1→64", "1→128", "1→256", "1→512", "1→1024", "1→2048"]
+    assert cs["all"]["1→64"]["n"] == 2 and cs["all"]["1→64"]["mean"] == pytest.approx((10 + 20) / 2)
+    assert cs["all"]["1→128"]["n"] == 0                     # 两条都没有 128 的打点
+    assert cs["all"]["1→1024"]["mean"] == pytest.approx(10.0)
+    # 没有 2048 的打点：正好生成了 2048 个的那条用整条 TPOT
+    assert cs["all"]["1→2048"]["n"] == 1 and cs["all"]["1→2048"]["mean"] == pytest.approx(1.0)
+    txt = "\n".join(T.continuous_report({"requests": rows}))
+    assert "累计生成间隔" in txt and "1→2048" in txt and "分段生成间隔" in txt

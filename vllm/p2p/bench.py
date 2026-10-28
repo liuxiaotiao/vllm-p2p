@@ -52,9 +52,11 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
-    from tiered_stats import continuous_report, mark_stats, request_stats, segment_stats
+    from tiered_stats import (continuous_report, cumulative_stats, mark_stats, request_stats,
+                              segment_stats)
 except ImportError:
-    from vllm.p2p.tiered_stats import continuous_report, mark_stats, request_stats, segment_stats
+    from vllm.p2p.tiered_stats import (continuous_report, cumulative_stats, mark_stats,
+                                       request_stats, segment_stats)
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -522,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--requests", type=int, default=0, help="0 = 测试集全部")
     ap.add_argument("--order", choices=("interleave", "file"), default="interleave")
     ap.add_argument("--warmup", type=int, default=1, help="每条通道先打几条预热（不计入结果）")
-    ap.add_argument("--marks", default="64,128,256,512,1024",
+    ap.add_argument("--marks", default="64,128,256,512,1024,2048",
                     help="每条请求生成到这些 token 数时打点（结果里 requests[i].marks，汇总里有一张表）")
     ap.add_argument("--req-timeout", type=float, default=3600.0)
     ap.add_argument("--thinking", choices=("off", "on", "default"), default="off")
@@ -771,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
     out["run"]["per_request"] = request_stats(rows)
     out["run"]["marks_stats"] = mark_stats(rows)
     out["run"]["segment_stats"] = segment_stats(rows)
+    out["run"]["cumulative_stats"] = cumulative_stats(rows)
     # 与 p2p-framework 连续性测试同一格式的汇总（均值 / 标准差 / 分位数、按 task、资源占用）
     log.info("")
     for ln in continuous_report(out):
