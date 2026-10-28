@@ -133,6 +133,60 @@ def mark_stats(rows) -> dict:
     return out
 
 
+def segment_stats(rows) -> dict:
+    """相邻两个打点之间的平均 token 间隔（ms / token）：首 token→第 k₁ 个、k₁→k₂、…。
+    每条请求：(t_b − t_a) / (n_b − n_a)，n 用打点时实际已生成的数；只统计两端都到了的请求。
+    看「已经生成了多长」时每个 token 要多久（上下文越长、后段越忙，间隔怎么变）。"""
+    ks = sorted({int(k) for r in rows for k in (r.get("marks") or {})})
+    segs = [("1", str(ks[0]))] + [(str(a), str(b)) for a, b in zip(ks, ks[1:])] if ks else []
+    out = {"segments": [f"{a}→{b}" for a, b in segs], "all": {}, "by_task": {}}
+    for a, b in segs:
+        name = f"{a}→{b}"
+        vals, by = [], defaultdict(list)
+        for r in rows:
+            m = r.get("marks") or {}
+            if b not in m:
+                continue
+            mb = m[b]
+            if a == "1":
+                sf, n = mb.get("since_first_ms"), mb.get("n") or 0
+                v = sf / (n - 1) if sf is not None and n > 1 else None
+            elif a in m and (mb["n"] - m[a]["n"]) > 0:
+                v = (mb["t_ms"] - m[a]["t_ms"]) / (mb["n"] - m[a]["n"])
+            else:
+                v = None
+            if v is not None:
+                vals.append(v)
+                by[r.get("true_task") or "?"].append(v)
+        out["all"][name] = full_stats(vals)
+        for u, vs in by.items():
+            out["by_task"].setdefault(u, {})[name] = full_stats(vs)
+    return out
+
+
+def format_segment_stats(ss: dict) -> list[str]:
+    if not ss.get("segments"):
+        return []
+    out = ["", "    分段生成间隔（相邻两个打点之间平均每个 token 的毫秒数；只算两端都生成到了的请求）",
+           f"    {'区间（第几个 token）':<18}{'条数':>6}" + "".join(
+               f"{h:>10}" for h in ("均值", "标准差", "p50", "p90", "p99", "最大"))]
+    for name in ss["segments"]:
+        v = ss["all"][name]
+        if not v.get("n"):
+            out.append(f"    {name:<18}{0:>6}" + f"{'—':>10}" * 6)
+            continue
+        out.append(f"    {name:<18}{v['n']:>6}" + "".join(
+            f"{v[k]:>10.1f}" for k in ("mean", "std", "p50", "p90", "p99", "max")))
+    out.append(f"    {'按 task：均值 ms（条数）':<24}" + "".join(f"{s_:>14}" for s_ in ss["segments"]))
+    for u, by in sorted(ss["by_task"].items()):
+        cells = [f"{by[n]['mean']:.1f}（{by[n]['n']}）" if by.get(n, {}).get("n") else "—"
+                 for n in ss["segments"]]
+        out.append(f"    {u:<24}" + "".join(f"{c:>14}" for c in cells))
+    out.append("    1→64 = (第 64 个 − 首 token) / 63；其余 = (第 k₂ 个 − 第 k₁ 个) / (k₂ − k₁)，"
+               "k 用打点时实际已生成的 token 数")
+    return out
+
+
 def format_mark_stats(ms: dict) -> list[str]:
     if not ms.get("all"):
         return []
@@ -226,6 +280,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
                    + f"{sum(int(r.get('rebinds', 0)) for r in rs):>10}")
     out.append("    （tok/s = 单请求 token/s，去排队口径）")
     out += format_mark_stats(mark_stats(rows))
+    out += format_segment_stats(segment_stats(rows))
     # ---- 资源 ----
     usage = run.get("nodes") or {}
     if usage:

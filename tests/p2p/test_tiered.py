@@ -867,3 +867,22 @@ def test_continuous_report_matches_p2p_framework_layout() -> None:
     assert "front-N01" in txt and "back-g-0" in txt and "合计/均值：GPU 利用率 7.0%，显存峰值合计 150 / 400 MB" in txt
     sv = T.full_stats([1, 2, 3, 4])
     assert sv["p50"] == 2.5 and sv["p90"] == pytest.approx(3.7) and sv["std"] == pytest.approx(1.2910, abs=1e-4)
+
+
+def test_segment_stats_between_marks() -> None:
+    from vllm.p2p import tiered_stats as T
+
+    def mk(n, t, sf):
+        return {"n": n, "t_ms": t, "since_first_ms": sf}
+    rows = [{"true_task": "g", "marks": {"64": mk(64, 730, 630), "128": mk(130, 1390, 1290)}},
+            {"true_task": "m", "marks": {"64": mk(65, 1100, 1024)}}]
+    ss = T.segment_stats(rows)
+    assert ss["segments"] == ["1→64", "64→128"]
+    a = ss["all"]["1→64"]
+    assert a["n"] == 2 and a["mean"] == pytest.approx((630 / 63 + 1024 / 64) / 2)
+    b = ss["all"]["64→128"]                       # 只有第一条两端都到了；用实际数 130 − 64
+    assert b["n"] == 1 and b["mean"] == pytest.approx((1390 - 730) / 66)
+    assert ss["by_task"]["m"].get("64→128") is None and ss["by_task"]["g"]["64→128"]["n"] == 1
+    txt = "\n".join(T.format_segment_stats(ss))
+    assert "分段生成间隔" in txt and "64→128" in txt and "10.0" in txt
+    assert T.segment_stats([{"true_task": "g"}])["segments"] == []

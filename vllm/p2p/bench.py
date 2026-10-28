@@ -52,9 +52,9 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
-    from tiered_stats import continuous_report, mark_stats, request_stats
+    from tiered_stats import continuous_report, mark_stats, request_stats, segment_stats
 except ImportError:
-    from vllm.p2p.tiered_stats import continuous_report, mark_stats, request_stats
+    from vllm.p2p.tiered_stats import continuous_report, mark_stats, request_stats, segment_stats
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -770,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             v["accuracy"] = None
     out["run"]["per_request"] = request_stats(rows)
     out["run"]["marks_stats"] = mark_stats(rows)
+    out["run"]["segment_stats"] = segment_stats(rows)
     # 与 p2p-framework 连续性测试同一格式的汇总（均值 / 标准差 / 分位数、按 task、资源占用）
     log.info("")
     for ln in continuous_report(out):
