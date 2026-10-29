@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -302,6 +303,18 @@ def test_bench_marks_at_generated_lengths(world, tmp_path) -> None:
     assert "生成长度打点" in txt and "k=4" in txt
 
 
+def test_bench_offline_submits_everything_at_once(world, tmp_path) -> None:
+    gw = gateway(world, "oracle")
+    rc = B.main(["--gateway", gw, "--channels", str(world["channels"]), "--cases", str(world["cases"]),
+                 "--model-dir", str(world["ckpt"]), "--p2p-framework", str(FW), "--max-tokens", "6",
+                 "--warmup", "0", "--offline", "--out", str(tmp_path / "off.json")])
+    assert rc == 0
+    out = json.loads((tmp_path / "off.json").read_text(encoding="utf-8"))
+    assert out["concurrency"] == len(out["requests"]) == 9 and out["run"]["offline"] is True
+    from vllm.p2p.tiered_stats import continuous_report
+    assert continuous_report(out)[0].startswith("离线满载（全部请求一次提交）：9 条")
+
+
 def test_lr_mode_routes_by_identifier(world, tmp_path) -> None:
     gw = gateway(world, "lr")
     out = run_bench(world, gw, tmp_path / "e4.json")
@@ -404,3 +417,85 @@ def test_compare_two_runs(world, tmp_path) -> None:
     pairs, ma, mb = C.pair_rows(a["requests"], a["requests"][:5])
     assert len(pairs) == 5 and ma == 4 and mb == 0
     assert C.common_prefix([1, 2, 3], [1, 2, 4]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# --saturate：逐步加压 → 保持满载
+# --------------------------------------------------------------------------- #
+def test_capacity_mix_and_ramp_level() -> None:
+    pool = [("a", 0), ("b", 1), ("a", 2), ("c", 3), ("b", 4), ("c", 5)]
+    caps = {"a": (4, 2), "b": (2, 1), "c": (2, 1)}
+    seq = B.capacity_mix(pool, 8, caps)
+    tasks = [pool[i][0] for i in seq]
+    assert len(seq) == 8 and tasks.count("a") == 4 and tasks.count("b") == 2 == tasks.count("c")
+    assert {pool[i][1] for i in seq if pool[i][0] == "a"} == {0, 2}          # a 只有两条样本：循环用
+    assert tasks[:4].count("a") == 2                                          # 交错，不是先发完一类
+    assert [B.ramp_level(t, step=2, every=10) for t in (0, 9.9, 10, 25)] == [1, 1, 3, 5]
+    assert B.ramp_level(5, step=1, every=0) > 10 ** 6
+    caps2 = B.saturation_caps(["x", "y", "z"], {"x": {"task": "a", "max_num_seqs": 8},
+                                                "y": {"task": "a", "max_num_seqs": 4},
+                                                "z": {"task": "b", "max_num_seqs": 8}}, by_task=True)
+    assert caps2 == {"a": (12, 2), "b": (8, 1)}
+    assert B.saturation_caps(["x", "z"], {"x": {"task": "a"}, "z": {"task": "b"}}, by_task=False,
+                             per_back=3) == {None: (6, 2)}
+    with pytest.raises(SystemExit, match="per-back"):
+        B.saturation_caps(["x"], {"x": {"task": "a"}}, by_task=True)
+
+
+def test_ramp_loop_ramps_then_holds_full() -> None:
+    import threading as th
+
+    class R:
+        def __init__(self, i):
+            self.i, self.t0, self.done = i, time.perf_counter(), th.Event()
+
+    live, peak = [], []
+
+    def submit(i):
+        r = R(i)
+        live.append(r)
+        th.Timer(0.12, r.done.set).start()
+        peak.append(sum(not x.done.is_set() for x in live))
+        return r
+
+    caps = {"a": (4, 2), "b": (2, 1)}
+    order = list(range(30))
+    key = lambda i: "a" if i % 3 else "b"                              # noqa: E731
+    done, dead, t0, t1, info = B.run_ramp_loop(order, key, caps, submit, step=1, every=0.1,
+                                               timeout_s=10, on_done=lambda *a: None,
+                                               poll_s=0.005, sample_s=0.02)
+    assert len(done) == 30 and not dead and info["target"] == 6
+    assert peak[0] <= 3 and max(peak) <= 6                              # 从每个后段 1 条起，不超满载
+    assert info["t_full_s"] is not None and info["t_end_s"] >= info["t_full_s"]
+    full = [n for t, n, lim in info["curve"] if info["t_full_s"] + 0.03 <= t <= info["t_end_s"] - 0.03]
+    assert full and min(full) >= 5                                      # 满载段里一直接近坐满
+
+
+def test_window_tokens() -> None:
+    rows = [{"n_generated": 11, "t_submit_s": 0.0, "prefill_ms": 1000.0, "t_done_s": 11.0},
+            {"n_generated": 1, "t_submit_s": 20.0, "prefill_ms": 0.0, "t_done_s": 20.0}]
+    assert B.window_tokens(rows, 0, 100) == pytest.approx(12)
+    assert B.window_tokens(rows, 6, 11) == pytest.approx(5)             # 后半段 5 秒 × 1 token/s
+
+
+def test_bench_saturate_ramps_and_reports_steady(world, tmp_path) -> None:
+    gw = gateway(world, "oracle")
+    rc = B.main(["--gateway", gw, "--channels", str(world["channels"]), "--cases", str(world["cases"]),
+                 "--model-dir", str(world["ckpt"]), "--p2p-framework", str(FW), "--max-tokens", "6",
+                 "--warmup", "0", "--saturate", "--per-back", "2", "--ramp-every", "0.05",
+                 "--requests", "40", "--out", str(tmp_path / "sat.json")])
+    assert rc == 0
+    out = json.loads((tmp_path / "sat.json").read_text(encoding="utf-8"))
+    sat = out["run"]["saturate"]
+    assert sat["by"] == "task" and sat["target"] == out["concurrency"] == 8
+    assert sat["caps"] == {"gsm8k": 4, "mbpp": 2, "no_robots": 2}
+    rs = out["requests"]
+    assert len(rs) == 40 and {r["phase"] for r in rs} <= {"ramp", "steady", "tail"}
+    n = defaultdict(int)
+    for r in rs:
+        n[r["true_task"]] += 1
+    assert n == {"gsm8k": 20, "mbpp": 10, "no_robots": 10}               # 按满载槽位成比例
+    from vllm.p2p.tiered_stats import continuous_report, saturate_report
+    assert continuous_report(out)[0].startswith("满载连续测试")
+    txt = "\n".join(saturate_report(out))
+    assert "满载过程" in txt and "在途曲线" in txt

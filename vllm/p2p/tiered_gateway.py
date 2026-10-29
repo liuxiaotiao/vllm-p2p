@@ -152,7 +152,8 @@ def _finish_reason(f: str | None) -> str | None:
 
 
 def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracle",
-             max_model_len: int = 4096, needs_body: bool = False, identifier: str | None = None):
+             max_model_len: int = 4096, needs_body: bool = False, identifier: str | None = None,
+             stream_timeout: float = 3600.0):
     """co：已经 start() 过的 TieredCoordinator（lr / shadow 模式要带 classify）；
     stages：名字 → stages.json 里的条目。"""
     from aiohttp import web
@@ -264,7 +265,7 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                     rec["shadow"] = v
 
         try:
-            async for ev in co.stream(ids, max_tokens, task=task, rid=pid, timeout=600.0,
+            async for ev in co.stream(ids, max_tokens, task=task, rid=pid, timeout=stream_timeout,
                                       body=body_ranges):
                 kind = ev[0]
                 if kind == "req":
@@ -424,7 +425,8 @@ async def _amain(a) -> int:
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
                    max_model_len=a.max_model_len,
-                   needs_body=bool(clf is not None and clf.needs_body), identifier=ident_desc)
+                   needs_body=bool(clf is not None and clf.needs_body), identifier=ident_desc,
+                   stream_timeout=a.stream_timeout)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, a.host, a.port).start()
@@ -452,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=9100, help="默认 9100（A 的网关占着 9000）")
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--connect-timeout", type=float, default=30.0)
+    ap.add_argument("--stream-timeout", type=float, default=3600.0,
+                    help="一条请求两次产出之间最多等多久（秒）。离线满载时请求会在后段引擎里排很久的队，"
+                         "首 token 之前可能几分钟没有动静")
     ap.add_argument("--via-coordinator", action="store_true",
                     help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
                          "协调器与引擎不在同一网段时每跳多一个往返）")

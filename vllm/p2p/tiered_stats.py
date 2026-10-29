@@ -248,6 +248,10 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     # 墙钟：bench 记的；老结果没有时用最后完成的时刻，再没有就用最长的那条（只影响吞吐那一行）
     wall = (run.get("wall_s") or max(float(r.get("t_done_s") or 0) for r in rows)
             or max(float(r.get("total_ms") or 0) for r in rows) / 1e3 or 1.0)
+    if run.get("offline") and title == "连续性测试":
+        title = "离线满载（全部请求一次提交）"
+    if run.get("saturate") and title == "连续性测试":
+        title = "满载连续测试（逐步加压 → 保持满载 → 发完收尾，全部请求）"
     out = [f"{title}：{len(rows)} 条（超时 {run.get('n_timeout', 0)}），在途 {run.get('inflight', doc.get('concurrency'))}，"
            f"最大生成 {run.get('max_tokens', doc.get('tokens'))}，墙钟 {wall:.0f}s"]
     metrics = [
@@ -276,8 +280,14 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     if not stops:
         for r in rows:
             stops[r.get("stop_reason")] = stops.get(r.get("stop_reason"), 0) + 1
-    out.append(f"    吞吐：输出 {out_tok / wall:.2f} token/s，含 prompt {(out_tok + in_tok) / wall:.2f} token/s，"
-               f"{len(rows) / wall * 60:.2f} 请求/分钟（输出共 {out_tok} token；停止原因 {dict(stops)}）")
+    if run.get("window_output_tokens") is not None:
+        wt = float(run["window_output_tokens"])
+        out.append(f"    吞吐（满载窗口内生成的 token ÷ 窗口长度，含跨窗口请求落在窗口里的部分）：输出 "
+                   f"{wt / wall:.2f} token/s；窗口内平均在途 {run.get('window_inflight_mean')}；"
+                   f"这 {len(rows)} 条的停止原因 {dict(stops)}")
+    else:
+        out.append(f"    吞吐：输出 {out_tok / wall:.2f} token/s，含 prompt {(out_tok + in_tok) / wall:.2f} token/s，"
+                   f"{len(rows) / wall * 60:.2f} 请求/分钟（输出共 {out_tok} token；停止原因 {dict(stops)}）")
     oks = [x for x in (_label_ok(r) for r in rows) if x is not None]
     if oks and doc.get("gateway_mode", "lr") not in ("oracle", "any"):
         out.append(f"    识别：{sum(oks)}/{len(oks)} = {100 * sum(oks) / len(oks):.1f}%（选择器自己判的类）；"
@@ -349,6 +359,46 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     return out
 
 
+def saturate_report(doc: dict) -> list[str]:
+    """--saturate 的结果：加压过程、满载段长度、满载段吞吐，再加一张只算满载段请求的表。"""
+    run = doc.get("run") or {}
+    sat = run.get("saturate")
+    if not sat:
+        return []
+    rows = list(doc.get("requests") or [])
+    caps = ", ".join(f"{'全部' if k == 'None' else k} {c}（{sat['backs'].get(k)} 个后段）"
+                     for k, c in sat["caps"].items())
+    ta, tb = sat.get("t_full_s"), sat.get("t_end_s")
+    out = [f"满载过程：按 {'task' if sat.get('by') == 'task' else '全局'} 保持，满载在途 {sat['target']}"
+           f"（{caps}）；从每个后段 1 条起、每 {sat.get('ramp_every'):g}s 每个后段 +{sat.get('ramp_step')}"]
+    if ta is None:
+        out.append("    一直没坐满（请求不够或加压太慢），没有满载段")
+        return out
+    out.append(f"    第 {ta:.0f}s 坐满 → 第 {tb:.0f}s 第一个 {'task ' if sat.get('by') == 'task' else ''}"
+               f"发完最后一条：满载段 {sat['window_s']:.0f}s，段内平均在途 {sat.get('window_inflight_mean')}，"
+               f"段内输出 {sat.get('window_tok_per_s') or 0:.2f} token/s")
+    ph = sat.get("n_phase") or {}
+    out.append(f"    请求分段：加压中提交 {ph.get('ramp', 0)} 条、满载段内提交并完成 {ph.get('steady', 0)} 条、"
+               f"满载段内提交但收尾时才完成 {ph.get('tail', 0)} 条")
+    cv = sat.get("curve") or []
+    if cv:
+        stride = max(1, len(cv) // 16)
+        out.append("    在途曲线（秒:在途/上限）：" + "  ".join(
+            f"{t:.0f}:{n}/{lim}" for t, n, lim in cv[::stride]))
+    steady = [r for r in rows if r.get("phase") == "steady"]
+    if steady:
+        sub = dict(doc)
+        sub["requests"] = steady
+        sub["run"] = {**(doc.get("steady") or {}), "wall_s": sat["window_s"],
+                      "window_output_tokens": sat.get("window_output_tokens"),
+                      "window_inflight_mean": sat.get("window_inflight_mean"),
+                      "inflight": sat["target"], "max_tokens": run.get("max_tokens")}
+        sub["run"].pop("nodes", None)
+        out.append("")
+        out += continuous_report(sub, title=f"满载段（坐满之后提交、第一个发完之前完成的 {len(steady)} 条）")
+    return out
+
+
 def format_request_stats(rs: dict) -> list[str]:
     def f(d, digits=1):
         if not d or d.get("mean") is None:
@@ -403,6 +453,10 @@ def main(argv=None) -> int:
     db = json.loads(a.b.read_text(encoding="utf-8"))
     for ln in continuous_report(db, title=f"连续性测试（{a.b.name}）"):
         print(ln)
+    if (db.get("run") or {}).get("saturate"):
+        print()
+        for ln in saturate_report(db):
+            print(ln)
     if a.a:
         print()
         for ln in continuous_report(json.loads(a.a.read_text(encoding="utf-8")),

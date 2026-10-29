@@ -53,10 +53,10 @@ from typing import Mapping, Sequence
 
 try:                                        # 按文件路径运行：同目录直接 import
     from tiered_stats import (continuous_report, cumulative_stats, mark_stats, request_stats,
-                              segment_stats)
+                              saturate_report, segment_stats)
 except ImportError:
     from vllm.p2p.tiered_stats import (continuous_report, cumulative_stats, mark_stats,
-                                       request_stats, segment_stats)
+                                       request_stats, saturate_report, segment_stats)
 try:
     import launch as _launch
 except ImportError:                         # pragma: no cover  python -m vllm.p2p.bench
@@ -219,6 +219,145 @@ def mark_rows(rec: Rec) -> dict:
             "decode_tok_per_s": round((n - 1) / (sf / 1e3), 3) if sf and n > 1 else None,
         }
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 满载连续测试（--saturate）：逐步加压到满载，之后一条完成补一条、始终保持满载
+# --------------------------------------------------------------------------- #
+def saturation_caps(live, channels: Mapping[str, Mapping], *, by_task: bool,
+                    per_back: int = 0) -> dict:
+    """满载的在途上限。按 task（by_task）：{task: (Σ 该 task 各后段的槽位, 后段数)}；
+    全局：{None: (Σ 所有后段的槽位, 后段数)}。一个后段的槽位 = --per-back，没给就用它的 max_num_seqs。"""
+    caps: dict = {}
+    for c in sorted(live):
+        ch = channels.get(c) or {}
+        slots = int(per_back or ch.get("max_num_seqs") or 0)
+        if slots <= 0:
+            raise SystemExit(f"后段 {c} 没写 max_num_seqs（vLLM 默认 256，不能当满载）—— 用 --per-back 指定"
+                             "每个后段同时跑几条")
+        k = ch.get("task") if by_task else None
+        cap, nb = caps.get(k, (0, 0))
+        caps[k] = (cap + slots, nb + 1)
+    return caps
+
+
+def capacity_mix(pool: Sequence, n: int, caps: Mapping) -> list[int]:
+    """按各 task 的满载槽位分配请求数（槽位多的 task 多给），每个 task 在自己的样本里循环取，
+    task 之间轮流排开。返回 pool 的下标序列（长 n）。这样各 task 的后段差不多同时做完，满载段最长。"""
+    by: dict = defaultdict(list)
+    for i, (u, _) in enumerate(pool):
+        by[u].append(i)
+    keys = [k for k in caps if by.get(k)]
+    tot = sum(caps[k][0] for k in keys)
+    want = {k: n * caps[k][0] / tot for k in keys}
+    cnt = {k: int(want[k]) for k in keys}
+    for k in sorted(keys, key=lambda k: want[k] - cnt[k], reverse=True)[: n - sum(cnt.values())]:
+        cnt[k] += 1
+    taken = {k: 0 for k in keys}
+    out = []
+    for _ in range(sum(cnt.values())):        # 按比例交错：每次取「进度」最落后的 task
+        k = min((k for k in keys if taken[k] < cnt[k]), key=lambda k: ((taken[k] + 1) / cnt[k], keys.index(k)))
+        out.append(by[k][taken[k] % len(by[k])])
+        taken[k] += 1
+    return out
+
+
+def ramp_level(t: float, *, step: int, every: float) -> int:
+    """加压进度：第 t 秒时每个后段允许的在途条数（从 1 起，每 every 秒加 step）。"""
+    if every <= 0:
+        return 1 << 30
+    return 1 + max(0, int(step)) * int(max(0.0, t) // every)
+
+
+def run_ramp_loop(order: Sequence[int], key_of, caps: Mapping, submit, *, step: int, every: float,
+                  timeout_s: float, on_done, poll_s: float = 0.02, sample_s: float = 1.0,
+                  on_level=None):
+    """逐步加压的闭环：key（task 或全局）k 的在途上限 = min(槽位_k, 后段数_k × ramp_level(t))；
+    到了上限以后一条完成补一条，直到这个 key 的请求发完。
+
+    返回 (完成, 超时, 墙钟起点, 墙钟终点, info)。info 里 t_full_s = 所有 key 第一次同时坐满的时刻，
+    t_end_s = 第一个 key 发完最后一条（之后它的后段开始空出来）的时刻 —— 两者之间就是满载段；
+    curve = 每 sample_s 秒的 (t, 总在途, 总上限)。"""
+    queues: dict = {k: [] for k in caps}
+    for i in order:
+        queues.setdefault(key_of(i), []).append(i)
+    for k in list(queues):
+        if k not in caps or not queues[k]:
+            if queues[k] and k not in caps:
+                raise ValueError(f"请求的 key {k!r} 没有后段槽位")
+            queues.pop(k)
+    cap = {k: caps[k][0] for k in queues}
+    nb = {k: caps[k][1] for k in queues}
+    head = {k: 0 for k in queues}
+    live: list = []
+    lkey: dict = {}
+    done, dead, curve = [], [], []
+    t_full = t_end = None
+    n = len(order)
+    last_level, next_sample = None, 0.0
+    t_start = time.perf_counter()
+    while any(head[k] < len(queues[k]) for k in queues) or live:
+        now = time.perf_counter() - t_start
+        lv = ramp_level(now, step=step, every=every)
+        limit = {k: min(cap[k], nb[k] * lv) for k in queues}
+        if lv != last_level and on_level and last_level is not None and \
+                any(min(cap[k], nb[k] * last_level) < cap[k] for k in queues):
+            on_level(now, lv, limit)
+        last_level = lv
+        cnt = defaultdict(int)
+        for r in live:
+            cnt[lkey[id(r)]] += 1
+        for k in queues:
+            while head[k] < len(queues[k]) and cnt[k] < limit[k]:
+                r = submit(queues[k][head[k]])
+                head[k] += 1
+                live.append(r)
+                lkey[id(r)] = k
+                cnt[k] += 1
+            if t_end is None and t_full is not None and head[k] >= len(queues[k]):
+                t_end = time.perf_counter() - t_start
+        if t_full is None and all(cnt[k] >= cap[k] for k in queues):
+            t_full = time.perf_counter() - t_start
+            if t_end is None and any(head[k] >= len(queues[k]) for k in queues):
+                t_end = t_full
+        if now >= next_sample:
+            curve.append((round(now, 2), len(live), sum(limit.values())))
+            next_sample += sample_s
+        time.sleep(poll_s)
+        still = []
+        tn = time.perf_counter()
+        for r in live:
+            if r.done.is_set():
+                done.append(r)
+                on_done(r, len(done), n)
+            elif tn - r.t0 > timeout_s:
+                dead.append(r)
+            else:
+                still.append(r)
+        live = still
+    t1 = time.perf_counter()
+    info = {"caps": {str(k): cap[k] for k in queues}, "backs": {str(k): nb[k] for k in queues},
+            "target": sum(cap.values()), "t_full_s": None if t_full is None else round(t_full, 3),
+            "t_end_s": None if t_end is None else round(t_end, 3), "curve": curve}
+    return done, dead, t_start, t1, info
+
+
+def window_tokens(rows: Sequence[Mapping], t_a: float, t_b: float) -> float:
+    """[t_a, t_b]（距压测开始的秒数）里生成的 token 数：每条请求的 token 按首 token → 最后一个 token
+    均匀摊开，算落在窗口里的部分（首 token 那一个算在首 token 时刻）。"""
+    tot = 0.0
+    for r in rows:
+        n = int(r.get("n_generated") or 0)
+        if n <= 0:
+            continue
+        tf = float(r["t_submit_s"]) + float(r.get("prefill_ms") or 0) / 1e3
+        td = float(r["t_done_s"])
+        if t_a <= tf <= t_b:
+            tot += 1
+        if n > 1 and td > tf:
+            ov = max(0.0, min(td, t_b) - max(tf, t_a))
+            tot += (n - 1) * ov / (td - tf)
+    return tot
 
 
 def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str, Mapping],
@@ -519,6 +658,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model-dir", required=True, help="有 tokenizer.json 的目录（控制机本地）")
     ap.add_argument("--p2p-framework", default=None)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--offline", action="store_true",
+                    help="离线满载：所有请求一次全部提交（在途 = 请求数），由各引擎自己连续批处理、排队；"
+                         "看的是吞吐与总耗时。各后段的 --max-num-seqs 要放大才真的满载")
+    ap.add_argument("--saturate", action="store_true",
+                    help="满载连续测试：从每个后段 1 条起，每 --ramp-every 秒每个后段多放 --ramp-step 条，"
+                         "加到满载（每个后段 = 它的 max_num_seqs 或 --per-back）后一条完成补一条、"
+                         "始终保持满载，直到请求发完；另报满载段（坐满之后提交、发完之前完成）的统计")
+    ap.add_argument("--saturate-by", choices=("auto", "task", "global"), default="auto",
+                    help="满载按 task 分别保持（每个 task 在途 = 它各后段的槽位和，按真实标注放请求，"
+                         "路由照旧由网关定）还是只保持总在途；auto = any 模式 global、其余 task")
+    ap.add_argument("--per-back", type=int, default=0,
+                    help="满载时每个后段同时几条；0 = 用 stages/channels 里它的 max_num_seqs")
+    ap.add_argument("--ramp-step", type=int, default=1, help="加压：每次每个后段多放几条")
+    ap.add_argument("--ramp-every", type=float, default=15.0, help="加压：每隔几秒加一次；0 = 直接满载")
+    ap.add_argument("--mix", choices=("capacity", "uniform"), default="capacity",
+                    help="--saturate-by task 时各 task 的请求数：capacity = 按满载槽位成比例（各 task "
+                         "差不多同时发完，满载段最长；样本不够就循环）；uniform = 测试集原样（三类各一份）")
     ap.add_argument("--inflight", type=int, default=0,
                     help="同时在途条数；默认 = 通道数（与本框架默认 = 后段通道数同口径）")
     ap.add_argument("--requests", type=int, default=0, help="0 = 测试集全部")
@@ -574,7 +730,35 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"{a.cases} 里一条都没有")
     pool = interleave(cases) if a.order == "interleave" else list(cases)
     n = len(pool) if a.requests <= 0 else a.requests
-    inflight = a.inflight or len(live)
+    inflight = n if a.offline else (a.inflight or len(live))
+    seq = [i % len(pool) for i in range(n)]          # 第 j 条请求用 pool[seq[j]]
+    caps = None
+    if a.saturate:
+        if a.offline:
+            raise SystemExit("--saturate 与 --offline 只能二选一")
+        by_task = a.saturate_by == "task" or (a.saturate_by == "auto" and mode != "any")
+        caps = saturation_caps(live, channels, by_task=by_task, per_back=a.per_back)
+        if by_task:
+            miss = sorted({str(u) for u, _ in pool if u not in caps})
+            if miss:
+                log.info("满载按 task：%s 没有后段，这些样本不发", miss)
+                pool = [x for x in pool if x[0] in caps]
+                n = len(pool) if a.requests <= 0 else a.requests
+            seq = (capacity_mix(pool, n, caps) if a.mix == "capacity"
+                   else [i % len(pool) for i in range(n)])
+        inflight = sum(c for c, _ in caps.values())
+        log.info("[满载] 按 %s 保持；满载在途 %s（共 %d），从每个后段 1 条起、每 %gs 每个后段 +%d",
+                 "task" if by_task else "全局",
+                 {str(k): f"{c}（{b} 个后段）" for k, (c, b) in caps.items()}, inflight,
+                 a.ramp_every, a.ramp_step)
+        if by_task and a.mix == "capacity":
+            cnt = defaultdict(int)
+            for i in seq:
+                cnt[pool[i][0]] += 1
+            log.info("  请求按满载槽位分给各 task：%s（样本不够的循环用）", dict(sorted(cnt.items())))
+        if n < 2 * inflight:
+            log.warning("  请求只有 %d 条、满载在途 %d：坐满后很快就发完，满载段会很短 —— "
+                        "加 --requests（比如 %d，样本循环用）", n, inflight, 4 * inflight)
 
     def encode(payload) -> tuple[list[int], list[tuple[int, int]], str, str | None]:
         if isinstance(payload, dict):
@@ -605,6 +789,11 @@ def main(argv: list[str] | None = None) -> int:
     # 分段网关还有前段引擎（不属于任何「通道」）：它们的节点也要采 smi
     fronts_live = [f["name"] for f in gw_info.get("fronts") or []]
     all_hosts = sorted({nh for c in (*live, *fronts_live) for nh in hosts.get(c, [])})
+    if caps and fronts_live:
+        fcap = sum(int((channels.get(f) or {}).get("max_num_seqs") or 0) for f in fronts_live)
+        if fcap and fcap < inflight:
+            log.warning("[满载] 前段 max_num_seqs 合计 %d < 满载在途 %d：每个 token 都要过前段，前段会先满、"
+                        "后段坐不满 —— stages.py 加大 --front-max-num-seqs", fcap, inflight)
 
     # ---- 预热：每条通道至少一条（task 轮着来，网关按最闲分到同 task 的各条） ---- #
     if a.warmup:
@@ -659,7 +848,7 @@ def main(argv: list[str] | None = None) -> int:
              n, len(pool), a.order, inflight, a.max_tokens, a.req_timeout)
 
     def submit(i):
-        u, p = pool[i % len(pool)]
+        u, p = pool[seq[i]]
         return make_rec(i, "req", u, p, a.max_tokens)
 
     def done(rec, k, total):
@@ -669,8 +858,27 @@ def main(argv: list[str] | None = None) -> int:
                  (rec.t_last - rec.t0) * 1000, ((rec.t_first or rec.t_last) - rec.t0) * 1000,
                  mark)
 
-    recs, dead, t0, t1 = run_closed_loop(n, submit, inflight=inflight, timeout_s=a.req_timeout,
-                                         on_done=done)
+    sat = None
+    if caps:
+        def level(t, lv, limit):
+            log.info("  [加压] 第 %.0fs：每个后段 ≤ %d 条，在途上限 %d / 满载 %d", t, lv,
+                     sum(limit.values()), inflight)
+
+        def key_of(j):
+            k = pool[seq[j]][0]
+            return k if k in caps else None
+
+        recs, dead, t0, t1, sat = run_ramp_loop(range(n), key_of, caps, submit, step=a.ramp_step,
+                                                every=a.ramp_every, timeout_s=a.req_timeout,
+                                                on_done=done, on_level=level)
+        if sat["t_full_s"] is None:
+            log.warning("[满载] 一直没坐满（请求不够或加压太慢）—— 满载段为空")
+        else:
+            log.info("[满载] 第 %.0fs 坐满，第 %.0fs 第一个 task 发完 → 满载段 %.0fs", sat["t_full_s"],
+                     sat["t_end_s"], sat["t_end_s"] - sat["t_full_s"])
+    else:
+        recs, dead, t0, t1 = run_closed_loop(n, submit, inflight=inflight, timeout_s=a.req_timeout,
+                                             on_done=done)
     wall = t1 - t0
 
     # ---- 收尾：计数器、smi、网关记录、A5 统计 ---- #
@@ -765,6 +973,26 @@ def main(argv: list[str] | None = None) -> int:
     out["run"]["order"] = a.order
     out["run"]["max_tokens"] = a.max_tokens
     out["run"]["marks"] = list(marks)
+    out["run"]["offline"] = bool(a.offline)
+    if sat is not None:
+        ta, tb = sat["t_full_s"], sat["t_end_s"]
+        for r in rows:
+            r["phase"] = ("ramp" if ta is None or r["t_submit_s"] < ta else
+                          "steady" if r["t_done_s"] <= tb else "tail")
+        steady = [r for r in rows if r["phase"] == "steady"]
+        win = (tb - ta) if ta is not None else 0.0
+        wt = window_tokens(rows, ta, tb) if win > 0 else 0.0
+        inw = [c[1] for c in sat["curve"] if ta is not None and ta <= c[0] <= tb]
+        sat.update(by="task" if any(k != "None" for k in sat["caps"]) else "global",
+                   per_back=a.per_back, ramp_step=a.ramp_step, ramp_every=a.ramp_every, mix=a.mix,
+                   window_s=round(win, 3), window_output_tokens=round(wt, 1),
+                   window_tok_per_s=round(wt / win, 3) if win > 0 else None,
+                   window_inflight_mean=round(sum(inw) / len(inw), 2) if inw else None,
+                   n_steady=len(steady),
+                   n_phase={p: sum(r["phase"] == p for r in rows) for p in ("ramp", "steady", "tail")})
+        out["run"]["saturate"] = sat
+        if steady:
+            out["steady"] = run_metrics(steady, win, inflight=inflight)
     if mode in ("oracle", "any"):
         # 路由按标注（any：不看 task），没有识别 —— run_metrics 会拿路由结果当「识别」算出个 100%，去掉免得误读
         out["run"]["accuracy"] = None
@@ -778,6 +1006,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("")
     for ln in continuous_report(out):
         log.info("%s", ln)
+    if sat is not None:
+        log.info("")
+        for ln in saturate_report(out):
+            log.info("%s", ln)
     if failed:
         log.warning("  失败 %d 条，第一条：%s", len(failed), failed[0])
     a.out.parent.mkdir(parents=True, exist_ok=True)
