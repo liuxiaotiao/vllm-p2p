@@ -67,6 +67,11 @@ class Engine:
     task: str | None = None          # 后段服务的 task（绑定时只在同 task 的后段里挑）
     inflight: int = 0
     n_bound: int = 0
+    # 后段的槽位（= 它的 max_num_seqs）：协调器开了 hold 时，在飞到了这个数就不再往它上绑，
+    # 请求停在前段等；None = 不限
+    slots: int | None = None
+    peak: int = 0                    # 同时在飞的最大条数（reset_counters 以来）
+    n_served: int = 0                # 接过的请求数（前段）
     errors: list = field(default_factory=list)
     on_error: Callable[[str], None] | None = None
     # 远端引擎报的每 decode 位置「引擎内毫秒」的滑动平均（选前段时按它算快慢）；0 = 还没数据
@@ -147,7 +152,7 @@ class _Req:
     __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
                  "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
                  "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b", "feat", "body",
-                 "true_task")
+                 "true_task", "t_wait", "identified")
 
     def __init__(self, rid, prompt, max_tokens, task, loop, body=None):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
@@ -162,6 +167,8 @@ class _Req:
         self.lps: list[dict] = []
         self.t_arrive = time.perf_counter()
         self.t_front = self.t_bound = self.t_first = self.t_last = None
+        self.t_wait = None                   # 开始在前段等后段空位的时刻（没等过 = None）
+        self.identified = False
         self.t_tok: list[float] = []         # 第 k 个 token 回到协调器的时刻
         self.t_hid: list[float] = []         # 第 k 个 token 的前段 hidden 回到协调器的时刻
         self.finish = None
@@ -187,6 +194,9 @@ class _Req:
             "finish": self.finish, "ttft_ms": ttft, "tpot_ms": tpot,
             "front_prefill_ms": (self.t_front - self.t_arrive) * 1e3 if self.t_front else None,
             "bind_ms": (self.t_bound - self.t_front) * 1e3 if self.t_bound and self.t_front else None,
+            # 前段 prefill 完、识别完以后，在前段等这个 task 的后段空出槽位的时间（hold；没等 = 0）
+            "wait_back_ms": ((self.t_bound - self.t_wait) * 1e3
+                             if self.t_wait is not None and self.t_bound else 0.0),
             "front_leg_ms": legs_f, "back_leg_ms": legs_b,
             "front_engine_ms": self.eng_f, "back_engine_ms": self.eng_b,
             **({"info": self.info} if self.info else {}),
@@ -204,13 +214,19 @@ class TieredCoordinator:
     识别（`classify(feat: dict, req_info: dict) -> verdict dict`，至少有 "task"）：前段在 prompt
     算完的那一批输出里交出前 L₀ 层的逐层路由统计（`EngineCoreOutput.p2p_feat`），绑定前调它。
     `route="task"`（默认）：只记下结果（shadow，绑定仍按请求自带的 task）；`route="lr"`：按判出的
-    task 绑定。结果放在 `result()["info"]["verdict"]`。"""
+    task 绑定。结果放在 `result()["info"]["verdict"]`。
+
+    `hold=True`：后段有槽位（`Engine.slots`，= 它的 max_num_seqs）。识别完以后，这个 task 的后段
+    都坐满时**不绑**：请求停在前段（前段已经 prefill 完，没有新 token 就不会再算它），进一个先来先到
+    的等待队列；有后段结束一条、空出槽位时再按顺序绑上。等的时间记在 `result()["wait_back_ms"]`。
+    不开时照旧立刻绑定，坐满的后段在自己的 vLLM 队列里排队。"""
 
     def __init__(self, fronts: Engine | Sequence[Engine], backs: Sequence[Engine], *,
                  bind: str | Callable = "least", eos: int | None = None,
                  stop_ids: Sequence[int] = (), ignore_eos: bool = False, logprobs: int = 0,
                  front_pick: str = "speed", direct: bool = False,
-                 classify: Callable[[dict, dict], dict] | None = None, route: str = "task"):
+                 classify: Callable[[dict, dict], dict] | None = None, route: str = "task",
+                 hold: bool = False, front_slots: int | None = None):
         fronts = [fronts] if isinstance(fronts, Engine) else list(fronts)
         if front_pick not in ("speed", "least"):
             raise ValueError(f"front_pick={front_pick!r}；可选 speed / least")
@@ -233,6 +249,13 @@ class TieredCoordinator:
         self.bind, self.eos, self.stop_ids = bind, eos, tuple(stop_ids)
         self.ignore_eos, self.logprobs = ignore_eos, logprobs
         self.reqs: dict[str, _Req] = {}
+        self.hold = bool(hold)
+        # 每个前段同时最多几条（None = 不限）：都满时新请求在网关里等，有前段做完一条再进
+        self.front_slots = int(front_slots) if front_slots else None
+        self._front_free = asyncio.Condition()
+        self.n_front_wait = 0
+        self._waiting: list[_Req] = []      # 在前段等后段空位的请求（先来先到）
+        self.n_held = 0
         self._rr: dict[Any, itertools.count] = defaultdict(itertools.count)
         self._tasks: list[asyncio.Task] = []
         self._ids = itertools.count()
@@ -269,11 +292,18 @@ class TieredCoordinator:
             raise RuntimeError("分段引擎 utility 调用失败：\n  " + "\n  ".join(errs[:5]))
 
     def state(self) -> dict:
-        return {"fronts": [{"name": f.name, "inflight": f.inflight,
-                            "engine_ms_ewma": round(f.ewma_ms, 2)} for f in self.fronts],
+        return {"fronts": [{"name": f.name, "inflight": f.inflight, "peak": f.peak,
+                            "served": f.n_served, "engine_ms_ewma": round(f.ewma_ms, 2)}
+                           for f in self.fronts],
                 "backs": [{"name": b.name, "task": b.task, "inflight": b.inflight,
-                           "bound": b.n_bound, "engine_ms_ewma": round(b.ewma_ms, 2)}
-                          for b in self.backs]}
+                           "bound": b.n_bound, "slots": b.slots, "peak": b.peak,
+                           "engine_ms_ewma": round(b.ewma_ms, 2)}
+                          for b in self.backs],
+                "waiting": [{"rid": r.rid, "task": r.task, "front": r.front.name if r.front else None,
+                             "wait_ms": round((time.perf_counter() - r.t_wait) * 1e3, 1)}
+                            for r in self._waiting],
+                "n_held": self.n_held, "front_slots": self.front_slots,
+                "n_front_wait": self.n_front_wait}
 
     # ---- 请求 ----
     async def submit(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
@@ -285,10 +315,23 @@ class TieredCoordinator:
         if rid in self.reqs:
             raise ValueError(f"请求号 {rid} 正在用")
         body = [(int(a), int(b)) for a, b in body] if body else None
+        t_in = time.perf_counter()
+        if self.front_slots:
+            async with self._front_free:
+                if not self._front_has_room():
+                    self.n_front_wait += 1
+                await self._front_free.wait_for(self._front_has_room)
+                f = self._pick_front()
+                f.inflight += 1
+        else:
+            f = self._pick_front()
+            f.inflight += 1
+        f.peak = max(f.peak, f.inflight)
+        f.n_served += 1
         r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop(),
                                   body=body)
-        f = r.front = self._pick_front()
-        f.inflight += 1
+        r.front = f
+        r.info["wait_front_slot_ms"] = round((time.perf_counter() - t_in) * 1e3, 3)
         xa = {"p2p_id": rid}
         if body:
             xa["p2p_body"] = ",".join(f"{a}:{b}" for a, b in body)
@@ -303,14 +346,18 @@ class TieredCoordinator:
         if r.rid not in self.reqs:
             return
         self.reqs.pop(r.rid, None)
+        if r in self._waiting:
+            self._waiting.remove(r)
         if r.front is not None:
             await r.front.abort([r.rid])
             if r.finish is None:
                 r.front.inflight -= 1
+                await self._front_released()
         if r.back is not None:
             await r.back.abort([r.rid])
             if r.finish is None:
                 r.back.inflight -= 1
+                await self._drain()
 
     async def stream(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
                      rid: str | None = None, timeout: float | None = None, body=None):
@@ -347,34 +394,55 @@ class TieredCoordinator:
         r = self.reqs.get(rid)
         if r is None:
             return "（已结束）"
-        return (f"front={r.front.name if r.front else None} "
+        held = f"（在前段等后段 {(time.perf_counter() - r.t_wait):.0f}s）" if r in self._waiting else ""
+        return (f"front={r.front.name if r.front else None}{held} "
                 f"back={r.back.name if r.back else None} hidden 收到 {r.stream.next} 位"
                 f"（prompt {r.n_prompt}） token {len(r.tokens)} 个 hidden 回 {len(r.t_hid)} 次")
+
+    def reset_counters(self) -> None:
+        """bench 预热完调用：峰值、计数从现在的在飞重新算。"""
+        for e in (*self.fronts, *self.backs):
+            e.peak = e.inflight
+            e.n_served = 0
+        self.n_held = self.n_front_wait = 0
+
+    def _front_has_room(self) -> bool:
+        return any(f.inflight < self.front_slots for f in self.fronts)
+
+    async def _front_released(self) -> None:
+        if self.front_slots:
+            async with self._front_free:
+                self._front_free.notify_all()
 
     def _pick_front(self) -> Engine:
         """`least`：在飞最少。`speed`（默认）：(在飞 + 1) × 该前段每位置的引擎内耗时最小 ——
         前段的卡型不同（A30 vs RTX 6000，B1 实测每位置 6 ms vs 28 ms），只数在飞会把一半
         请求压到慢卡上。还没数据的前段按已知最快的算（先让它接几条、量出来）。"""
         k = next(self._rr["__front__"])
+        fronts = [f for f in self.fronts
+                  if not self.front_slots or f.inflight < self.front_slots] or self.fronts
         if self.front_pick == "least":
-            low = min(f.inflight for f in self.fronts)
-            cands = [f for f in self.fronts if f.inflight == low]
+            low = min(f.inflight for f in fronts)
+            cands = [f for f in fronts if f.inflight == low]
             return cands[k % len(cands)]
         known = [f.ewma_ms for f in self.fronts if f.ewma_ms > 0]
         base = min(known) if known else 1.0
 
         def cost(f):
             return (f.inflight + 1) * (f.ewma_ms if f.ewma_ms > 0 else base)
-        low = min(cost(f) for f in self.fronts)
-        cands = [f for f in self.fronts if cost(f) <= low * (1 + 1e-9)]
+        low = min(cost(f) for f in fronts)
+        cands = [f for f in fronts if cost(f) <= low * (1 + 1e-9)]
         return cands[k % len(cands)]
 
     def _candidates(self, task: str | None) -> list[Engine]:
         same = [b for b in self.backs if task is not None and b.task == task]
         return same or self.backs
 
-    def _pick(self, r: _Req) -> Engine:
-        cands = self._candidates(r.task)
+    def _free(self, cands: Sequence[Engine]) -> list[Engine]:
+        return [b for b in cands if b.slots is None or b.inflight < b.slots]
+
+    def _pick(self, r: _Req, cands: Sequence[Engine] | None = None) -> Engine:
+        cands = list(cands) if cands is not None else self._candidates(r.task)
         if callable(self.bind):
             return self.bind({"rid": r.rid, "task": r.task, "n_prompt": r.n_prompt,
                               "front": r.front.name if r.front else None}, cands)
@@ -403,10 +471,49 @@ class TieredCoordinator:
             r.task = v.get("task")
 
     async def _bind(self, r: _Req) -> None:
+        if r.identified:
+            return                       # 已经识别过（在等后段，或前段抢占重算又送了一遍 prompt）
+        r.identified = True
         if self.classify is not None:
             self._identify(r)
-        b = r.back = self._pick(r)
+        if self.hold:
+            cands = self._candidates(r.task)
+            free = self._free(cands)
+            # 先来先到：同 task（同一组候选）已经有人在等，就排在它后面
+            ahead = any(set(map(id, self._candidates(w.task))) & set(map(id, cands))
+                        for w in self._waiting)
+            if not free or ahead:
+                r.t_wait = time.perf_counter()
+                self._waiting.append(r)
+                self.n_held += 1
+                return
+            await self._attach(r, self._pick(r, free))
+            return
+        await self._attach(r, self._pick(r))
+
+    async def _drain(self) -> None:
+        """有后段空出槽位：等待队列里按先来先到，能绑的都绑上（每条只在自己 task 的后段里挑）。"""
+        if not self._waiting:
+            return
+        blocked: set[int] = set()        # 这一轮已经有人绑不上的候选组：排在它后面的同组不越过它
+        for r in list(self._waiting):
+            if r not in self._waiting:
+                continue
+            cands = self._candidates(r.task)
+            key = set(map(id, cands))
+            if key & blocked:
+                continue
+            free = self._free(cands)
+            if not free:
+                blocked |= key
+                continue
+            self._waiting.remove(r)
+            await self._attach(r, self._pick(r, free))
+
+    async def _attach(self, r: _Req, b: Engine) -> None:
+        r.back = b
         b.inflight += 1
+        b.peak = max(b.peak, b.inflight)
         b.n_bound += 1
         r.t_bound = time.perf_counter()
         if self.direct:
@@ -442,7 +549,7 @@ class TieredCoordinator:
                     start, rows = got
                     if r.back is None:
                         r.stream.keep(rows)
-                        if r.stream.next >= r.n_prompt:
+                        if r.stream.next >= r.n_prompt and not r.identified:
                             r.t_front = now
                             await self._bind(r)
                     elif self.direct:
@@ -477,6 +584,7 @@ class TieredCoordinator:
                 meta = getattr(b.client, "last_meta", None) or {}
                 appends: dict[str, tuple[Engine, list]] = {}
                 aborts: dict[str, tuple[Engine, list]] = {}
+                freed = False
                 now = time.perf_counter()
                 for o in outs.outputs:
                     r = self.reqs.get(o.request_id)
@@ -497,6 +605,7 @@ class TieredCoordinator:
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)
                         b.inflight -= 1
+                        freed = True
                         f.inflight -= 1
                         aborts.setdefault(f.name, (f, []))[1].append(r.rid)
                         res = r.result()
@@ -512,6 +621,9 @@ class TieredCoordinator:
                     await f.fire("p2p_append", items)
                 for f, ids in aborts.values():
                     await f.abort(ids)
+                if freed:
+                    await self._front_released()
+                    await self._drain()
         except asyncio.CancelledError:
             raise
         except BaseException as e:      # noqa: BLE001

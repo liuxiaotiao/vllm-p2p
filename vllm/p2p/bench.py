@@ -394,8 +394,10 @@ def build_row(rec: Rec, *, mode: str, gw: Mapping | None, channels: Mapping[str,
                   (nodes[0] if nodes else "")),
         "back": ("+".join(gw["back_nodes"]) if gw.get("back_nodes") else "+".join(nodes[1:])),
         **({"front_engine": gw["front"]} if gw.get("front") else {}),
-        **({"tiered": {k: gw.get(k) for k in ("front_prefill_ms", "bind_ms")}}
+        **({"tiered": {k: gw.get(k) for k in ("front_prefill_ms", "bind_ms", "wait_back_ms")}}
            if gw.get("front_nodes") else {}),
+        # 分段网关 hold：识别完以后在前段等这个 task 的后段空出槽位的时间（没等 / 没开 = 0）
+        "wait_front_ms": round(float(gw.get("wait_back_ms") or 0.0), 2),
         "channel": chname,
         "n_prompt": n_prompt, "n_generated": n_gen,
         "total_ms": round(total, 2),
@@ -665,16 +667,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="满载连续测试：从每个后段 1 条起，每 --ramp-every 秒每个后段多放 --ramp-step 条，"
                          "加到满载（每个后段 = 它的 max_num_seqs 或 --per-back）后一条完成补一条、"
                          "始终保持满载，直到请求发完；另报满载段（坐满之后提交、发完之前完成）的统计")
-    ap.add_argument("--saturate-by", choices=("auto", "task", "global"), default="auto",
-                    help="满载按 task 分别保持（每个 task 在途 = 它各后段的槽位和，按真实标注放请求，"
-                         "路由照旧由网关定）还是只保持总在途；auto = any 模式 global、其余 task")
+    ap.add_argument("--saturate-by", choices=("global", "task"), default="global",
+                    help="global（默认）：只保持总在途 = 所有后段槽位之和，请求按测试集顺序（三类交错、"
+                         "各类条数相同）放给前段，不看哪类后段闲 —— 某类后段坐满时请求在前段等"
+                         "（分段网关默认 hold）；task：按真实标注给每类单独保持在途 = 它各后段槽位和"
+                         "（放请求时用了后段的空闲信息，只作对照上限）")
     ap.add_argument("--per-back", type=int, default=0,
                     help="满载时每个后段同时几条；0 = 用 stages/channels 里它的 max_num_seqs")
     ap.add_argument("--ramp-step", type=int, default=1, help="加压：每次每个后段多放几条")
     ap.add_argument("--ramp-every", type=float, default=15.0, help="加压：每隔几秒加一次；0 = 直接满载")
-    ap.add_argument("--mix", choices=("capacity", "uniform"), default="capacity",
+    ap.add_argument("--mix", choices=("capacity", "uniform"), default="uniform",
                     help="--saturate-by task 时各 task 的请求数：capacity = 按满载槽位成比例（各 task "
                          "差不多同时发完，满载段最长；样本不够就循环）；uniform = 测试集原样（三类各一份）")
+    ap.add_argument("--per-front", type=int, default=0,
+                    help="闭环：总在途 = 每个前段 N 条 × 前段数，不管请求是哪一类（一条完成补一条）。"
+                         "配合分段网关 --front-slots N，保证每个前段恰好 N 条；比如 1 = 每个前段始终只服务一条")
     ap.add_argument("--inflight", type=int, default=0,
                     help="同时在途条数；默认 = 通道数（与本框架默认 = 后段通道数同口径）")
     ap.add_argument("--requests", type=int, default=0, help="0 = 测试集全部")
@@ -731,12 +738,25 @@ def main(argv: list[str] | None = None) -> int:
     pool = interleave(cases) if a.order == "interleave" else list(cases)
     n = len(pool) if a.requests <= 0 else a.requests
     inflight = n if a.offline else (a.inflight or len(live))
+    if a.per_front:
+        if a.offline or a.saturate or a.inflight:
+            raise SystemExit("--per-front 不能和 --offline / --saturate / --inflight 一起用")
+        nf = len(gw_info.get("fronts") or [])
+        if not nf:
+            raise SystemExit("--per-front 只对分段网关有意义（/p2p/channels 里没有前段）")
+        inflight = a.per_front * nf
+        fs = gw_info.get("front_slots")
+        log.info("[每个前段 %d 条] 前段 %d 个 → 总在途 %d，一条完成补一条，不看请求是哪一类", a.per_front,
+                 nf, inflight)
+        if fs != a.per_front:
+            log.warning("  分段网关的 --front-slots = %s（不是 %d）：总在途对了，但不能保证每个前段恰好 %d 条"
+                        " —— 网关加 --front-slots %d", fs, a.per_front, a.per_front, a.per_front)
     seq = [i % len(pool) for i in range(n)]          # 第 j 条请求用 pool[seq[j]]
     caps = None
     if a.saturate:
         if a.offline:
             raise SystemExit("--saturate 与 --offline 只能二选一")
-        by_task = a.saturate_by == "task" or (a.saturate_by == "auto" and mode != "any")
+        by_task = a.saturate_by == "task" and mode != "any"
         caps = saturation_caps(live, channels, by_task=by_task, per_back=a.per_back)
         if by_task:
             miss = sorted({str(u) for u, _ in pool if u not in caps})
@@ -756,6 +776,14 @@ def main(argv: list[str] | None = None) -> int:
             for i in seq:
                 cnt[pool[i][0]] += 1
             log.info("  请求按满载槽位分给各 task：%s（样本不够的循环用）", dict(sorted(cnt.items())))
+        if not by_task:
+            cnt = defaultdict(int)
+            for i in seq:
+                cnt[pool[i][0]] += 1
+            log.info("  请求按测试集顺序（各类交错）放给前段，不看后段闲不闲：%s", dict(sorted(cnt.items())))
+            if gw_info.get("kind") == "tiered" and not gw_info.get("hold"):
+                log.warning("  分段网关没开 hold（--no-hold）：某类后段坐满时请求会在那个后段的 vLLM 队列里排，"
+                            "而不是在前段等")
         if n < 2 * inflight:
             log.warning("  请求只有 %d 条、满载在途 %d：坐满后很快就发完，满载段会很短 —— "
                         "加 --requests（比如 %d，样本循环用）", n, inflight, 4 * inflight)
@@ -974,6 +1002,16 @@ def main(argv: list[str] | None = None) -> int:
     out["run"]["max_tokens"] = a.max_tokens
     out["run"]["marks"] = list(marks)
     out["run"]["offline"] = bool(a.offline)
+    out["run"]["per_front"] = a.per_front or None
+    if gw_info.get("kind") == "tiered":
+        try:
+            end = http_json(f"{a.gateway}/p2p/channels")
+            out["run"]["front_peaks"] = {f["name"]: {"peak": f.get("peak"), "served": f.get("served")}
+                                         for f in end.get("fronts") or []}
+            out["run"]["gateway_waits"] = {"front_slot": end.get("n_front_wait"),
+                                           "back_hold": end.get("n_held")}
+        except Exception:                                     # noqa: BLE001
+            pass
     if sat is not None:
         ta, tb = sat["t_full_s"], sat["t_end_s"]
         for r in rows:
@@ -1006,6 +1044,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("")
     for ln in continuous_report(out):
         log.info("%s", ln)
+    if out["run"].get("front_peaks"):
+        log.info("各前段：同时在途最大值 / 接过的请求数 —— %s；在网关等前段 %s 条，在前段等后段 %s 条",
+                 ", ".join(f"{k} {v['peak']}/{v['served']}" for k, v in out["run"]["front_peaks"].items()),
+                 out["run"]["gateway_waits"]["front_slot"], out["run"]["gateway_waits"]["back_hold"])
     if sat is not None:
         log.info("")
         for ln in saturate_report(out):

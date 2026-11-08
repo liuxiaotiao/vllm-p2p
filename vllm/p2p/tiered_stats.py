@@ -95,7 +95,8 @@ def full_stats(xs) -> dict:
 
 
 def _queue(r):
-    return float(r.get("queue_ms") or 0.0) + float(r.get("queue_back_ms") or 0.0)
+    return (float(r.get("queue_ms") or 0.0) + float(r.get("queue_back_ms") or 0.0)
+            + float(r.get("wait_front_ms") or 0.0))
 
 
 def _tok_s_service(r):
@@ -250,6 +251,8 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
             or max(float(r.get("total_ms") or 0) for r in rows) / 1e3 or 1.0)
     if run.get("offline") and title == "连续性测试":
         title = "离线满载（全部请求一次提交）"
+    if run.get("per_front") and title == "连续性测试":
+        title = f"连续性测试（每个前段始终 {run['per_front']} 条，不分类型）"
     if run.get("saturate") and title == "连续性测试":
         title = "满载连续测试（逐步加压 → 保持满载 → 发完收尾，全部请求）"
     out = [f"{title}：{len(rows)} 条（超时 {run.get('n_timeout', 0)}），在途 {run.get('inflight', doc.get('concurrency'))}，"
@@ -260,6 +263,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
         ("TTFT(去排队) ms", [r["prefill_ms"] - _queue(r) for r in rows], 0),
         ("TPOT ms/token", [_tpot(r) for r in rows], 1),
         ("后段排队 ms", [r.get("queue_back_ms", 0.0) for r in rows], 0),
+        ("前段等后段 ms", [r.get("wait_front_ms", 0.0) for r in rows], 0),
         ("生成长度 token", [r.get("n_generated") for r in rows], 0),
         ("token/s(含排队)", [_tok_s(r) for r in rows], 2),
         ("token/s(去排队)", [_tok_s_service(r) for r in rows], 2),
@@ -298,7 +302,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
     for r in rows:
         by[r.get("true_task") or "?"].append(r)
     hd = ("条数", "时延均值", "时延p99", "TTFT均值", "TTFT std", "去排队TTFT", "TPOT均值", "TPOT std",
-          "tok/s均值", "tok/s std", "后段排队", "生成均长", "识别", "换绑")
+          "tok/s均值", "tok/s std", "后段排队", "前段等后段", "生成均长", "识别", "换绑")
     out.append("")
     out.append(f"    {'task':<12}" + "".join(f"{h:>10}" for h in hd))
     for u, rs in sorted(by.items()):
@@ -306,16 +310,23 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
         TS = full_stats([r["prefill_ms"] - _queue(r) for r in rs])
         P, K = full_stats([_tpot(r) for r in rs]), full_stats([_tok_s_service(r) for r in rs])
         Q, G = full_stats([r.get("queue_back_ms", 0.0) for r in rs]), full_stats([r.get("n_generated") for r in rs])
+        W = full_stats([r.get("wait_front_ms", 0.0) for r in rs])
         ok = [x for x in (_label_ok(r) for r in rs) if x is not None]
 
         def v(sv, k, d):
             return f"{sv[k]:>10.{d}f}" if sv.get("n") else f"{'—':>10}"
         out.append(f"    {u:<12}{len(rs):>10}" + v(L, "mean", 0) + v(L, "p99", 0) + v(T, "mean", 0)
                    + v(T, "std", 0) + v(TS, "mean", 0) + v(P, "mean", 1) + v(P, "std", 1)
-                   + v(K, "mean", 2) + v(K, "std", 2) + v(Q, "mean", 0) + v(G, "mean", 0)
+                   + v(K, "mean", 2) + v(K, "std", 2) + v(Q, "mean", 0) + v(W, "mean", 0) + v(G, "mean", 0)
                    + (f"{100 * sum(ok) / len(ok):>9.0f}%" if ok else f"{'—':>10}")
                    + f"{sum(int(r.get('rebinds', 0)) for r in rs):>10}")
-    out.append("    （tok/s = 单请求 token/s，去排队口径）")
+    out.append("    （tok/s = 单请求 token/s，去排队口径；前段等后段 = 识别完以后在前段等这类后段空出槽位）")
+    held = [r for r in rows if float(r.get("wait_front_ms") or 0) > 0]
+    if held:
+        hb = defaultdict(int)
+        for r in held:
+            hb[r.get("true_task") or "?"] += 1
+        out.append(f"    在前段等过后段的请求 {len(held)}/{len(rows)} 条：{dict(sorted(hb.items()))}")
     out += format_mark_stats(mark_stats(rows))
     out += format_segment_stats(segment_stats(rows))
     out += format_segment_stats(
@@ -453,6 +464,12 @@ def main(argv=None) -> int:
     db = json.loads(a.b.read_text(encoding="utf-8"))
     for ln in continuous_report(db, title=f"连续性测试（{a.b.name}）"):
         print(ln)
+    fp = (db.get("run") or {}).get("front_peaks")
+    if fp:
+        gw = (db.get("run") or {}).get("gateway_waits") or {}
+        print("各前段 同时在途最大值/接过的请求数：" + ", ".join(
+            f"{k} {v.get('peak')}/{v.get('served')}" for k, v in fp.items())
+              + f"；在网关等前段 {gw.get('front_slot')} 条，在前段等后段 {gw.get('back_hold')} 条")
     if (db.get("run") or {}).get("saturate"):
         print()
         for ln in saturate_report(db):

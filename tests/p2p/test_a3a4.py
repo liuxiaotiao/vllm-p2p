@@ -482,7 +482,8 @@ def test_bench_saturate_ramps_and_reports_steady(world, tmp_path) -> None:
     gw = gateway(world, "oracle")
     rc = B.main(["--gateway", gw, "--channels", str(world["channels"]), "--cases", str(world["cases"]),
                  "--model-dir", str(world["ckpt"]), "--p2p-framework", str(FW), "--max-tokens", "6",
-                 "--warmup", "0", "--saturate", "--per-back", "2", "--ramp-every", "0.05",
+                 "--warmup", "0", "--saturate", "--saturate-by", "task", "--mix", "capacity",
+                 "--per-back", "2", "--ramp-every", "0.05",
                  "--requests", "40", "--out", str(tmp_path / "sat.json")])
     assert rc == 0
     out = json.loads((tmp_path / "sat.json").read_text(encoding="utf-8"))
@@ -499,3 +500,25 @@ def test_bench_saturate_ramps_and_reports_steady(world, tmp_path) -> None:
     assert continuous_report(out)[0].startswith("满载连续测试")
     txt = "\n".join(saturate_report(out))
     assert "满载过程" in txt and "在途曲线" in txt
+
+
+def test_bench_saturate_default_releases_uniformly(world, tmp_path) -> None:
+    """默认（global + uniform）：只保持总在途 = 后段槽位和，三类按测试集顺序交错、条数相同，
+    放请求时不看哪类后段闲。"""
+    gw = gateway(world, "oracle")
+    rc = B.main(["--gateway", gw, "--channels", str(world["channels"]), "--cases", str(world["cases"]),
+                 "--model-dir", str(world["ckpt"]), "--p2p-framework", str(FW), "--max-tokens", "6",
+                 "--warmup", "0", "--saturate", "--per-back", "2", "--ramp-every", "0.05",
+                 "--requests", "36", "--out", str(tmp_path / "satg.json")])
+    assert rc == 0
+    out = json.loads((tmp_path / "satg.json").read_text(encoding="utf-8"))
+    sat = out["run"]["saturate"]
+    assert sat["by"] == "global" and sat["caps"] == {"None": 8} and sat["target"] == 8
+    n = defaultdict(int)
+    for r in out["requests"]:
+        n[r["true_task"]] += 1
+        assert r["wait_front_ms"] == 0.0              # A 的网关没有 hold
+    assert n == {"gsm8k": 12, "mbpp": 12, "no_robots": 12}
+    # 第 j 条就是测试集交错顺序里的第 j 条（不按后段空闲挑类）：每 3 条一轮，三类各一
+    order = [r["true_task"] for r in sorted(out["requests"], key=lambda r: int(r["req"][3:]))]
+    assert all(len(set(order[k:k + 3])) == 3 for k in range(0, 36, 3))

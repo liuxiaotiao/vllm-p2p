@@ -185,6 +185,7 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             return round(xs[len(xs) // 2], 3) if xs else None
         return {"front": res.get("front"), "back": res.get("back"),
                 "front_prefill_ms": res.get("front_prefill_ms"), "bind_ms": res.get("bind_ms"),
+                "wait_back_ms": res.get("wait_back_ms"),
                 "ttft_ms": res.get("ttft_ms"), "tpot_ms": res.get("tpot_ms"),
                 "front_leg_ms_p50": p50(res.get("front_leg_ms") or []),
                 "back_leg_ms_p50": p50(res.get("back_leg_ms") or []),
@@ -251,13 +252,16 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                        back_nodes=list((stages.get(back) or {}).get("nodes", [])))
             hdr.update({"X-P2P-Channel": back or "", "X-P2P-Front": front or "",
                         "X-P2P-Task": req.task or ""})
+            # 前段都满（--front-slots）时在网关里等空闲前段的时间：算进「等空闲前段」（queue_ms）
+            rec["wait_front_slot_ms"] = float(req.info.get("wait_front_slot_ms") or 0.0)
+            rec["route_ms"] = rec["wait_front_slot_ms"]
             v = req.info.get("verdict")
             if v is not None:
                 # bench 的 identify 列按 A4 识别服务的字段名读
                 v = dict(v, compute_ms=v.get("lr_ms"), queue_ms=0.0)
                 if mode == "lr":
                     rec["verdict"] = v
-                    rec["route_ms"] = v.get("lr_ms") or 0.0
+                    rec["route_ms"] = rec["wait_front_slot_ms"] + (v.get("lr_ms") or 0.0)
                     hdr["X-P2P-LR"] = json.dumps({k: v.get(k) for k in
                                                   ("task", "label", "conf", "zone")},
                                                  ensure_ascii=True, separators=(",", ":"))
@@ -296,7 +300,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                          "total_tokens": len(ids) + n_out}
                 met = metrics_of(res)
                 rec.update(status=200, t_done=time.time(), finish=fin,
-                           front_prefill_ms=met["front_prefill_ms"], bind_ms=met["bind_ms"])
+                           front_prefill_ms=met["front_prefill_ms"], bind_ms=met["bind_ms"],
+                           wait_back_ms=met["wait_back_ms"])
                 if not stream:
                     return web.json_response({
                         "id": cid, "object": "text_completion", "created": int(t_recv),
@@ -343,14 +348,17 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             "tasks": sorted({b["task"] for b in st["backs"] if b["task"]}),
             # bench 把这些当「通道」：名字要能在 stages.json 里查到 task / 节点
             "channels": [{"name": b["name"], "task": b["task"], "inflight": b["inflight"],
-                          "served": b["bound"]} for b in st["backs"]],
-            "fronts": st["fronts"]})
+                          "served": b["bound"], "peak": b.get("peak")} for b in st["backs"]],
+            "fronts": st["fronts"], "hold": co.hold, "front_slots": co.front_slots,
+            "n_held": st.get("n_held", 0), "n_front_wait": st.get("n_front_wait", 0),
+            "waiting": len(st.get("waiting") or [])})
 
     async def health(_):
         return web.json_response({"ok": True, "mode": mode, "kind": "tiered"})
 
     async def reset(_):
         records.clear()
+        co.reset_counters()
         return web.json_response({"ok": True})
 
     app = web.Application(client_max_size=64 * 1024 * 1024)
@@ -399,7 +407,11 @@ async def _amain(a) -> int:
         print(f"  {c['name']:<20} {c['role']:<5} task={c.get('task') or '—':<10} "
               f"层 {info.get('layers')}  PP={info.get('pp')}  max_num_seqs {info.get('max_num_seqs')}"
               f"  {c['zmq']}", flush=True)
-        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task")))
+        slots = None
+        if c["role"] == "back" and not a.no_hold:
+            # 槽位 = 后段的 max_num_seqs：清单里写的优先，没写就用代理报的（vLLM 默认 256）
+            slots = int(c.get("max_num_seqs") or info.get("max_num_seqs") or 0) or None
+        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task"), slots=slots))
     fe = [e for e in engines if e.role == "front"]
     be = [e for e in engines if e.role == "back"]
     eos, stop_ids = load_stop_ids(a.model_dir)
@@ -421,7 +433,13 @@ async def _amain(a) -> int:
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
     co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
-                           classify=classify, route="lr" if a.mode == "lr" else "task")
+                           classify=classify, route="lr" if a.mode == "lr" else "task",
+                           hold=not a.no_hold, front_slots=a.front_slots or None)
+    if a.front_slots:
+        print(f"每个前段同时最多 {a.front_slots} 条：都满时新请求在网关里等", flush=True)
+    if not a.no_hold:
+        print("后段坐满时请求停在前段等（hold）：槽位 "
+              + ", ".join(f"{b.name}={b.slots}" for b in be), flush=True)
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
                    max_model_len=a.max_model_len,
@@ -457,6 +475,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stream-timeout", type=float, default=3600.0,
                     help="一条请求两次产出之间最多等多久（秒）。离线满载时请求会在后段引擎里排很久的队，"
                          "首 token 之前可能几分钟没有动静")
+    ap.add_argument("--front-slots", type=int, default=0,
+                    help="每个前段同时最多几条（0 = 不限）。比如 1：每个前段只服务一条请求，不管它是哪一类，"
+                         "都满时新请求在网关里排队，有前段做完一条再进")
+    ap.add_argument("--no-hold", action="store_true",
+                    help="关掉「后段坐满时请求停在前段等」：识别完立刻绑定，坐满的后段在自己的 vLLM 队列里排队"
+                         "（默认开：后段在飞到了 max_num_seqs 就不再往它上绑，请求在前段排先来先到的队）")
     ap.add_argument("--via-coordinator", action="store_true",
                     help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
                          "协调器与引擎不在同一网段时每跳多一个往返）")

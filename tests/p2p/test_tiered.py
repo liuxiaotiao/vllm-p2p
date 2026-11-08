@@ -905,3 +905,146 @@ def test_cumulative_stats_from_first_token() -> None:
     assert cs["all"]["1→2048"]["n"] == 1 and cs["all"]["1→2048"]["mean"] == pytest.approx(1.0)
     txt = "\n".join(T.continuous_report({"requests": rows}))
     assert "累计生成间隔" in txt and "1→2048" in txt and "分段生成间隔" in txt
+
+
+# --------------------------------------------------------------------------- #
+# hold：后段坐满时请求停在前段等，空出槽位按先来先到绑上
+# --------------------------------------------------------------------------- #
+class _RecClient:
+    def __init__(self):
+        self.added: list[str] = []
+        self.aborted: list[str] = []
+
+    async def add_request_async(self, req):
+        self.added.append(req)
+
+    async def abort_requests_async(self, ids):
+        self.aborted += list(ids)
+
+
+def test_hold_at_front_fifo_per_task(monkeypatch) -> None:
+    from vllm.p2p import tiered as T
+
+    monkeypatch.setattr(T, "_core_request", lambda rid, **kw: rid)
+    b0 = T.Engine("b0", "back", _RecClient(), task="t0", slots=1)
+    b1 = T.Engine("b1", "back", _RecClient(), task="t1", slots=1)
+    co = T.TieredCoordinator(T.Engine("f", "front", _RecClient()), [b0, b1], hold=True)
+
+    async def go():
+        loop = asyncio.get_running_loop()
+        rs = {}
+        for rid, u in (("r1", "t0"), ("r2", "t0"), ("r3", "t1"), ("r4", "t0"), ("r5", "t1")):
+            r = rs[rid] = T._Req(rid, [1, 2], 4, u, loop)
+            r.front = co.front
+            co.front.inflight += 1
+            co.reqs[rid] = r
+            r.stream.keep(torch.zeros(2, 4))
+            await co._bind(r)
+        # t0 只有一个槽：r1 绑上，r2、r4 在前段等；t1 不受 t0 排队影响：r3 绑上、r5 等
+        assert b0.client.added == ["r1"] and b1.client.added == ["r3"]
+        assert [r.rid for r in co._waiting] == ["r2", "r4", "r5"]
+        assert co.state()["n_held"] == 3 and b0.inflight == 1 == b1.inflight
+        await co._bind(rs["r2"])                      # 前段重送 prompt：不会重复排队
+        assert [r.rid for r in co._waiting] == ["r2", "r4", "r5"]
+        # b0 做完一条：只放 t0 的队首 r2，r4 继续等；t1 还满着，r5 不动
+        b0.inflight -= 1
+        await co._drain()
+        assert b0.client.added == ["r1", "r2"] and [r.rid for r in co._waiting] == ["r4", "r5"]
+        assert rs["r2"].back is b0 and rs["r2"].t_wait is not None
+        # 等着的请求被取消：从队里拿掉，前段 abort，后段不动
+        await co.cancel(rs["r4"])
+        assert [r.rid for r in co._waiting] == ["r5"] and "r4" in co.front.client.aborted
+        b1.inflight -= 1
+        await co._drain()
+        assert co._waiting == [] and b1.client.added == ["r3", "r5"]
+        res = rs["r5"].result()
+        assert res["wait_back_ms"] >= 0 and rs["r1"].result()["wait_back_ms"] == 0.0
+
+    asyncio.run(go())
+
+
+def test_hold_end_to_end_never_exceeds_slots(configs) -> None:
+    """真调度器：两个后段各 1 个槽、8 条并发 —— 多出来的请求在前段等，结果仍与整模型一致，
+    任何时刻每个后段里最多 1 条。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, closed_loop
+
+    rng = random.Random(1)
+    prompts = [[rng.randrange(3, V) for _ in range(rng.randint(3, 30))] for _ in range(10)]
+    peak = {"back0": 0, "back1": 0}
+
+    async def go():
+        front = FakeCore(make_sched(configs["front"], 64), FrontRunner(), 1)
+        backs = [FakeCore(make_sched(configs["back"], 64), BackRunner(), 2 + i) for i in range(2)]
+        co = TieredCoordinator(Engine("front", "front", front),
+                               [Engine(f"back{i}", "back", b, task="t", slots=1)
+                                for i, b in enumerate(backs)],
+                               eos=None, ignore_eos=True, hold=True)
+        co.start()
+
+        async def watch():
+            while True:
+                for i, b in enumerate(backs):
+                    peak[f"back{i}"] = max(peak[f"back{i}"], len(b.sched.requests))
+                await asyncio.sleep(0.0005)
+
+        w = asyncio.get_running_loop().create_task(watch())
+        try:
+            res, _ = await closed_loop(co.generate, prompts, max_tokens=12, concurrency=8,
+                                       tasks=["t"] * len(prompts), timeout=30)
+            return res, co
+        finally:
+            w.cancel()
+            await co.close()
+            for c in (front, *backs):
+                c.close()
+
+    res, co = asyncio.run(go())
+    for p, r in zip(prompts, res):
+        assert r["tokens"] == mono(p, 12, None), r["rid"]
+    assert max(peak.values()) == 1, peak
+    assert co.n_held > 0 and sum(r["wait_back_ms"] > 0 for r in res) > 0
+    assert sum(b.n_bound for b in co.backs) == len(prompts) and not co._waiting
+
+
+def test_front_slots_one_request_per_front(configs) -> None:
+    """--front-slots 1：两个前段、6 条并发 —— 每个前段任何时刻只有 1 条，其余在网关里等；
+    结果仍与整模型一致。front-pick speed 也不会往忙的快前段上叠。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, closed_loop
+
+    rng = random.Random(2)
+    prompts = [[rng.randrange(3, V) for _ in range(rng.randint(3, 30))] for _ in range(9)]
+    peak = {"front0": 0, "front1": 0}
+
+    async def go():
+        fronts = [FakeCore(make_sched(configs["front"], 64), FrontRunner(), 10 + i) for i in range(2)]
+        back = FakeCore(make_sched(configs["back"], 64), BackRunner(), 2)
+        co = TieredCoordinator([Engine(f"front{i}", "front", f) for i, f in enumerate(fronts)],
+                               [Engine("back0", "back", back, task="t")],
+                               eos=None, ignore_eos=True, front_pick="speed", front_slots=1)
+        co.start()
+
+        async def watch():
+            while True:
+                for i, f in enumerate(co.fronts):
+                    peak[f"front{i}"] = max(peak[f"front{i}"], f.inflight)
+                await asyncio.sleep(0.0005)
+
+        w = asyncio.get_running_loop().create_task(watch())
+        try:
+            res, _ = await closed_loop(co.generate, prompts, max_tokens=10, concurrency=6,
+                                       tasks=["t"] * len(prompts), timeout=30)
+            return res, co
+        finally:
+            w.cancel()
+            await co.close()
+            for c in (*fronts, back):
+                c.close()
+
+    res, co = asyncio.run(go())
+    for p, r in zip(prompts, res):
+        assert r["tokens"] == mono(p, 10, None), r["rid"]
+    assert max(peak.values()) == 1 and all(f.peak == 1 for f in co.fronts), peak
+    assert sum(f.n_served for f in co.fronts) == len(prompts) and co.n_front_wait > 0
+    assert any(r["info"]["wait_front_slot_ms"] > 0 for r in res)
+    co.reset_counters()
+    assert all(f.peak == 0 and f.n_served == 0 for f in co.fronts)
