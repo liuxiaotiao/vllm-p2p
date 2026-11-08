@@ -8,6 +8,10 @@
 #     bash /home/ubuntu/vllm-p2p/p2p_distribute.sh                          # hosts.txt 里除本机外的全部
 #     bash /home/ubuntu/vllm-p2p/p2p_distribute.sh 192.168.1.6 192.168.1.4  # 只处理这几台
 #     REBUILD=1 bash /home/ubuntu/vllm-p2p/p2p_distribute.sh                # 强制重建 wheel 仓库
+#     REBUILD_VENV=1 bash /home/ubuntu/vllm-p2p/p2p_distribute.sh           # 各节点的 venv 删掉从头建
+#
+# 换了 conda / Python（比如 anaconda3 → miniforge3）时：先在本机 `p2p_install.sh --rebuild`，再
+# `REBUILD_VENV=1` 跑本脚本。wheel 仓库记着 Python 版本（python.txt），对不上会自动重建。
 #
 # 各节点最终用的包版本与本机逐个一致（wheel 仓库带 constraints.txt，安装时钉死）。
 #
@@ -15,7 +19,8 @@
 #   SRC        代码目录（修改后的 vLLM）  默认 /home/ubuntu/vllm-p2p
 #   VENV       本机装好的 venv            默认 /home/ubuntu/venvs/vllm-p2p
 #   WHEELHOUSE wheel 仓库（本机与各节点同一路径）默认 /home/ubuntu/vllm-p2p-wheels
-#   MOE_PY     moe 的 python              默认 /home/ubuntu/anaconda3/envs/moe/bin/python
+#   MOE_PY     moe 的 python              默认 /home/ubuntu/miniforge3/envs/moe/bin/python
+#              （各节点同一路径）
 #   HOSTS      节点表                     默认 /home/ubuntu/p2p-framework/task/hosts.txt
 #   SSH_USER                              默认 ubuntu
 #   JOBS       同时处理几台               默认 4（推 wheel 仓库时本机网卡是瓶颈）
@@ -24,11 +29,12 @@ set -euo pipefail
 SRC=${SRC:-/home/ubuntu/vllm-p2p}
 VENV=${VENV:-/home/ubuntu/venvs/vllm-p2p}
 WHEELHOUSE=${WHEELHOUSE:-/home/ubuntu/vllm-p2p-wheels}
-MOE_PY=${MOE_PY:-/home/ubuntu/anaconda3/envs/moe/bin/python}
+MOE_PY=${MOE_PY:-/home/ubuntu/miniforge3/envs/moe/bin/python}
 HOSTS=${HOSTS:-/home/ubuntu/p2p-framework/task/hosts.txt}
 SSH_USER=${SSH_USER:-ubuntu}
 JOBS=${JOBS:-4}
 REBUILD=${REBUILD:-0}
+REBUILD_VENV=${REBUILD_VENV:-0}
 LOGDIR=${LOGDIR:-$HOME/p2p_distribute_logs}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 
@@ -36,9 +42,10 @@ die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 
 # ---- 0. 本机必须是装好的 -------------------------------------------------- #
 echo "== 0. 本机自检（$(hostname)）"
-bash "$SRC/p2p_install.sh" --verify >/dev/null 2>&1 \
+MOE_PY="$MOE_PY" VENV="$VENV" SRC="$SRC" bash "$SRC/p2p_install.sh" --verify >/dev/null 2>&1 \
   || die "本机的安装没通过自检 —— 先在本机跑 bash $SRC/p2p_install.sh 装好"
 PYV=$("$MOE_PY" -c 'import sys; print(sys.version.split()[0])')
+PYMM=$("$MOE_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 echo "  ✓ 本机已装好（moe Python $PYV）"
 
 # ---- 1. wheel 仓库 --------------------------------------------------------- #
@@ -53,14 +60,21 @@ skipped=$("$VENV/bin/pip" freeze --all --exclude-editable 2>/dev/null | grep -c 
 [ "$skipped" = 0 ] || echo "  ⚠ 有 $skipped 个包是从本地路径/URL 装的，不进 wheel 仓库（节点上会缺）"
 if [ "$REBUILD" = 0 ] && [ -f "$WHEELHOUSE/constraints.txt" ] \
    && cmp -s "$TMPC" "$WHEELHOUSE/constraints.txt" \
+   && [ "$(cat "$WHEELHOUSE/python.txt" 2>/dev/null)" = "$PYMM" ] \
    && ls "$WHEELHOUSE"/vllm-0.14.0-*x86_64.whl >/dev/null 2>&1; then
   echo "  ✓ 已是最新（$n_pkg 个包，$(du -sh "$WHEELHOUSE" | cut -f1)），跳过下载"
 else
   echo "  → 按本机版本下载 $n_pkg 个包（第一次约 5GB，之后版本不变就不再下载）"
+  # Python 换了版本时旧 wheel（cp311 之类）全没用：清空重下
+  if [ -d "$WHEELHOUSE" ] && [ "$(cat "$WHEELHOUSE/python.txt" 2>/dev/null)" != "$PYMM" ]; then
+    echo "  → 旧仓库是 Python $(cat "$WHEELHOUSE/python.txt" 2>/dev/null || echo 未知) 的，清空"
+    rm -rf "$WHEELHOUSE"
+  fi
   mkdir -p "$WHEELHOUSE"
   "$VENV/bin/pip" download --no-deps -d "$WHEELHOUSE" -r "$TMPC"
   "$VENV/bin/pip" download --no-deps -d "$WHEELHOUSE" vllm==0.14.0   # 只取里面编译好的 .so
   cp "$TMPC" "$WHEELHOUSE/constraints.txt"
+  echo "$PYMM" > "$WHEELHOUSE/python.txt"
   n_sdist=$(ls "$WHEELHOUSE"/*.tar.gz "$WHEELHOUSE"/*.zip 2>/dev/null | wc -l || true)
   [ "$n_sdist" = 0 ] || echo "  ⚠ 有 $n_sdist 个包只有源码包（.tar.gz），节点上离线装时要现场编译"
   echo "  ✓ 建好（$(du -sh "$WHEELHOUSE" | cut -f1)）"
@@ -95,13 +109,13 @@ one() {   # 单台：预检 → 推代码 → 推 wheel 仓库 → 远端检查 
     # wheel 仓库是我们自己的，镜像过去（--delete 清掉旧版本的 wheel）
     rsync -a --delete -e "$SSH" "$WHEELHOUSE/" "$t:$WHEELHOUSE/" || { echo "✗ 推 wheel 仓库失败"; return 1; }
     # 远端：逐步检查，缺哪步补哪步（离线，因为 wheel 仓库在默认路径）
-    $SSH "$t" "SRC=$SRC VENV=$VENV MOE_PY=$MOE_PY WHEELHOUSE=$WHEELHOUSE bash $SRC/p2p_install.sh" \
+    $SSH "$t" "SRC=$SRC VENV=$VENV MOE_PY=$MOE_PY WHEELHOUSE=$WHEELHOUSE REBUILD_VENV=$REBUILD_VENV bash $SRC/p2p_install.sh" \
       || { echo "✗ 远端安装 / 检查没通过"; return 1; }
     echo "✓ 完成"
   } > "$LOGDIR/$ip.log" 2>&1
 }
 export -f one
-export SSH SSH_USER MOE_PY VENV SRC WHEELHOUSE PYV LOGDIR
+export SSH SSH_USER MOE_PY VENV SRC WHEELHOUSE PYV LOGDIR REBUILD_VENV
 
 echo "== 3. 推送 + 各节点检查/补装（同时 $JOBS 台，日志在 $LOGDIR/）"
 for ip in $TARGETS; do echo "$ip"; done \

@@ -4,6 +4,10 @@
 #
 #     bash /home/ubuntu/vllm-p2p/p2p_install.sh            # 检查 + 补装
 #     bash /home/ubuntu/vllm-p2p/p2p_install.sh --verify   # 只检查，不装（不就绪则退出码 1）
+#     bash /home/ubuntu/vllm-p2p/p2p_install.sh --rebuild  # 删掉 venv 从头建（换了 conda / Python 时用）
+#
+# venv 建在哪个 Python 上会被检查：pyvenv.cfg 的 home 不是 MOE_PY 所在目录（比如 conda 从 anaconda3
+# 换到了 miniforge3）、或 Python 版本不一致，都会自动删掉重建。
 #
 # 步骤（每步先检查，就绪就跳过）：
 #   1 venv        用 moe 的 Python 解释器建一个独立 venv（不复用 moe 的任何包，moe 本身不改）
@@ -21,19 +25,26 @@
 #
 # 可覆盖的变量（一般不用改）：
 #   SRC        本目录（修改后的 vLLM）    默认 /home/ubuntu/vllm-p2p
-#   MOE_PY     moe 环境的 python          默认 /home/ubuntu/anaconda3/envs/moe/bin/python
+#   MOE_PY     moe 环境的 python          默认 /home/ubuntu/miniforge3/envs/moe/bin/python
+#   REBUILD_VENV=1                        同 --rebuild
 #   VENV       venv                       默认 /home/ubuntu/venvs/vllm-p2p
 #   WHEELHOUSE 本地 wheel 仓库            默认 /home/ubuntu/vllm-p2p-wheels（不存在就联网）
 #   WHEEL      官方 vllm-0.14.0 wheel     默认在 WHEELHOUSE 里找，找不到就下载
 set -euo pipefail
 
 SRC=${SRC:-/home/ubuntu/vllm-p2p}
-MOE_PY=${MOE_PY:-/home/ubuntu/anaconda3/envs/moe/bin/python}
+MOE_PY=${MOE_PY:-/home/ubuntu/miniforge3/envs/moe/bin/python}
 VENV=${VENV:-/home/ubuntu/venvs/vllm-p2p}
 WHEELHOUSE=${WHEELHOUSE:-/home/ubuntu/vllm-p2p-wheels}
 WHEEL=${WHEEL:-}
+REBUILD_VENV=${REBUILD_VENV:-0}
 VERIFY_ONLY=0
-[ "${1:-}" = "--verify" ] && VERIFY_ONLY=1
+case "${1:-}" in
+  --verify) VERIFY_ONLY=1 ;;
+  --rebuild) REBUILD_VENV=1 ;;
+  "") ;;
+  *) echo "用法：$0 [--verify | --rebuild]" >&2; exit 2 ;;
+esac
 TMPW=$(mktemp -d /tmp/vllm-wheel.XXXXXX)
 trap 'rm -rf "$TMPW"' EXIT
 
@@ -45,7 +56,14 @@ check() { python -I "$SRC/vllm/p2p/envcheck.py" "$@"; }   # 0 = 就绪
 
 # ---- pip 的来源：本地 wheel 仓库（离线、版本钉死）或 PyPI ------------------ #
 PIP_SRC=()
-if [ -f "$WHEELHOUSE/constraints.txt" ]; then
+[ -x "$MOE_PY" ] || { echo "✗ 找不到 moe 的 python：$MOE_PY（用 MOE_PY=… 指定）" >&2; exit 1; }
+MOE_PYV=$("$MOE_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+WH_PYV=$(cat "$WHEELHOUSE/python.txt" 2>/dev/null || true)
+if [ -f "$WHEELHOUSE/constraints.txt" ] && [ "$WH_PYV" != "$MOE_PYV" ]; then
+  # wheel 是按 Python 版本编的（cp311 / cp312 …）：版本对不上的仓库不能用
+  echo "  ⚠ 本地 wheel 仓库是 Python ${WH_PYV:-未知} 的，moe 现在是 $MOE_PYV —— 不用它，改联网装" >&2
+  SRC_DESC="PyPI（联网；本地 wheel 仓库的 Python 版本不对）"
+elif [ -f "$WHEELHOUSE/constraints.txt" ]; then
   PIP_SRC=(--no-index --find-links "$WHEELHOUSE" -c "$WHEELHOUSE/constraints.txt")
   SRC_DESC="本地 wheel 仓库 $WHEELHOUSE（离线，版本与控制节点一致）"
 else
@@ -79,8 +97,7 @@ say "0/5 预检（$(hostname)）  包来源：$SRC_DESC"
 [ -f "$SRC/vllm/model_executor/models/qwen3_moe_partial.py" ] \
   || die "$SRC 里没有 qwen3_moe_partial.py —— 不是修改后的 vLLM，或者还没同步过来"
 [ -f "$SRC/vllm/p2p/envcheck.py" ] || die "$SRC 里没有 vllm/p2p/envcheck.py —— 代码目录不是最新的"
-[ -x "$MOE_PY" ] || die "找不到 moe 的 python：$MOE_PY（用 MOE_PY=… 指定）"
-pyv=$("$MOE_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+pyv=$MOE_PYV
 case "$pyv" in 3.10|3.11|3.12|3.13) ok "moe Python $pyv" ;;
   *) die "moe 是 Python $pyv，vLLM 0.14 要 3.10–3.13" ;; esac
 glibc=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo 0)
@@ -99,6 +116,17 @@ if [ "$venv_ok" = 1 ] && grep -qiE '^include-system-site-packages *= *true' "$VE
 fi
 if [ "$venv_ok" = 1 ] && [ "$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')" != "$pyv" ]; then
   todo "venv 的 Python 版本与 moe 不一致"; venv_ok=0
+fi
+if [ "$venv_ok" = 1 ]; then
+  # venv 记着它建在哪个解释器上（pyvenv.cfg 的 home）：换了 conda（anaconda3 → miniforge3）要重建
+  vhome=$(awk -F' *= *' '$1=="home"{print $2}' "$VENV/pyvenv.cfg" 2>/dev/null || true)
+  mhome=$("$MOE_PY" -c 'import os, sys; print(os.path.dirname(getattr(sys, "_base_executable", sys.executable)))')
+  if [ -z "$vhome" ] || [ "$(readlink -f "$vhome")" != "$(readlink -f "$mhome")" ]; then
+    todo "venv 建在 ${vhome:-?} 上，不是现在的 moe（$mhome）"; venv_ok=0
+  fi
+fi
+if [ "$REBUILD_VENV" = 1 ] && [ "$VERIFY_ONLY" = 0 ]; then
+  todo "--rebuild：删掉重建"; venv_ok=0
 fi
 if [ "$venv_ok" = 1 ]; then
   ok "已就绪"
