@@ -187,3 +187,31 @@ def test_steptrace_records_and_summarises(tmp_path) -> None:
         from vllm.p2p import launch
         assert launch.venv_of(b["commands"][0]["cmd"]) == "/venv"
     assert T.StepTrace.from_env() is None or True
+
+
+def test_full_pipeline_channels_any_mode(world) -> None:
+    """layout.py 的 channels.json（整条流水线 A）：网关 any 挑在途最少的通道；decode 在引擎里连着算，
+    每 token 间隔 = 这条流水线一步的用时（单条请求时可以手算）。"""
+    cj = json.loads((world["tmp"] / "vc" / "channels.json").read_text())
+    names = [c["name"] for c in cj["channels"]]
+    real = {"requests": [{"req": f"req{i}", "true_task": "gsm8k", "channel": names[i % len(names)],
+                          "n_prompt": 80, "n_generated": 20} for i in range(10)]}
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    net = S.Net(ip=ip, hop_ms=2.0, lat_same=0.1, lat_cross=3.0, lat_gw=0.1)
+    doc = S.run_sim(cj, S.replay_requests(real, cj), perf=perf, net=net, node_gpu=gpu,
+                    params=S.Params(back_fixed_ms=1.0), real=real)
+    rows = doc["requests"]
+    assert doc["concurrency"] == len(names) and doc["mode"] == "static"
+    assert {r["channel"] for r in rows} == set(names)          # any：5 条在途 → 每条通道各一条
+    assert all(r["front_engine"] is None and r["wait_front_ms"] == 0 for r in rows)
+    one = S.run_sim(cj, S.replay_requests({"requests": real["requests"][:1]}, cj), perf=perf, net=net,
+                    node_gpu=gpu, params=S.Params(back_fixed_ms=1.0), inflight=1)["requests"][0]
+    ch = next(c for c in cj["channels"] if c["name"] == one["channel"])
+    e = S.resident_experts(ch) or 128
+    step = 1.0 + sum(nl * perf[gpu[v]].decode_ms(e, 81, 1) for v, nl in zip(ch["nodes"], ch["partition"]))
+    step += sum(net.pp(a, b, 2048 * 2) for a, b in zip(ch["nodes"], ch["nodes"][1:]))
+    assert one["token_ms"][0] == pytest.approx(step, rel=0.02)
+    with pytest.raises(SystemExit, match="没有前段"):
+        S.run_sim(cj, S.replay_requests(real, cj), perf=perf, net=net, node_gpu=gpu, params=S.Params(),
+                  per_front=1)

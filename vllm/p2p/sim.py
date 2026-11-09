@@ -33,6 +33,11 @@ decode[专家数][上下文 C][批 B]（B 向上补到量过的档位 —— CUD
 **网络**：每条消息 = 单向时延 + 字节 / 带宽 + 每跳软件开销（`--hop-ms`）。单向时延与带宽取
 `--topo` 的 edges；没有拓扑就按 IP 同不同 /24 网段取 `--lat-same` / `--lat-cross`。
 
+**整条流水线（A）**：给的是 layout.py 的 channels.json（不是 stages.json）时，每条通道是一个从第 0 层
+到最后一层的 vLLM 引擎（PP 多机），网关按 gateway.py 的 Router 挑通道（`--a-mode any` = 全部通道里
+在途最少的，`oracle` = 按标注的类）；decode 循环全在引擎里，不经过网关。挑通道用的也是真网关的
+`gateway.Router`。这种部署的每步固定开销用 `--back-fixed-ms`（含 embedding、lm_head、采样）。
+
 v1 的简化（与真机比对时心里要有数）：后段多机 PP 按各段**串行**算（不模拟 vLLM 的 batch queue
 重叠）；不模拟 KV 容量与抢占（槽位小时不会发生）；识别结果、生成长度回放真机。
 """
@@ -280,6 +285,7 @@ class SimEngine:
         self.ready: dict[str, tuple] = {}        # rid → ("pf", n) | ("dec", ctx)
         self.admitted: set[str] = set()
         self.busy = False
+        self._in_done = False
         self.t_ready: dict[str, float] = {}
         # 统计
         self.n_steps = 0
@@ -297,7 +303,7 @@ class SimEngine:
         v = p.front_fixed_ms if self.role == "front" else p.back_fixed_ms
         if v is not None:
             return float(v)
-        g = self.gpus[-1] if self.role == "back" else self.gpus[0]
+        g = self.gpus[0] if self.role == "front" else self.gpus[-1]
         oh = g.overhead_ms(self.experts, ctx, batch)
         return oh * (0.5 if self.role == "front" else 1.0)
 
@@ -322,7 +328,8 @@ class SimEngine:
     def put(self, rid: str, item: tuple, now: float) -> None:
         self.ready[rid] = item
         self.t_ready.setdefault(rid, now)
-        self.kick(now)
+        if not self._in_done:            # 一步结束时逐条放回的，等全放完再开下一步
+            self.kick(now)
 
     def kick(self, now: float) -> None:
         if self.busy or not self.ready:
@@ -358,17 +365,19 @@ class SimEngine:
             self.sim.reqs[rid].queue_engine_ms[self.role] = now - self.t_ready.pop(rid, now)
         for rid, _ in dec:
             self.t_ready.pop(rid, None)
-        if self.role == "front":
-            fe = self.sim.co_eng[self.name]
-            if dec:
-                fe.observe(ms)
+        if self.role == "front" and dec:
+            self.sim.co_eng[self.name].observe(ms)
         self.sim.at(now + ms, self._done, dec, pf, ms)
 
     def _done(self, now: float, dec, pf, ms) -> None:
         self.busy = False
         self.t_last_end = now
-        for rid, it in pf + dec:
-            self.sim.on_step_out(self, rid, it, now)
+        self._in_done = True
+        try:
+            for rid, it in pf + dec:
+                self.sim.on_step_out(self, rid, it, now)
+        finally:
+            self._in_done = False
         self.kick(now)
 
     def release(self, rid: str) -> None:
@@ -408,9 +417,7 @@ class Sim:
     def __init__(self, stages: Mapping, *, perf: Mapping[str, GpuPerf], net: Net, node_gpu: Mapping,
                  params: Params, front_slots: int | None, hold: bool, front_pick: str = "least",
                  bind: str = "least", steps: Mapping[str, Mapping] | None = None,
-                 n_experts: int | None = None):
-        from vllm.p2p.tiered import Engine, TieredCoordinator
-
+                 n_experts: int | None = None, a_mode: str = "any"):
         self.params, self.net = params, net
         self.now = 0.0
         self._q: list = []
@@ -420,6 +427,23 @@ class Sim:
         ne = int(n_experts or stages.get("n_experts") or 128)
         steps = steps or {}
         self.engines: dict[str, SimEngine] = {}
+        self.gw_queue: list[SimReq] = []
+        self.on_finish: Callable[[SimReq, float], None] = lambda r, t: None
+        self.full = stages.get("kind") != "tiered"
+        if self.full:
+            # 整条流水线（A）：每条通道一个引擎；挑通道用 gateway.Router（与真网关同一份）
+            from vllm.p2p.gateway import ChannelInfo, Router
+            for c in stages["channels"]:
+                cc = dict(c, role="full", partition=c.get("partition") or [])
+                self.engines[c["name"]] = SimEngine(cc, perf, node_gpu, resident_experts(c) or ne, self,
+                                                    steps.get(c["name"]))
+            self.router = Router([ChannelInfo(name=c["name"], task=c.get("task") or "", api="sim",
+                                              nodes=list(c["nodes"])) for c in stages["channels"]])
+            self.a_mode = a_mode
+            self.co = None
+            return
+        from vllm.p2p.tiered import Engine, TieredCoordinator
+
         for name in [*stages["fronts"], *stages["backs"]]:
             c = chans[name]
             e = ne if c["role"] == "front" else (resident_experts(c) or ne)
@@ -432,8 +456,6 @@ class Sim:
                                     [self.co_eng[n] for n in stages["backs"]], bind=bind,
                                     front_pick=front_pick, hold=hold, front_slots=front_slots)
         self.co.clock = lambda: self.now
-        self.gw_queue: list[SimReq] = []
-        self.on_finish: Callable[[SimReq, float], None] = lambda r, t: None
 
     # ---- 事件 ----
     def at(self, t: float, fn: Callable, *args) -> None:
@@ -451,6 +473,14 @@ class Sim:
     def submit(self, r: SimReq, t: float) -> None:
         self.reqs[r.rid] = r
         r.t_submit = t
+        if self.full:
+            ch = self.router.pick_any() if self.a_mode == "any" else self.router.pick(r.task)
+            ch.inflight += 1
+            ch.served += 1
+            r.back = ch
+            e = self.engines[ch.name]
+            self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4), self._arrive, e, r.rid, ("pf", r.n_prompt))
+            return
         if self.co.front_slots and not self.co._front_has_room():
             self.co.n_front_wait += 1
             self.gw_queue.append(r)
@@ -481,6 +511,11 @@ class Sim:
 
     def _finish(self, t: float, r: SimReq) -> None:
         r.t_done = t
+        if self.full:
+            r.back.inflight -= 1
+            self.engines[r.back.name].release(r.rid)
+            self.on_finish(r, t)
+            return
         r.back.inflight -= 1
         r.front.inflight -= 1
         self.engines[r.front.name].release(r.rid)
@@ -504,7 +539,7 @@ class Sim:
                 be = self.engines[r.back.name]
                 self.at(t + self.net.msg(e.node0, be.node0, H), self._arrive, be, rid, ("dec", item[1]))
             return
-        # 后段：出一个 token
+        # 后段 / 整条流水线：出一个 token
         r.n_out += 1
         t_cli = t + self.net.msg(e.node0, None, 8)
         r.toks.append(t_cli)
@@ -513,13 +548,24 @@ class Sim:
         if r.n_out >= r.n_gen:
             self.at(t_cli, lambda tt, rr=r: self._finish(tt, rr))
             return
+        if self.full:                     # decode 循环在引擎里：下一步就能算
+            e.put(rid, ("dec", r.n_prompt + r.n_out - 1), t)
+            return
         fe = self.engines[r.front.name]
         ctx = r.n_prompt + r.n_out - 1
         self.at(t + self.net.msg(e.node0, fe.node0, 8), self._arrive, fe, rid, ("dec", ctx))
 
 
 def resident_experts(ch: Mapping) -> int | None:
-    """后段命令里的 p2p_layer_experts → 每层驻留专家数的均值。"""
+    """后段命令里（或 A 通道的 overrides 文件里）的 p2p_layer_experts → 每层驻留专家数的均值。"""
+    if ch.get("overrides") and Path(ch["overrides"]).is_file():
+        try:
+            le = json.loads(Path(ch["overrides"]).read_text(encoding="utf-8")).get("p2p_layer_experts") or {}
+            sizes = [len(v) for v in le.values() if v]
+            if sizes:
+                return round(sum(sizes) / len(sizes))
+        except ValueError:
+            pass
     for c in ch.get("commands") or []:
         if " --hf-overrides " not in c["cmd"]:
             continue
@@ -563,13 +609,15 @@ def _req_index(rid: Any) -> int:
 def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu, params: Params,
             per_front: int = 0, inflight: int = 0, front_slots: int = 0, hold: bool = True,
             front_pick: str = "least", steps=None, marks: Sequence[int] = DEFAULT_MARKS,
-            real: Mapping | None = None, label: str = "") -> dict:
-    nf = len(stages["fronts"])
+            real: Mapping | None = None, label: str = "", a_mode: str = "any") -> dict:
+    full = stages.get("kind") != "tiered"
     if per_front:
-        inflight, front_slots = per_front * nf, per_front
-    inflight = inflight or len(stages["backs"])
+        if full:
+            raise SystemExit("整条流水线（A）没有前段：用 --inflight（比如 = 通道数，每条流水线一条）")
+        inflight, front_slots = per_front * len(stages["fronts"]), per_front
+    inflight = inflight or len(stages["channels"] if full else stages["backs"])
     sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params,
-              front_slots=front_slots or None, hold=hold, front_pick=front_pick, steps=steps)
+              front_slots=front_slots or None, hold=hold, front_pick=front_pick, steps=steps, a_mode=a_mode)
     queue = list(reqs)
     nxt = iter(range(len(queue)))
 
@@ -592,7 +640,7 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
 def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[dict]:
     rows = []
     for r in reqs:
-        fe, be = sim.engines[r.front.name], sim.engines[r.back.name]
+        fe, be = (sim.engines[r.front.name] if r.front is not None else None), sim.engines[r.back.name]
         total = r.t_done - r.t_submit
         ttft = r.t_first - r.t_submit
         gaps = [b - a for a, b in zip(r.toks, r.toks[1:])]
@@ -611,9 +659,10 @@ def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[d
             "true_task": r.true_task, "task": r.task,
             "correct": (None if r.true_task is None else bool(r.task == r.true_task)),
             "confidence": 0.0, "zone": "", "rebinds": 0, "alarms": 0,
-            "front": "+".join(fe.nodes), "back": "+".join(be.nodes), "front_engine": fe.name,
-            "tiered": {"front_prefill_ms": round((r.t_front_done or 0) - r.t_submit, 2),
-                       "bind_ms": None, "wait_back_ms": round(wait_back, 2)},
+            "front": "+".join(fe.nodes) if fe else None, "back": "+".join(be.nodes),
+            "front_engine": fe.name if fe else None,
+            **({"tiered": {"front_prefill_ms": round((r.t_front_done or 0) - r.t_submit, 2),
+                           "bind_ms": None, "wait_back_ms": round(wait_back, 2)}} if fe else {}),
             "wait_front_ms": round(wait_back, 2),
             "channel": be.name, "n_prompt": r.n_prompt, "n_generated": r.n_out,
             "total_ms": round(total, 2), "queue_ms": round(r.t_gw_wait, 2),
@@ -674,17 +723,19 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
     wall = (t1 - t0) / 1e3
     out = {
         "model": f"sim · {Path(str(stages.get('plan') or '')).name}",
-        "backend": "sim", "mode": "dynamic", "gateway_mode": "lr" if real else "oracle",
+        "backend": "sim", "mode": "static" if sim.full else "dynamic",
+        "gateway_mode": sim.a_mode if sim.full else ("lr" if real else "oracle"),
         "label": label or "sim", "tokens": max(r.n_gen for r in reqs), "concurrency": inflight,
         "channels": {n: {"nodes": e.nodes, "partition": e.layers} for n, e in sim.engines.items()
-                     if e.role == "back"},
+                     if e.role != "front"},
         "requests": rows, "failed": [],
     }
     run = run_metrics(rows, wall, inflight)
     run.update(order="replay", max_tokens=out["tokens"], marks=list(marks), offline=False,
                per_front=per_front or None)
-    run["front_peaks"] = {f.name: {"peak": f.peak, "served": f.n_served} for f in sim.co.fronts}
-    run["gateway_waits"] = {"front_slot": sim.co.n_front_wait, "back_hold": sim.co.n_held}
+    if sim.co is not None:
+        run["front_peaks"] = {f.name: {"peak": f.peak, "served": f.n_served} for f in sim.co.fronts}
+        run["gateway_waits"] = {"front_slot": sim.co.n_front_wait, "back_hold": sim.co.n_held}
     run["per_request"] = ts.request_stats(rows)
     run["marks_stats"] = ts.mark_stats(rows)
     run["segment_stats"] = ts.segment_stats(rows)
@@ -801,8 +852,8 @@ def fit(make: Callable[[Params, float], dict], real: Mapping, params: Params, ho
 # --------------------------------------------------------------------------- #
 def _setup(a) -> tuple:
     stages = json.loads(Path(a.stages).read_text(encoding="utf-8"))
-    if stages.get("kind") != "tiered":
-        raise SystemExit(f"{a.stages} 不是分段部署的 stages.json")
+    if stages.get("kind") != "tiered" and not all("partition" in c for c in stages.get("channels") or [{}]):
+        raise SystemExit(f"{a.stages} 既不是分段部署的 stages.json，也不是 layout.py 的 channels.json")
     ip, gpu_h = load_hosts(a.hosts)
     for c in stages["channels"]:
         for x in c.get("commands") or []:
@@ -833,7 +884,10 @@ def _setup(a) -> tuple:
 
 
 def _common(ap) -> None:
-    ap.add_argument("--stages", required=True, help="分段部署的 stages.json")
+    ap.add_argument("--stages", required=True,
+                    help="分段部署的 stages.json；或整条流水线（A）的 channels.json（layout.py 生成）")
+    ap.add_argument("--a-mode", choices=("any", "oracle"), default="any",
+                    help="整条流水线（A）时网关怎么挑通道（同 gateway.py --mode）")
     ap.add_argument("--replay", required=True,
                     help="一次真机结果（bench 的 --out）：请求顺序、prompt / 生成长度、绑到哪类都照它")
     ap.add_argument("--layer-bench", nargs="+", required=True,
@@ -894,12 +948,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
                        hold=not a.no_hold, front_pick=a.front_pick, steps=steps, real=real,
-                       label=a.label or f"sim {a.cmd}")
+                       label=a.label or f"sim {a.cmd}", a_mode=a.a_mode)
 
     if a.cmd == "fit":
         print("标定（坐标下降）：")
-        p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds,
-                                 fixed=[x.strip() for x in a.fix.split(",") if x.strip()])
+        fixed = [x.strip() for x in a.fix.split(",") if x.strip()]
+        if stages.get("kind") != "tiered":
+            fixed.append("front_fixed_ms")            # 整条流水线没有前段
+        p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds, fixed=fixed)
         print(f"结果：--front-fixed-ms {p.front_fixed_ms:g} --back-fixed-ms {p.back_fixed_ms:g} "
               f"--hop-ms {hop:g}（误差分 {score:.4f}）")
     else:
