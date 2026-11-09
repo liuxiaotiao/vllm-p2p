@@ -55,6 +55,20 @@ def world(tmp_path):
     return {"stages": st, "stages_path": sp, "lb": lb, "tmp": tmp_path}
 
 
+def pp_timeline(net, nodes, comp, tok_bytes):
+    """多机 PP 一步（手算版）：调度结果同时发给各台；第 i 段等调度结果与上一段的 hidden 都到；
+    最后采样结果回 node_rank 0。"""
+    end = comp[0]
+    for i in range(1, len(nodes)):
+        start = max(net.one_way(nodes[0], nodes[i]) + net.pp_hop_ms,
+                    end + net.one_way(nodes[i - 1], nodes[i]) + net.xfer(nodes[i - 1], nodes[i], tok_bytes)
+                    + net.pp_hop_ms)
+        end = start + comp[i]
+    if len(nodes) > 1:
+        end += net.one_way(nodes[-1], nodes[0]) + net.xfer(nodes[-1], nodes[0], 8) + net.pp_hop_ms
+    return end
+
+
 def fake_real(st, n=12, gen=(40, 70, 25)) -> dict:
     """一份「真机」结果的骨架：只用到回放要的字段。"""
     tasks = ["gsm8k", "mbpp", "no_robots"]
@@ -113,8 +127,8 @@ def test_single_request_timeline_by_hand(world) -> None:
     gf = perf[gpu[fch["nodes"][0]]]
     e_b = S.resident_experts(bch)
     f_step = 0.5 + 8 * gf.decode_ms(128, 130, 1)               # 上下文 ≈ 128 + 已生成
-    b_step = 1.0 + sum(nl * perf[gpu[v]].decode_ms(e_b, 130, 1) for v, nl in zip(bch["nodes"], bch["partition"]))
-    b_step += sum(net.pp(a, b, 2048 * 2) for a, b in zip(bch["nodes"], bch["nodes"][1:]))
+    b_step = 1.0 + pp_timeline(net, bch["nodes"], [nl * perf[gpu[v]].decode_ms(e_b, 130, 1)
+                                                   for v, nl in zip(bch["nodes"], bch["partition"])], 2048 * 2)
     hops = net.msg(fch["nodes"][0], bch["nodes"][0], 2048 * 2) + net.msg(bch["nodes"][0], fch["nodes"][0], 8)
     gap = f_step + b_step + hops
     assert r["token_ms"][0] == pytest.approx(gap, rel=0.02)
@@ -209,9 +223,55 @@ def test_full_pipeline_channels_any_mode(world) -> None:
                     node_gpu=gpu, params=S.Params(back_fixed_ms=1.0), inflight=1)["requests"][0]
     ch = next(c for c in cj["channels"] if c["name"] == one["channel"])
     e = S.resident_experts(ch) or 128
-    step = 1.0 + sum(nl * perf[gpu[v]].decode_ms(e, 81, 1) for v, nl in zip(ch["nodes"], ch["partition"]))
-    step += sum(net.pp(a, b, 2048 * 2) for a, b in zip(ch["nodes"], ch["nodes"][1:]))
+    step = 1.0 + pp_timeline(net, ch["nodes"], [nl * perf[gpu[v]].decode_ms(e, 81, 1)
+                                                for v, nl in zip(ch["nodes"], ch["partition"])], 2048 * 2)
     assert one["token_ms"][0] == pytest.approx(step, rel=0.02)
     with pytest.raises(SystemExit, match="没有前段"):
         S.run_sim(cj, S.replay_requests(real, cj), perf=perf, net=net, node_gpu=gpu, params=S.Params(),
                   per_front=1)
+
+
+def test_pp_simple_is_v1_and_broadcast_can_dominate(world) -> None:
+    """--pp-simple = v1（只算往下传的几跳）；新算法多出「结果回传」；第一段很快、跨网段下发很慢时，
+    后面的段要等调度结果。"""
+    st = world["stages"]
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    sim = S.Sim(st, perf=perf, net=S.Net(ip=ip, lat_same=0.1, lat_cross=3.0), node_gpu=gpu,
+                params=S.Params(back_fixed_ms=0.0), front_slots=None, hold=True)
+    e = sim.engines["back-mbpp-1"]                      # N13 → N14：同网段
+    new = e.step_ms([200.0], [])
+    sim.params.pp_simple = True
+    old = e.step_ms([200.0], [])
+    assert new - old == pytest.approx(sim.net.one_way("N14", "N13") + sim.net.pp_hop_ms
+                                      + sim.net.xfer("N14", "N13", 8), rel=1e-6)
+    # 三段的流水线：首段到末段直连很慢（50 ms）、中间两跳很快 → 末段要等调度结果，结果回传也走慢的那条
+    cj = json.loads((world["tmp"] / "vc" / "channels.json").read_text())
+    net = S.Net(ip=ip, lat_same=0.1, lat_cross=3.0, lat={("N12", "N08"): 50.0})
+    sa = S.Sim(cj, perf=perf, net=net, node_gpu=gpu, params=S.Params(back_fixed_ms=0.0), front_slots=None,
+               hold=True)
+    e3 = sa.engines["no_robots-0"]
+    assert e3.nodes == ["N12", "N09", "N08"]
+    e3.gpus = [S.GpuPerf("x", {"128": {"128": {"1": 0.0}}}, {"128": {"128": 0.0}}, {})] * 3
+    want = (50.0 + net.pp_hop_ms) + (50.0 + net.xfer("N08", "N12", 8) + net.pp_hop_ms)
+    assert e3.step_ms([128.0], []) == pytest.approx(want, rel=1e-9)
+
+
+def test_layout_step_trace_for_full_channels(tmp_path) -> None:
+    """layout.py --step-trace：整条流水线（A）的每台命令前加环境变量；collect 认 node_rank 0 那台。"""
+    if not PLAN.exists():
+        pytest.skip("清单不在")
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out), "--model-dir", "/w",
+                        "--vllm-bin", "/venv/bin/vllm", "--step-trace", "/tmp/steps"]) == 0
+    cj = json.loads((out / "channels.json").read_text())
+    files = T.trace_files(cj)
+    assert set(files) == {c["name"] for c in cj["channels"]}
+    for c in cj["channels"]:
+        assert c["step_trace"] == f"/tmp/steps/{c['name']}.jsonl"
+        assert all(x["cmd"].startswith(f"VLLM_P2P_STEP_TRACE=/tmp/steps/{c['name']}.jsonl ")
+                   for x in c["commands"])
+        assert files[c["name"]][0] == c["commands"][0]["host"]          # node_rank 0
+        assert "VLLM_P2P_STEP_TRACE" in (out / f"{c['name']}.sh").read_text()
+    from vllm.p2p import launch
+    assert launch.venv_of(cj["channels"][0]["commands"][0]["cmd"]) == "/venv"

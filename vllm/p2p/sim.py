@@ -38,8 +38,12 @@ decode[专家数][上下文 C][批 B]（B 向上补到量过的档位 —— CUD
 在途最少的，`oracle` = 按标注的类）；decode 循环全在引擎里，不经过网关。挑通道用的也是真网关的
 `gateway.Router`。这种部署的每步固定开销用 `--back-fixed-ms`（含 embedding、lm_head、采样）。
 
-v1 的简化（与真机比对时心里要有数）：后段多机 PP 按各段**串行**算（不模拟 vLLM 的 batch queue
-重叠）；不模拟 KV 容量与抢占（槽位小时不会发生）；识别结果、生成长度回放真机。
+**多机 PP 的一步**：调度器在 node_rank 0，每步先把调度结果发给其余各台；第 i 段等调度结果与上一段的
+hidden 都到了才算；最后一段采样的 token 回到 node_rank 0 才算这一步完（`--pp-simple` 回到 v1 只算
+往下传的几跳）。时延按 `--topo` / 网段估，每次 PP 传输另加 `--pp-hop-ms`。
+
+v1 的简化（与真机比对时心里要有数）：几批之间不重叠（不模拟 vLLM 的 batch queue；批大小 1 时
+没有区别）；不模拟 KV 容量与抢占（槽位小时不会发生）；识别结果、生成长度回放真机。
 """
 
 from __future__ import annotations
@@ -217,6 +221,10 @@ class Net:
     def pp(self, a: str, b: str, nbytes: float) -> float:
         return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.pp_hop_ms
 
+    def ctrl(self, a: str, b: str) -> float:
+        """多机 PP：node_rank 0 把这一步的调度结果发给 b（小消息）。"""
+        return self.one_way(a, b) + self.pp_hop_ms
+
 
 def load_topo(path: str | Path | None) -> tuple[dict, dict, dict]:
     """拓扑 JSON → (单向时延, 带宽, 节点卡型)。"""
@@ -259,6 +267,7 @@ class Params:
     client_ms: float = 1.0                   # bench 收到完成到发出下一条
     max_batched_tokens: int = 8192
     hidden: int = 2048                       # hidden 维度（每位置 hidden × 2 字节）
+    pp_simple: bool = False                  # True = v1 的多机 PP 算法（不算调度下发与结果回传）
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -308,21 +317,38 @@ class SimEngine:
         return oh * (0.5 if self.role == "front" else 1.0)
 
     def step_ms(self, dec_ctx: Sequence[float], pf_tokens: Sequence[int]) -> float:
+        """一步的用时。多机 PP 时按 vLLM 的实际过程排时间线：
+
+        1. 调度器在 node_rank 0 上：把这一步的调度结果同时发给其余各台（`Net.ctrl`）；
+        2. 第 i 段要等「调度结果到了」和「上一段的 hidden 到了」都满足才开算；
+        3. 最后一段采样出的 token 要回到 node_rank 0（EngineCore 在那儿出结果）。
+
+        `Params.pp_simple` = v1 的算法（各段串行相加，只算往下传的那几跳）。"""
         b = len(dec_ctx)
         ctx = (sum(dec_ctx) / b) if b else 0.0
         if b and not pf_tokens and b in self.steps:
             return float(self.steps[b])
-        t = self.fixed_ms(ctx, max(b, 1))
+        fixed = self.fixed_ms(ctx, max(b, 1))
         net = self.sim.net
-        for i, (g, nl) in enumerate(zip(self.gpus, self.layers)):
-            if b:
-                t += nl * g.decode_ms(self.experts, ctx, b)
-            for n in pf_tokens:
-                t += nl * g.prefill_ms(self.experts, n)
-            if i + 1 < len(self.nodes):
-                tok = b + sum(pf_tokens)
-                t += net.pp(self.nodes[i], self.nodes[i + 1], tok * self.sim.params.hidden * 2)
-        return t
+        tok = b + sum(pf_tokens)
+        H = self.sim.params.hidden * 2
+        comp = []
+        for g, nl in zip(self.gpus, self.layers):
+            c = nl * g.decode_ms(self.experts, ctx, b) if b else 0.0
+            c += sum(nl * g.prefill_ms(self.experts, n) for n in pf_tokens)
+            comp.append(c)
+        if self.sim.params.pp_simple or len(self.nodes) == 1:
+            t = fixed + sum(comp)
+            for i in range(len(self.nodes) - 1):
+                t += net.pp(self.nodes[i], self.nodes[i + 1], tok * H)
+            return t
+        n0 = self.nodes[0]
+        end = comp[0]
+        for i in range(1, len(self.nodes)):
+            start = max(net.ctrl(n0, self.nodes[i]), end + net.pp(self.nodes[i - 1], self.nodes[i], tok * H))
+            end = start + comp[i]
+        end += net.pp(self.nodes[-1], n0, max(b, 1) * 8)          # 采样结果回 node_rank 0
+        return fixed + end
 
     # ---- 调度 ----
     def put(self, rid: str, item: tuple, now: float) -> None:
@@ -810,11 +836,15 @@ def compare(sim: Mapping, real: Mapping) -> tuple[list[str], float]:
     return lines, score
 
 
-def fit(make: Callable[[Params, float], dict], real: Mapping, params: Params, hop_ms: float, *,
-        rounds: int = 3, fixed: Sequence[str] = (), log: Callable[[str], None] = print
-        ) -> tuple[Params, float, float, dict]:
-    """坐标下降：依次调 front_fixed_ms / back_fixed_ms / hop_ms，每次在当前值的几档倍数里挑误差分最小的。"""
-    cur = {"front_fixed_ms": params.front_fixed_ms, "back_fixed_ms": params.back_fixed_ms, "hop_ms": hop_ms}
+def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float, *,
+        rounds: int = 3, fixed: Sequence[str] = (), log: Callable[[str], None] = print,
+        extra: Mapping[str, float] | None = None) -> tuple[Params, float, float, dict]:
+    """坐标下降：依次调 front_fixed_ms / back_fixed_ms / hop_ms（以及 `extra` 里的，比如 pp_hop_ms ——
+    以关键字传给 make），每次在当前值的几档倍数里挑误差分最小的。各参数最后的取值也写进
+    返回结果的 `doc["sim"]["fit"]`。"""
+    extra = dict(extra or {})
+    cur = {"front_fixed_ms": params.front_fixed_ms, "back_fixed_ms": params.back_fixed_ms, "hop_ms": hop_ms,
+           **extra}
     if cur["front_fixed_ms"] is None or cur["back_fixed_ms"] is None:
         # None = 用 layer_bench 截距（各卡型不同）—— 标定从它在模拟里的平均取值出发
         eng = make(params, hop_ms)["sim"]["engines"]
@@ -826,13 +856,13 @@ def fit(make: Callable[[Params, float], dict], real: Mapping, params: Params, ho
     def score_of(c) -> tuple[float, dict]:
         p = Params(**{**params.as_dict(), "front_fixed_ms": c["front_fixed_ms"],
                       "back_fixed_ms": c["back_fixed_ms"]})
-        doc = make(p, c["hop_ms"])
+        doc = make(p, c["hop_ms"], **{k: c[k] for k in extra})
         return compare(doc, real)[1], doc
 
     best, best_doc = score_of(cur)
     log(f"  起点 {cur} → 误差分 {best:.4f}")
     for rd in range(rounds):
-        for k in ("front_fixed_ms", "back_fixed_ms", "hop_ms"):
+        for k in ("front_fixed_ms", "back_fixed_ms", "hop_ms", *extra):
             if k in fixed:
                 continue
             base = cur[k] if cur[k] > 0 else 0.5
@@ -844,6 +874,7 @@ def fit(make: Callable[[Params, float], dict], real: Mapping, params: Params, ho
             log(f"  第 {rd + 1} 轮 {k:<15} → {cur[k]:.3f}   误差分 {best:.4f}")
     p = Params(**{**params.as_dict(), "front_fixed_ms": cur["front_fixed_ms"],
                   "back_fixed_ms": cur["back_fixed_ms"]})
+    best_doc.setdefault("sim", {})["fit"] = {"params": cur, "score": best}
     return p, cur["hop_ms"], best, best_doc
 
 
@@ -870,7 +901,8 @@ def _setup(a) -> tuple:
     if a.model_dir and (Path(a.model_dir) / "config.json").exists():
         hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
     params = Params(front_fixed_ms=a.front_fixed_ms, back_fixed_ms=a.back_fixed_ms, lr_ms=a.lr_ms,
-                    client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden)
+                    client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden,
+                    pp_simple=a.pp_simple)
     steps = None
     if a.steps:
         from vllm.p2p import steptrace
@@ -907,7 +939,10 @@ def _common(ap) -> None:
                     help="前段每步固定开销（默认 layer_bench 截距 × 0.5）")
     ap.add_argument("--back-fixed-ms", type=float, default=None, help="后段每步固定开销（默认 layer_bench 截距）")
     ap.add_argument("--hop-ms", type=float, default=2.0, help="每条前后段 / 网关消息的软件开销")
-    ap.add_argument("--pp-hop-ms", type=float, default=0.3, help="后段 PP 段间的固定开销")
+    ap.add_argument("--pp-hop-ms", type=float, default=0.3,
+                    help="多机 PP 每次传输（段间 hidden、调度下发、结果回传）的固定开销")
+    ap.add_argument("--pp-simple", action="store_true",
+                    help="多机 PP 用 v1 的算法：只算往下传的几跳，不算调度下发与结果回传")
     ap.add_argument("--lat-same", type=float, default=0.1, help="同网段单向时延 ms（没 --topo 时）")
     ap.add_argument("--lat-cross", type=float, default=3.15, help="跨网段单向时延 ms（没 --topo 时）")
     ap.add_argument("--lat-gw", type=float, default=0.1, help="网关 ↔ 节点单向时延（没 --gateway-node 时）")
@@ -928,6 +963,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     f = sub.add_parser("fit", help="拿 --replay 的真机结果标定 前段 / 后段每步固定开销、每跳开销")
     _common(f)
     f.add_argument("--rounds", type=int, default=3)
+    f.add_argument("--fit-pp", action="store_true",
+                   help="也标定 --pp-hop-ms（多机 PP 每次传输的固定开销）。同一深度的流水线下它和每步固定开销"
+                        "分不开 —— 有步级记录（--steps）或不同深度的部署一起看时再开")
     f.add_argument("--fix", default="", help="不调的参数（逗号分隔：front_fixed_ms,back_fixed_ms,hop_ms）")
     c = sub.add_parser("compare", help="比两份结果的关键指标")
     c.add_argument("--sim", required=True)
@@ -943,8 +981,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stages, node_gpu, perf, net, params, steps, real, reqs_fn = _setup(a)
 
-    def make(p: Params, hop: float) -> dict:
+    def make(p: Params, hop: float, pp_hop_ms: float | None = None) -> dict:
         net.hop_ms = hop
+        if pp_hop_ms is not None:
+            net.pp_hop_ms = pp_hop_ms
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
                        hold=not a.no_hold, front_pick=a.front_pick, steps=steps, real=real,
@@ -955,9 +995,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixed = [x.strip() for x in a.fix.split(",") if x.strip()]
         if stages.get("kind") != "tiered":
             fixed.append("front_fixed_ms")            # 整条流水线没有前段
-        p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds, fixed=fixed)
+        extra = {"pp_hop_ms": a.pp_hop_ms} if a.fit_pp else None
+        p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds, fixed=fixed, extra=extra)
+        pp = f" --pp-hop-ms {doc['sim']['fit']['params']['pp_hop_ms']:g}" if a.fit_pp else ""
         print(f"结果：--front-fixed-ms {p.front_fixed_ms:g} --back-fixed-ms {p.back_fixed_ms:g} "
-              f"--hop-ms {hop:g}（误差分 {score:.4f}）")
+              f"--hop-ms {hop:g}{pp}（误差分 {score:.4f}）")
     else:
         doc = make(params, a.hop_ms)
     lines, score = compare(doc, real)

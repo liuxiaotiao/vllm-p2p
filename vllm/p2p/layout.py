@@ -565,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-num-seqs-channel", action="append", default=[], metavar="通道=N",
                     help="逐通道覆盖 --max-num-seqs，可重复，如 --max-num-seqs-channel no_robots-0=32"
                          "（只有显存紧的那条通道要压小；压小的通道在闭环里会在 vLLM 里排队）")
+    ap.add_argument("--step-trace", default=None, metavar="DIR",
+                    help="开步级记录：每条通道的引擎把每一步的开始时刻、用时、批大小写到 DIR/<通道>.jsonl"
+                         "（node_rank 0 那台上；用 vllm/p2p/steptrace.py collect --stages channels.json 收回来）")
     ap.add_argument("--stats", action="store_true",
                     help="开 A5 统计钩子：逐请求的全量路由 top-k、后段 miss、前 L₀ 层 LR 特征，"
                          "落到各节点的 $VLLM_P2P_STATS_DIR（默认 /tmp/p2p_stats）")
@@ -663,6 +666,11 @@ def main(argv: list[str] | None = None) -> int:
                                   attention_backend=args.attention_backend or None,
                                   prefix_caching=args.prefix_caching,
                                   max_num_seqs=mns.get(ch.name, args.max_num_seqs))
+            if args.step_trace:
+                # 步级记录（vllm/p2p/steptrace.py）：EngineCore 在 node_rank 0 上，写 <目录>/<通道>.jsonl
+                path = f"{args.step_trace.rstrip('/')}/{ch.name}.jsonl"
+                entry["step_trace"] = path
+                cmds = [(v, f"VLLM_P2P_STEP_TRACE={shlex.quote(path)} {c}") for v, c in cmds]
             entry["api"] = f"http://{hosts[ch.nodes[0]].host}:{args.port}/v1"
             entry["commands"] = [{"node": v, "host": hosts[v].host, "cmd": c} for v, c in cmds]
             sh = args.out / f"{ch.name}.sh"
