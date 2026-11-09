@@ -250,6 +250,8 @@ class TieredCoordinator:
         self.ignore_eos, self.logprobs = ignore_eos, logprobs
         self.reqs: dict[str, _Req] = {}
         self.hold = bool(hold)
+        # 记等待 / 绑定时刻用的钟（模拟器 vllm/p2p/sim.py 换成模拟时间）
+        self.clock: Callable[[], float] = time.perf_counter
         # 每个前段同时最多几条（None = 不限）：都满时新请求在网关里等，有前段做完一条再进
         self.front_slots = int(front_slots) if front_slots else None
         self._front_free = asyncio.Condition()
@@ -321,13 +323,9 @@ class TieredCoordinator:
                 if not self._front_has_room():
                     self.n_front_wait += 1
                 await self._front_free.wait_for(self._front_has_room)
-                f = self._pick_front()
-                f.inflight += 1
+                f = self.assign_front()
         else:
-            f = self._pick_front()
-            f.inflight += 1
-        f.peak = max(f.peak, f.inflight)
-        f.n_served += 1
+            f = self.assign_front()
         r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop(),
                                   body=body)
         r.front = f
@@ -398,6 +396,14 @@ class TieredCoordinator:
         return (f"front={r.front.name if r.front else None}{held} "
                 f"back={r.back.name if r.back else None} hidden 收到 {r.stream.next} 位"
                 f"（prompt {r.n_prompt}） token {len(r.tokens)} 个 hidden 回 {len(r.t_hid)} 次")
+
+    def assign_front(self) -> Engine:
+        """挑一个前段并占上（同步；真网关与模拟器共用）。front_slots 时调用方先确认有空位。"""
+        f = self._pick_front()
+        f.inflight += 1
+        f.peak = max(f.peak, f.inflight)
+        f.n_served += 1
+        return f
 
     def reset_counters(self) -> None:
         """bench 预热完调用：峰值、计数从现在的在飞重新算。"""
@@ -476,6 +482,14 @@ class TieredCoordinator:
         r.identified = True
         if self.classify is not None:
             self._identify(r)
+        b = self.bind_decision(r)
+        if b is not None:
+            await self._send_bind(r, b)
+
+    # ---- 绑定的决策（同步、不碰 I/O：真网关和模拟器 sim.py 共用） ----
+    def bind_decision(self, r) -> Engine | None:
+        """识别完的请求该绑哪个后段。返回的后段已经占好位（`reserve`）；hold 时这类后段都坐满、
+        或同组有人排在前面 → 进等待队列、返回 None。"""
         if self.hold:
             cands = self._candidates(r.task)
             free = self._free(cands)
@@ -483,22 +497,22 @@ class TieredCoordinator:
             ahead = any(set(map(id, self._candidates(w.task))) & set(map(id, cands))
                         for w in self._waiting)
             if not free or ahead:
-                r.t_wait = time.perf_counter()
+                r.t_wait = self.clock()
                 self._waiting.append(r)
                 self.n_held += 1
-                return
-            await self._attach(r, self._pick(r, free))
-            return
-        await self._attach(r, self._pick(r))
+                return None
+            b = self._pick(r, free)
+        else:
+            b = self._pick(r)
+        self.reserve(r, b)
+        return b
 
-    async def _drain(self) -> None:
-        """有后段空出槽位：等待队列里按先来先到，能绑的都绑上（每条只在自己 task 的后段里挑）。"""
-        if not self._waiting:
-            return
+    def drain_plan(self) -> list:
+        """有后段空出槽位：等待队列里按先来先到，能绑的都绑上（每条只在自己 task 的后段里挑）。
+        返回 [(请求, 后段)]，后段已占好位。"""
+        out = []
         blocked: set[int] = set()        # 这一轮已经有人绑不上的候选组：排在它后面的同组不越过它
         for r in list(self._waiting):
-            if r not in self._waiting:
-                continue
             cands = self._candidates(r.task)
             key = set(map(id, cands))
             if key & blocked:
@@ -508,14 +522,27 @@ class TieredCoordinator:
                 blocked |= key
                 continue
             self._waiting.remove(r)
-            await self._attach(r, self._pick(r, free))
+            b = self._pick(r, free)
+            self.reserve(r, b)
+            out.append((r, b))
+        return out
 
-    async def _attach(self, r: _Req, b: Engine) -> None:
+    def reserve(self, r, b: Engine) -> None:
         r.back = b
         b.inflight += 1
         b.peak = max(b.peak, b.inflight)
         b.n_bound += 1
-        r.t_bound = time.perf_counter()
+        r.t_bound = self.clock()
+
+    async def _drain(self) -> None:
+        for r, b in self.drain_plan():
+            await self._send_bind(r, b)
+
+    async def _attach(self, r: _Req, b: Engine) -> None:
+        self.reserve(r, b)
+        await self._send_bind(r, b)
+
+    async def _send_bind(self, r: _Req, b: Engine) -> None:
         if self.direct:
             # 先给后段下路由（与 add 同一条 socket，必在 add 之前到）：它出的 token 直接给前段
             await b.client.send_route(r.rid, r.front.client.address, 0)

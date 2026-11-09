@@ -1,0 +1,921 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""B1 分段服务的离散事件模拟器（v1）：粒度到「每个分段引擎的每一步」。
+
+模拟的是 `tiered_gateway.py` + 分段引擎这套真系统在 bench 压测下的样子，输出与 bench.py **同一种
+结果 JSON**，所以 `tiered_stats.py --b sim.json --a real.json` 直接出对比表。
+
+    # 1. 照一次真机结果回放（请求顺序、每条的 prompt 长度 / 生成长度 / LR 判成哪类都取自它）
+    python -m vllm.p2p.sim run --stages p2p_channels/stages.json --replay results/b1_lr_pf1_x.json \\
+        --layer-bench results/layer_bench/summary_by_gpu.json --hosts <hosts.txt> --per-front 1 \\
+        --out results/sim_pf1_x.json
+    python3 vllm/p2p/tiered_stats.py --b results/sim_pf1_x.json --a results/b1_lr_pf1_x.json
+    # 2. 标定三个自由参数（前段 / 后段每步固定开销、每跳软件开销），拿真机结果拟合
+    python -m vllm.p2p.sim fit  …同上… --out results/sim_fit_x.json
+    # 3. 对比任意两份结果（关键指标 + 相对误差）
+    python -m vllm.p2p.sim compare --sim results/sim_pf1_x.json --real results/b1_lr_pf1_x.json
+
+模型
+----
+**请求**：网关挑前段（`TieredCoordinator.assign_front`，`--front-slots` 满了在网关排队）→ 前段 prefill
+→ prompt 的 hidden 交给网关、LR 判类（回放真机判的类）→ `bind_decision`（hold：这类后段坐满就在前段
+等，后段做完一条时 `drain_plan` 按先来先到接上）→ 后段 prefill 出第 1 个 token → decode 循环：
+后段出 token → 直连发给前段 → 前段算一步 → hidden 直连发给后段 → 后段算一步 … → 生成够长度结束。
+**挑前段 / 挑后段 / 等待队列用的就是真网关那几个同步函数**（tiered.py），不是另写一份。
+
+**引擎**：照 vLLM 的调度循环 —— 空闲时一有输入就开一步；一步取「输入已经到了」的请求（已在跑的
+decode 优先，新请求 prefill 受 max_num_seqs 与每步 token 上限约束）；算的时候新到的输入等下一步。
+一步用时 = 每步固定开销 + Σ各 PP 段 [层数 × 每层耗时] + 段间转发。每层耗时查 layer_bench：
+decode[专家数][上下文 C][批 B]（B 向上补到量过的档位 —— CUDA Graph 也是这么补的；C 线性插值、
+超出范围线性外推），prefill[专家数][P]。给了 `--steps`（steptrace 收回来的步级记录）时，
+纯 decode 步直接用那个引擎实测的「这个批大小的每步 p50」。
+
+**网络**：每条消息 = 单向时延 + 字节 / 带宽 + 每跳软件开销（`--hop-ms`）。单向时延与带宽取
+`--topo` 的 edges；没有拓扑就按 IP 同不同 /24 网段取 `--lat-same` / `--lat-cross`。
+
+v1 的简化（与真机比对时心里要有数）：后段多机 PP 按各段**串行**算（不模拟 vLLM 的 batch queue
+重叠）；不模拟 KV 容量与抢占（槽位小时不会发生）；识别结果、生成长度回放真机。
+"""
+
+from __future__ import annotations
+
+import argparse
+import heapq
+import itertools
+import json
+import math
+import re
+import shlex
+import statistics as stt
+import sys
+from bisect import bisect_left
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+DEFAULT_MARKS = (64, 128, 256, 512, 1024, 2048)
+
+
+# --------------------------------------------------------------------------- #
+# 每层耗时表（layer_bench）
+# --------------------------------------------------------------------------- #
+def gpu_key(name: str) -> str:
+    s = str(name or "").upper()
+    for p in ("NVIDIA ", "TESLA ", "QUADRO ", "GEFORCE "):
+        s = s.replace(p, "")
+    return re.sub(r"[\s\-_]", "", s)
+
+
+def _interp(xs: Sequence[float], ys: Sequence[float], x: float) -> float:
+    """分段线性插值；两端之外用最近两点线性外推（不小于 0）。"""
+    if len(xs) == 1:
+        return float(ys[0])
+    i = bisect_left(xs, x)
+    if i < len(xs) and xs[i] == x:
+        return float(ys[i])
+    if i == 0:
+        i = 1
+    elif i >= len(xs):
+        i = len(xs) - 1
+    x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
+    return max(0.0, y0 + (y1 - y0) * (x - x0) / (x1 - x0))
+
+
+@dataclass
+class GpuPerf:
+    """一种卡的 layer_bench 表：decode[E][C][B]、prefill[E][P]、decode_overhead_ms[E][C][B]（每层毫秒）。"""
+    gpu: str
+    decode: dict
+    prefill: dict
+    overhead: dict
+
+    def _e(self, table: Mapping, experts: int) -> Mapping:
+        cache = self.__dict__.setdefault("_ecache", {})
+        if (id(table), experts) in cache:
+            return cache[(id(table), experts)]
+        cache[(id(table), experts)] = self._e_uncached(table, experts)
+        return cache[(id(table), experts)]
+
+    def _e_uncached(self, table: Mapping, experts: int) -> Mapping:
+        ks = sorted(int(k) for k in table if table[k])
+        if not ks:
+            raise ValueError(f"{self.gpu} 的 layer_bench 表是空的")
+        e = min(ks, key=lambda k: (abs(k - experts), -k))
+        return table[str(e)]
+
+    def _by_batch(self, tab: Mapping, batch: int) -> tuple[list[int], list[float]]:
+        """固定批大小时各上下文长度的每层耗时（缓存：每步都要查）。"""
+        cache = self.__dict__.setdefault("_cache", {})
+        key = (id(tab), batch)
+        if key not in cache:
+            cs = sorted(int(c) for c in tab)
+            vals = []
+            for c in cs:
+                row = tab[str(c)]
+                bs = sorted(int(b) for b in row)
+                up = [b for b in bs if b >= batch]
+                if up:                               # 补到量过的档位（CUDA Graph 同样补齐）
+                    vals.append(float(row[str(up[0])]))
+                else:                                # 超过最大档：按最后两档外推
+                    vals.append(_interp(bs, [row[str(b)] for b in bs], batch))
+            cache[key] = (cs, vals)
+        return cache[key]
+
+    def _cb(self, tab: Mapping, ctx: float, batch: int) -> float:
+        cs, vals = self._by_batch(tab, batch)
+        return _interp(cs, vals, ctx)
+
+    def decode_ms(self, experts: int, ctx: float, batch: int) -> float:
+        return self._cb(self._e(self.decode, experts), ctx, batch)
+
+    def overhead_ms(self, experts: int, ctx: float, batch: int) -> float:
+        try:
+            return self._cb(self._e(self.overhead, experts), ctx, batch)
+        except ValueError:
+            return 0.0
+
+    def prefill_ms(self, experts: int, n: int) -> float:
+        tab = self._e(self.prefill, experts)
+        ps = sorted(int(p) for p in tab)
+        return _interp(ps, [tab[str(p)] for p in ps], n)
+
+
+def load_perf(paths: Sequence[str | Path]) -> dict[str, GpuPerf]:
+    """layer_bench 的 summary_by_gpu.json（{卡型: {...}}）或若干台的单机结果（同卡型取均值）。"""
+    by: dict[str, list[Mapping]] = defaultdict(list)
+    for p in paths:
+        d = json.loads(Path(p).read_text(encoding="utf-8"))
+        if "decode" in d and isinstance(d.get("decode"), dict) and ("gpu" in d or "node" in d):
+            by[gpu_key(d.get("gpu", ""))].append(d)
+        else:
+            for g, v in d.items():
+                if isinstance(v, dict) and "decode" in v:
+                    by[gpu_key(v.get("gpu") or g)].append(v)
+    if not by:
+        raise SystemExit(f"{list(map(str, paths))} 里没有 layer_bench 的 decode 表")
+
+    def mean_tree(objs):
+        objs = [o for o in objs if o is not None]
+        if not objs:
+            return {}
+        if isinstance(objs[0], Mapping):
+            keys = set().union(*[o.keys() for o in objs if isinstance(o, Mapping)])
+            return {k: mean_tree([o.get(k) for o in objs if isinstance(o, Mapping)]) for k in keys}
+        nums = [float(o) for o in objs if isinstance(o, (int, float))]
+        return sum(nums) / len(nums) if nums else None
+
+    return {g: GpuPerf(g, mean_tree([r.get("decode") for r in rs]), mean_tree([r.get("prefill") for r in rs]),
+                       mean_tree([r.get("decode_overhead_ms") for r in rs])) for g, rs in by.items()}
+
+
+# --------------------------------------------------------------------------- #
+# 网络
+# --------------------------------------------------------------------------- #
+@dataclass
+class Net:
+    """节点间单向时延（ms）与带宽（Mbps）。没拓扑时按 IP 网段估。"""
+    ip: dict[str, str]
+    lat: dict[tuple[str, str], float] = field(default_factory=dict)
+    bw: dict[tuple[str, str], float] = field(default_factory=dict)
+    lat_same: float = 0.1
+    lat_cross: float = 3.15
+    bw_default: float = 10000.0
+    lat_gw: float = 0.1                    # 网关 ↔ 节点（没给 --gateway-node 时）
+    gateway: str | None = None
+    hop_ms: float = 2.0                    # 每条前后段 / 网关消息的软件开销（代理、ZMQ、进程间转发）
+    pp_hop_ms: float = 0.3                 # 后段 PP 段间（vLLM 内部 NCCL）的固定开销
+
+    def one_way(self, a: str | None, b: str | None) -> float:
+        if a is None or b is None:
+            return self.lat_gw
+        if a == b:
+            return 0.0
+        if (a, b) in self.lat:
+            return self.lat[(a, b)]
+        if (b, a) in self.lat:
+            return self.lat[(b, a)]
+        ia, ib = self.ip.get(a, ""), self.ip.get(b, "")
+        same = ia.rsplit(".", 1)[0] == ib.rsplit(".", 1)[0] if ia and ib else True
+        return self.lat_same if same else self.lat_cross
+
+    def xfer(self, a: str | None, b: str | None, nbytes: float) -> float:
+        bw = self.bw.get((a, b)) or self.bw.get((b, a)) or self.bw_default
+        return nbytes * 8 / (bw * 1e3)                      # Mbps → bit/ms = bw×1e3
+
+    def msg(self, a: str | None, b: str | None, nbytes: float = 0.0) -> float:
+        """一条前后段 / 网关消息：单向 + 传输 + 软件开销。a/b 为 None = 网关。"""
+        a = self.gateway if a is None else a
+        b = self.gateway if b is None else b
+        return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.hop_ms
+
+    def pp(self, a: str, b: str, nbytes: float) -> float:
+        return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.pp_hop_ms
+
+
+def load_topo(path: str | Path | None) -> tuple[dict, dict, dict]:
+    """拓扑 JSON → (单向时延, 带宽, 节点卡型)。"""
+    if not path:
+        return {}, {}, {}
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    lat, bw = {}, {}
+    for e in d.get("edges") or []:
+        lat[(e["u"], e["v"])] = float(e.get("propagation_delay", 0.0))
+        if e.get("bandwidth"):
+            bw[(e["u"], e["v"])] = float(e["bandwidth"])
+    roles = {n["id"]: gpu_key(n.get("role", "")) for n in d.get("nodes") or []}
+    return lat, bw, roles
+
+
+def load_hosts(path: str | Path | None) -> tuple[dict, dict]:
+    """hosts.txt：`节点 地址[:端口] # 卡型 …` → (IP, 卡型)。"""
+    ip, gpu = {}, {}
+    if not path:
+        return ip, gpu
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        body, _, comment = raw.partition("#")
+        parts = body.split()
+        if len(parts) < 2:
+            continue
+        ip[parts[0]] = parts[1].rsplit(":", 1)[0] if parts[1].count(":") == 1 else parts[1]
+        if comment.split():
+            gpu[parts[0]] = gpu_key(comment.split()[0])
+    return ip, gpu
+
+
+# --------------------------------------------------------------------------- #
+# 引擎
+# --------------------------------------------------------------------------- #
+@dataclass
+class Params:
+    front_fixed_ms: float | None = None      # 前段每步固定开销；None = layer_bench 截距 × 0.5（无 lm_head）
+    back_fixed_ms: float | None = None       # 后段每步固定开销；None = layer_bench 截距（含 lm_head、采样）
+    lr_ms: float = 2.0                       # 网关上跑 LR 的时间
+    client_ms: float = 1.0                   # bench 收到完成到发出下一条
+    max_batched_tokens: int = 8192
+    hidden: int = 2048                       # hidden 维度（每位置 hidden × 2 字节）
+
+    def as_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+class SimEngine:
+    def __init__(self, ch: Mapping, perf: Mapping[str, GpuPerf], node_gpu: Mapping[str, str],
+                 experts: int, sim: "Sim", steps: Mapping | None = None):
+        self.name, self.role, self.task = ch["name"], ch["role"], ch.get("task")
+        self.nodes = list(ch["nodes"])
+        self.layers = [int(x) for x in ch["partition"]]
+        self.max_seqs = int(ch.get("max_num_seqs") or 256)
+        self.gpus = []
+        for v in self.nodes:
+            g = node_gpu.get(v)
+            if g is None:
+                raise SystemExit(f"不知道节点 {v} 是什么卡 —— 给 --hosts（注释写卡型）或 --topo（role）")
+            if g not in perf:
+                raise SystemExit(f"layer_bench 里没有卡型 {g}（节点 {v}）；有 {sorted(perf)}")
+            self.gpus.append(perf[g])
+        self.experts = int(experts)
+        self.sim = sim
+        self.steps = steps or {}                 # 实测：{批大小: 每步毫秒}（纯 decode 步）
+        self.ready: dict[str, tuple] = {}        # rid → ("pf", n) | ("dec", ctx)
+        self.admitted: set[str] = set()
+        self.busy = False
+        self.t_ready: dict[str, float] = {}
+        # 统计
+        self.n_steps = 0
+        self.busy_ms = 0.0
+        self.batch_sum = 0
+        self.t_first_step: float | None = None
+        self.t_last_end = 0.0
+
+    @property
+    def node0(self) -> str:
+        return self.nodes[0]
+
+    def fixed_ms(self, ctx: float, batch: int) -> float:
+        p = self.sim.params
+        v = p.front_fixed_ms if self.role == "front" else p.back_fixed_ms
+        if v is not None:
+            return float(v)
+        g = self.gpus[-1] if self.role == "back" else self.gpus[0]
+        oh = g.overhead_ms(self.experts, ctx, batch)
+        return oh * (0.5 if self.role == "front" else 1.0)
+
+    def step_ms(self, dec_ctx: Sequence[float], pf_tokens: Sequence[int]) -> float:
+        b = len(dec_ctx)
+        ctx = (sum(dec_ctx) / b) if b else 0.0
+        if b and not pf_tokens and b in self.steps:
+            return float(self.steps[b])
+        t = self.fixed_ms(ctx, max(b, 1))
+        net = self.sim.net
+        for i, (g, nl) in enumerate(zip(self.gpus, self.layers)):
+            if b:
+                t += nl * g.decode_ms(self.experts, ctx, b)
+            for n in pf_tokens:
+                t += nl * g.prefill_ms(self.experts, n)
+            if i + 1 < len(self.nodes):
+                tok = b + sum(pf_tokens)
+                t += net.pp(self.nodes[i], self.nodes[i + 1], tok * self.sim.params.hidden * 2)
+        return t
+
+    # ---- 调度 ----
+    def put(self, rid: str, item: tuple, now: float) -> None:
+        self.ready[rid] = item
+        self.t_ready.setdefault(rid, now)
+        self.kick(now)
+
+    def kick(self, now: float) -> None:
+        if self.busy or not self.ready:
+            return
+        dec, pf = [], []
+        tok = 0
+        for rid, it in list(self.ready.items()):
+            if it[0] == "dec" and rid in self.admitted:
+                dec.append((rid, it))
+                tok += 1
+        for rid, it in list(self.ready.items()):
+            if it[0] != "pf":
+                continue
+            if rid not in self.admitted and len(self.admitted) >= self.max_seqs:
+                continue
+            if tok + it[1] > self.sim.params.max_batched_tokens and (dec or pf):
+                continue
+            self.admitted.add(rid)
+            pf.append((rid, it))
+            tok += it[1]
+        if not dec and not pf:
+            return
+        for rid, _ in dec + pf:
+            del self.ready[rid]
+        ms = self.step_ms([it[1] for _, it in dec], [it[1] for _, it in pf])
+        self.busy = True
+        self.n_steps += 1
+        self.busy_ms += ms
+        self.batch_sum += len(dec) + len(pf)
+        if self.t_first_step is None:
+            self.t_first_step = now
+        for rid, it in pf:
+            self.sim.reqs[rid].queue_engine_ms[self.role] = now - self.t_ready.pop(rid, now)
+        for rid, _ in dec:
+            self.t_ready.pop(rid, None)
+        if self.role == "front":
+            fe = self.sim.co_eng[self.name]
+            if dec:
+                fe.observe(ms)
+        self.sim.at(now + ms, self._done, dec, pf, ms)
+
+    def _done(self, now: float, dec, pf, ms) -> None:
+        self.busy = False
+        self.t_last_end = now
+        for rid, it in pf + dec:
+            self.sim.on_step_out(self, rid, it, now)
+        self.kick(now)
+
+    def release(self, rid: str) -> None:
+        self.admitted.discard(rid)
+        self.ready.pop(rid, None)
+        self.t_ready.pop(rid, None)
+
+
+# --------------------------------------------------------------------------- #
+# 请求与整套系统
+# --------------------------------------------------------------------------- #
+@dataclass
+class SimReq:
+    rid: str
+    case_id: str | None
+    true_task: str | None
+    task: str | None                 # 识别后用来绑定的类（回放真机）
+    n_prompt: int
+    n_gen: int
+    stop_reason: str = "length"
+    front: Any = None                # tiered.Engine（策略用）
+    back: Any = None
+    identified: bool = False
+    t_wait: float | None = None
+    t_bound: float | None = None
+    t_submit: float = 0.0
+    t_gw_wait: float = 0.0           # 在网关等空闲前段
+    t_first: float | None = None
+    t_done: float | None = None
+    t_front_done: float | None = None
+    toks: list = field(default_factory=list)       # 每个 token 到客户端的时刻
+    n_out: int = 0
+    queue_engine_ms: dict = field(default_factory=dict)
+
+
+class Sim:
+    def __init__(self, stages: Mapping, *, perf: Mapping[str, GpuPerf], net: Net, node_gpu: Mapping,
+                 params: Params, front_slots: int | None, hold: bool, front_pick: str = "least",
+                 bind: str = "least", steps: Mapping[str, Mapping] | None = None,
+                 n_experts: int | None = None):
+        from vllm.p2p.tiered import Engine, TieredCoordinator
+
+        self.params, self.net = params, net
+        self.now = 0.0
+        self._q: list = []
+        self._seq = itertools.count()
+        self.reqs: dict[str, SimReq] = {}
+        chans = {c["name"]: c for c in stages["channels"]}
+        ne = int(n_experts or stages.get("n_experts") or 128)
+        steps = steps or {}
+        self.engines: dict[str, SimEngine] = {}
+        for name in [*stages["fronts"], *stages["backs"]]:
+            c = chans[name]
+            e = ne if c["role"] == "front" else (resident_experts(c) or ne)
+            self.engines[name] = SimEngine(c, perf, node_gpu, e, self, steps.get(name))
+        self.co_eng = {n: Engine(n, chans[n]["role"], None, task=chans[n].get("task"),
+                                 slots=(int(chans[n]["max_num_seqs"]) if hold and chans[n]["role"] == "back"
+                                        and chans[n].get("max_num_seqs") else None))
+                       for n in self.engines}
+        self.co = TieredCoordinator([self.co_eng[n] for n in stages["fronts"]],
+                                    [self.co_eng[n] for n in stages["backs"]], bind=bind,
+                                    front_pick=front_pick, hold=hold, front_slots=front_slots)
+        self.co.clock = lambda: self.now
+        self.gw_queue: list[SimReq] = []
+        self.on_finish: Callable[[SimReq, float], None] = lambda r, t: None
+
+    # ---- 事件 ----
+    def at(self, t: float, fn: Callable, *args) -> None:
+        heapq.heappush(self._q, (t, next(self._seq), fn, args))
+
+    def run(self, until: float = math.inf) -> None:
+        while self._q:
+            t, _, fn, args = heapq.heappop(self._q)
+            if t > until:
+                break
+            self.now = t
+            fn(t, *args)
+
+    # ---- 网关 ----
+    def submit(self, r: SimReq, t: float) -> None:
+        self.reqs[r.rid] = r
+        r.t_submit = t
+        if self.co.front_slots and not self.co._front_has_room():
+            self.co.n_front_wait += 1
+            self.gw_queue.append(r)
+            return
+        self._to_front(r, t)
+
+    def _to_front(self, r: SimReq, t: float) -> None:
+        f = self.co.assign_front()
+        r.front = f
+        r.t_gw_wait = t - r.t_submit
+        e = self.engines[f.name]
+        self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4), self._arrive, e, r.rid, ("pf", r.n_prompt))
+
+    def _arrive(self, t: float, e: SimEngine, rid: str, item: tuple) -> None:
+        if rid in self.reqs and self.reqs[rid].t_done is None:
+            e.put(rid, item, t)
+
+    def _identified(self, t: float, r: SimReq) -> None:
+        r.identified = True
+        b = self.co.bind_decision(r)
+        if b is not None:
+            self._send_prompt(r, b, t)
+
+    def _send_prompt(self, r: SimReq, b, t: float) -> None:
+        e = self.engines[b.name]
+        self.at(t + self.net.msg(None, e.node0, r.n_prompt * self.params.hidden * 2),
+                self._arrive, e, r.rid, ("pf", r.n_prompt))
+
+    def _finish(self, t: float, r: SimReq) -> None:
+        r.t_done = t
+        r.back.inflight -= 1
+        r.front.inflight -= 1
+        self.engines[r.front.name].release(r.rid)
+        self.engines[r.back.name].release(r.rid)
+        for w, b in self.co.drain_plan():
+            self._send_prompt(w, b, t)
+        while self.gw_queue and self.co._front_has_room():
+            self._to_front(self.gw_queue.pop(0), t)
+        self.on_finish(r, t)
+
+    # ---- 引擎出结果 ----
+    def on_step_out(self, e: SimEngine, rid: str, item: tuple, t: float) -> None:
+        r = self.reqs[rid]
+        H = self.params.hidden * 2
+        if e.role == "front":
+            if item[0] == "pf":
+                r.t_front_done = t
+                self.at(t + self.net.msg(e.node0, None, r.n_prompt * H) + self.params.lr_ms,
+                        self._identified, r)
+            else:
+                be = self.engines[r.back.name]
+                self.at(t + self.net.msg(e.node0, be.node0, H), self._arrive, be, rid, ("dec", item[1]))
+            return
+        # 后段：出一个 token
+        r.n_out += 1
+        t_cli = t + self.net.msg(e.node0, None, 8)
+        r.toks.append(t_cli)
+        if r.n_out == 1:
+            r.t_first = t_cli
+        if r.n_out >= r.n_gen:
+            self.at(t_cli, lambda tt, rr=r: self._finish(tt, rr))
+            return
+        fe = self.engines[r.front.name]
+        ctx = r.n_prompt + r.n_out - 1
+        self.at(t + self.net.msg(e.node0, fe.node0, 8), self._arrive, fe, rid, ("dec", ctx))
+
+
+def resident_experts(ch: Mapping) -> int | None:
+    """后段命令里的 p2p_layer_experts → 每层驻留专家数的均值。"""
+    for c in ch.get("commands") or []:
+        if " --hf-overrides " not in c["cmd"]:
+            continue
+        try:
+            ov = json.loads(shlex.split(c["cmd"].split(" --hf-overrides ", 1)[1])[0])
+        except (ValueError, IndexError):
+            continue
+        le = ov.get("p2p_layer_experts") or {}
+        sizes = [len(v) for v in le.values() if v]
+        if sizes:
+            return round(sum(sizes) / len(sizes))
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 回放、客户端、结果
+# --------------------------------------------------------------------------- #
+def replay_requests(real: Mapping, stages: Mapping, *, n: int | None = None) -> list[SimReq]:
+    """真机结果 → 同样顺序的请求（prompt 长度、生成长度、绑到的类都照真机）。"""
+    chans = {c["name"]: c for c in stages["channels"]}
+    rows = sorted(real.get("requests") or [], key=lambda r: _req_index(r.get("req")))
+    if not rows:
+        raise SystemExit("回放文件里没有 requests")
+    out = []
+    for i in range(n or len(rows)):
+        r = rows[i % len(rows)]
+        ch = chans.get(r.get("channel") or "")
+        task = (ch or {}).get("task") or r.get("task")
+        out.append(SimReq(rid=f"req{i}", case_id=r.get("case_id"), true_task=r.get("true_task"),
+                          task=task, n_prompt=int(r.get("n_prompt") or 1),
+                          n_gen=max(1, int(r.get("n_generated") or 1)),
+                          stop_reason=r.get("stop_reason") or "length"))
+    return out
+
+
+def _req_index(rid: Any) -> int:
+    m = re.search(r"(\d+)$", str(rid or ""))
+    return int(m.group(1)) if m else 0
+
+
+def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu, params: Params,
+            per_front: int = 0, inflight: int = 0, front_slots: int = 0, hold: bool = True,
+            front_pick: str = "least", steps=None, marks: Sequence[int] = DEFAULT_MARKS,
+            real: Mapping | None = None, label: str = "") -> dict:
+    nf = len(stages["fronts"])
+    if per_front:
+        inflight, front_slots = per_front * nf, per_front
+    inflight = inflight or len(stages["backs"])
+    sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params,
+              front_slots=front_slots or None, hold=hold, front_pick=front_pick, steps=steps)
+    queue = list(reqs)
+    nxt = iter(range(len(queue)))
+
+    def release(t: float) -> None:
+        i = next(nxt, None)
+        if i is not None:
+            sim.submit(queue[i], t)
+
+    sim.on_finish = lambda r, t: sim.at(t + params.client_ms, lambda tt: release(tt))
+    for _ in range(min(inflight, len(queue))):
+        release(0.0)
+    sim.run()
+    done = [r for r in queue if r.t_done is not None]
+    if len(done) < len(queue):
+        raise RuntimeError(f"模拟没跑完：{len(done)}/{len(queue)}（有请求卡住 —— 槽位 / 前段设置不一致？）")
+    return build_output(sim, queue, stages, inflight=inflight, per_front=per_front, marks=marks,
+                        real=real, label=label, front_slots=front_slots, hold=hold)
+
+
+def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[dict]:
+    rows = []
+    for r in reqs:
+        fe, be = sim.engines[r.front.name], sim.engines[r.back.name]
+        total = r.t_done - r.t_submit
+        ttft = r.t_first - r.t_submit
+        gaps = [b - a for a, b in zip(r.toks, r.toks[1:])]
+        mk = {}
+        for k in marks:
+            if len(r.toks) >= k:
+                t = r.toks[k - 1]
+                e, sf = t - r.t_submit, t - r.t_first
+                mk[str(k)] = {"n": k, "t_ms": round(e, 2), "since_first_ms": round(sf, 2),
+                              "tpot_ms": round(sf / (k - 1), 3) if k > 1 and sf else None,
+                              "tok_per_s": round(k / (e / 1e3), 3) if e > 0 else None,
+                              "decode_tok_per_s": round((k - 1) / (sf / 1e3), 3) if k > 1 and sf else None}
+        wait_back = (r.t_bound - r.t_wait) if r.t_wait is not None and r.t_bound is not None else 0.0
+        rows.append({
+            "req": r.rid, "prompt": None, "text": "", "stop_reason": r.stop_reason,
+            "true_task": r.true_task, "task": r.task,
+            "correct": (None if r.true_task is None else bool(r.task == r.true_task)),
+            "confidence": 0.0, "zone": "", "rebinds": 0, "alarms": 0,
+            "front": "+".join(fe.nodes), "back": "+".join(be.nodes), "front_engine": fe.name,
+            "tiered": {"front_prefill_ms": round((r.t_front_done or 0) - r.t_submit, 2),
+                       "bind_ms": None, "wait_back_ms": round(wait_back, 2)},
+            "wait_front_ms": round(wait_back, 2),
+            "channel": be.name, "n_prompt": r.n_prompt, "n_generated": r.n_out,
+            "total_ms": round(total, 2), "queue_ms": round(r.t_gw_wait, 2),
+            "queue_back_ms": round(r.queue_engine_ms.get("back", 0.0), 2),
+            "prefill_ms": round(ttft, 2), "decode_ms": round(total - ttft, 2),
+            "per_token_p50_ms": round(stt.median(gaps), 2) if gaps else 0.0,
+            "compute_ms": 0.0, "network_and_overhead_ms": 0.0, "traces_complete": False,
+            "utilisation": 0.0, "token_ms": [round(x, 2) for x in gaps], "marks": mk,
+            "t_submit_s": round(r.t_submit / 1e3, 3), "t_done_s": round(r.t_done / 1e3, 3),
+            **({"case_id": r.case_id} if r.case_id else {}),
+            "engine": None, "identify": None, "nodes": [], "missing_traces": [],
+        })
+    return rows
+
+
+def _stats_mod():
+    try:
+        from vllm.p2p import tiered_stats as ts
+    except ImportError:                                     # pragma: no cover
+        import tiered_stats as ts
+    return ts
+
+
+def run_metrics(rows: Sequence[Mapping], wall_s: float, inflight: int) -> dict:
+    """与 p2p-framework continuous.run_metrics 同口径（有就直接用它）。"""
+    try:
+        try:
+            from p2pmoe.deploy.continuous import run_metrics as rm
+        except ImportError:
+            from vllm.p2p.identifier import use_p2p_framework
+            use_p2p_framework(None)
+            from p2pmoe.deploy.continuous import run_metrics as rm
+        return rm(rows, wall_s, inflight=inflight)
+    except (ImportError, SystemExit):
+        pass
+    ts = _stats_mod()
+    out_tok = sum(int(r["n_generated"]) for r in rows)
+    in_tok = sum(int(r["n_prompt"]) for r in rows)
+    by = defaultdict(list)
+    for r in rows:
+        by[r.get("true_task") or "?"].append(r)
+    return {"n_requests": len(rows), "n_timeout": 0, "inflight": inflight, "wall_s": round(wall_s, 2),
+            "output_tokens": out_tok, "prompt_tokens": in_tok,
+            "throughput": {"output_tok_per_s": round(out_tok / wall_s, 3) if wall_s else None,
+                           "total_tok_per_s": round((out_tok + in_tok) / wall_s, 3) if wall_s else None,
+                           "req_per_min": round(len(rows) / wall_s * 60, 3) if wall_s else None},
+            "by_task": {u: {"n": len(rs)} for u, rs in by.items()},
+            "stop_reasons": {}, "accuracy": None,
+            "per_request_fallback": ts.request_stats(rows)}
+
+
+def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, label,
+                 front_slots, hold) -> dict:
+    ts = _stats_mod()
+    rows = build_rows(sim, reqs, marks)
+    t0 = min(r.t_submit for r in reqs)
+    t1 = max(r.t_done for r in reqs)
+    wall = (t1 - t0) / 1e3
+    out = {
+        "model": f"sim · {Path(str(stages.get('plan') or '')).name}",
+        "backend": "sim", "mode": "dynamic", "gateway_mode": "lr" if real else "oracle",
+        "label": label or "sim", "tokens": max(r.n_gen for r in reqs), "concurrency": inflight,
+        "channels": {n: {"nodes": e.nodes, "partition": e.layers} for n, e in sim.engines.items()
+                     if e.role == "back"},
+        "requests": rows, "failed": [],
+    }
+    run = run_metrics(rows, wall, inflight)
+    run.update(order="replay", max_tokens=out["tokens"], marks=list(marks), offline=False,
+               per_front=per_front or None)
+    run["front_peaks"] = {f.name: {"peak": f.peak, "served": f.n_served} for f in sim.co.fronts}
+    run["gateway_waits"] = {"front_slot": sim.co.n_front_wait, "back_hold": sim.co.n_held}
+    run["per_request"] = ts.request_stats(rows)
+    run["marks_stats"] = ts.mark_stats(rows)
+    run["segment_stats"] = ts.segment_stats(rows)
+    run["cumulative_stats"] = ts.cumulative_stats(rows)
+    out["run"] = run
+    out["sim"] = {
+        "params": sim.params.as_dict(),
+        "net": {"hop_ms": sim.net.hop_ms, "pp_hop_ms": sim.net.pp_hop_ms, "lat_same": sim.net.lat_same,
+                "lat_cross": sim.net.lat_cross, "lat_gw": sim.net.lat_gw, "gateway": sim.net.gateway},
+        "front_slots": front_slots or None, "hold": hold,
+        "engines": {n: {"role": e.role, "task": e.task, "nodes": e.nodes, "gpus": [g.gpu for g in e.gpus],
+                        "experts": e.experts, "steps": e.n_steps,
+                        "fixed_ms_b1": round(e.fixed_ms(512.0, 1), 4),
+                        "busy_frac": round(e.busy_ms / (t1 - t0), 4) if t1 > t0 else None,
+                        "batch_mean": round(e.batch_sum / e.n_steps, 3) if e.n_steps else None,
+                        "measured_steps": bool(e.steps)}
+                    for n, e in sim.engines.items()},
+    }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 比对与标定
+# --------------------------------------------------------------------------- #
+def _tpot(r: Mapping) -> float | None:
+    n = int(r.get("n_generated") or 0)
+    if n <= 1:
+        return None
+    return (float(r["total_ms"]) - float(r["prefill_ms"])) / (n - 1)
+
+
+def key_metrics(doc: Mapping) -> dict:
+    rows = doc.get("requests") or []
+    tp = [x for x in (_tpot(r) for r in rows) if x is not None]
+    tt = [float(r["prefill_ms"]) for r in rows]
+    out = {"TTFT 均值": stt.mean(tt) if tt else None, "TTFT p50": stt.median(tt) if tt else None,
+           "TPOT 均值": stt.mean(tp) if tp else None, "TPOT p50": stt.median(tp) if tp else None,
+           "TPOT p90": (sorted(tp)[int(0.9 * (len(tp) - 1))] if tp else None),
+           "输出 tok/s": ((doc.get("run") or {}).get("throughput") or {}).get("output_tok_per_s"),
+           "墙钟 s": (doc.get("run") or {}).get("wall_s")}
+    by = defaultdict(list)
+    for r in rows:
+        v = _tpot(r)
+        if v is not None:
+            by[r.get("channel") or "?"].append(v)
+    for ch, vs in sorted(by.items()):
+        out[f"TPOT 均值 {ch}"] = stt.mean(vs)
+    return out
+
+
+def compare(sim: Mapping, real: Mapping) -> tuple[list[str], float]:
+    """关键指标逐项比；返回 (表格行, 误差分 = 各项相对误差平方的均值，后段分项按条数加权)。"""
+    ks, kr = key_metrics(sim), key_metrics(real)
+    lines = [f"{'指标':<28}{'真机':>12}{'模拟':>12}{'相对误差':>10}"]
+    errs, ws = [], []
+    n_by = defaultdict(int)
+    for r in real.get("requests") or []:
+        n_by[r.get("channel") or "?"] += 1
+    for k in kr:
+        a, b = kr[k], ks.get(k)
+        if a is None or b is None:
+            continue
+        e = (b - a) / a if a else 0.0
+        lines.append(f"{k:<28}{a:>12.2f}{b:>12.2f}{100 * e:>9.1f}%")
+        if k in ("TTFT 均值", "TPOT 均值", "TPOT p90", "输出 tok/s"):
+            errs.append(e * e)
+            ws.append(2.0)
+        elif k.startswith("TPOT 均值 "):
+            errs.append(e * e)
+            ws.append(n_by.get(k[len("TPOT 均值 "):], 1) / max(len(real.get("requests") or [1]), 1) * 4)
+    score = sum(e * w for e, w in zip(errs, ws)) / sum(ws) if ws else math.inf
+    return lines, score
+
+
+def fit(make: Callable[[Params, float], dict], real: Mapping, params: Params, hop_ms: float, *,
+        rounds: int = 3, fixed: Sequence[str] = (), log: Callable[[str], None] = print
+        ) -> tuple[Params, float, float, dict]:
+    """坐标下降：依次调 front_fixed_ms / back_fixed_ms / hop_ms，每次在当前值的几档倍数里挑误差分最小的。"""
+    cur = {"front_fixed_ms": params.front_fixed_ms, "back_fixed_ms": params.back_fixed_ms, "hop_ms": hop_ms}
+    if cur["front_fixed_ms"] is None or cur["back_fixed_ms"] is None:
+        # None = 用 layer_bench 截距（各卡型不同）—— 标定从它在模拟里的平均取值出发
+        eng = make(params, hop_ms)["sim"]["engines"]
+        for k, role in (("front_fixed_ms", "front"), ("back_fixed_ms", "back")):
+            if cur[k] is None:
+                vs = [v["fixed_ms_b1"] for v in eng.values() if v["role"] == role]
+                cur[k] = round(sum(vs) / len(vs), 4) if vs else 1.0
+
+    def score_of(c) -> tuple[float, dict]:
+        p = Params(**{**params.as_dict(), "front_fixed_ms": c["front_fixed_ms"],
+                      "back_fixed_ms": c["back_fixed_ms"]})
+        doc = make(p, c["hop_ms"])
+        return compare(doc, real)[1], doc
+
+    best, best_doc = score_of(cur)
+    log(f"  起点 {cur} → 误差分 {best:.4f}")
+    for rd in range(rounds):
+        for k in ("front_fixed_ms", "back_fixed_ms", "hop_ms"):
+            if k in fixed:
+                continue
+            base = cur[k] if cur[k] > 0 else 0.5
+            for m in (0.0, 0.25, 0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0, 3.0):
+                c = dict(cur, **{k: round(base * m, 4)})
+                s, doc = score_of(c)
+                if s < best - 1e-9:
+                    best, best_doc, cur = s, doc, c
+            log(f"  第 {rd + 1} 轮 {k:<15} → {cur[k]:.3f}   误差分 {best:.4f}")
+    p = Params(**{**params.as_dict(), "front_fixed_ms": cur["front_fixed_ms"],
+                  "back_fixed_ms": cur["back_fixed_ms"]})
+    return p, cur["hop_ms"], best, best_doc
+
+
+# --------------------------------------------------------------------------- #
+# 命令行
+# --------------------------------------------------------------------------- #
+def _setup(a) -> tuple:
+    stages = json.loads(Path(a.stages).read_text(encoding="utf-8"))
+    if stages.get("kind") != "tiered":
+        raise SystemExit(f"{a.stages} 不是分段部署的 stages.json")
+    ip, gpu_h = load_hosts(a.hosts)
+    for c in stages["channels"]:
+        for x in c.get("commands") or []:
+            ip.setdefault(x["node"], x["host"])
+    lat, bw, gpu_t = load_topo(a.topo)
+    node_gpu = {**gpu_t, **gpu_h}
+    for kv in a.gpu or []:
+        k, v = kv.split("=", 1)
+        node_gpu[k] = gpu_key(v)
+    perf = load_perf(a.layer_bench)
+    net = Net(ip=ip, lat=lat, bw=bw, lat_same=a.lat_same, lat_cross=a.lat_cross, lat_gw=a.lat_gw,
+              gateway=a.gateway_node, hop_ms=a.hop_ms, pp_hop_ms=a.pp_hop_ms)
+    hidden = a.hidden
+    if a.model_dir and (Path(a.model_dir) / "config.json").exists():
+        hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
+    params = Params(front_fixed_ms=a.front_fixed_ms, back_fixed_ms=a.back_fixed_ms, lr_ms=a.lr_ms,
+                    client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden)
+    steps = None
+    if a.steps:
+        from vllm.p2p import steptrace
+        steps = {}
+        for name, rows in steptrace.load(a.steps).items():
+            s = steptrace.summarise(rows)
+            steps[name] = {int(b): v["p50"] for b, v in (s.get("decode_ms_by_batch") or {}).items()}
+    real = json.loads(Path(a.replay).read_text(encoding="utf-8"))
+    reqs_fn = lambda: replay_requests(real, stages, n=a.requests or None)   # noqa: E731
+    return stages, node_gpu, perf, net, params, steps, real, reqs_fn
+
+
+def _common(ap) -> None:
+    ap.add_argument("--stages", required=True, help="分段部署的 stages.json")
+    ap.add_argument("--replay", required=True,
+                    help="一次真机结果（bench 的 --out）：请求顺序、prompt / 生成长度、绑到哪类都照它")
+    ap.add_argument("--layer-bench", nargs="+", required=True,
+                    help="layer_bench 的 summary_by_gpu.json，或各台的单机结果（同卡型取均值）")
+    ap.add_argument("--hosts", default=None, help="hosts.txt（节点 IP；注释的第一个词当卡型）")
+    ap.add_argument("--topo", default=None, help="拓扑 JSON（edges 的单向时延 / 带宽、nodes 的 role 当卡型）")
+    ap.add_argument("--gpu", action="append", help="手动指定卡型：N13=RTX6000（可多次）")
+    ap.add_argument("--model-dir", default=None, help="读 config.json 的 hidden_size（默认 --hidden）")
+    ap.add_argument("--hidden", type=int, default=2048)
+    ap.add_argument("--per-front", type=int, default=0, help="每个前段始终 N 条（同 bench --per-front）")
+    ap.add_argument("--inflight", type=int, default=0, help="闭环总在途（不给 --per-front 时）")
+    ap.add_argument("--front-slots", type=int, default=0, help="同网关 --front-slots（--per-front 时自动）")
+    ap.add_argument("--no-hold", action="store_true", help="同网关 --no-hold")
+    ap.add_argument("--front-pick", choices=("least", "speed"), default="least")
+    ap.add_argument("--requests", type=int, default=0, help="请求数（默认 = 回放文件的条数，多了循环用）")
+    ap.add_argument("--front-fixed-ms", type=float, default=None,
+                    help="前段每步固定开销（默认 layer_bench 截距 × 0.5）")
+    ap.add_argument("--back-fixed-ms", type=float, default=None, help="后段每步固定开销（默认 layer_bench 截距）")
+    ap.add_argument("--hop-ms", type=float, default=2.0, help="每条前后段 / 网关消息的软件开销")
+    ap.add_argument("--pp-hop-ms", type=float, default=0.3, help="后段 PP 段间的固定开销")
+    ap.add_argument("--lat-same", type=float, default=0.1, help="同网段单向时延 ms（没 --topo 时）")
+    ap.add_argument("--lat-cross", type=float, default=3.15, help="跨网段单向时延 ms（没 --topo 时）")
+    ap.add_argument("--lat-gw", type=float, default=0.1, help="网关 ↔ 节点单向时延（没 --gateway-node 时）")
+    ap.add_argument("--gateway-node", default=None, help="网关在哪个节点（如 N09），网关消息按它算时延")
+    ap.add_argument("--lr-ms", type=float, default=2.0)
+    ap.add_argument("--client-ms", type=float, default=1.0)
+    ap.add_argument("--max-batched-tokens", type=int, default=8192)
+    ap.add_argument("--steps", nargs="*", default=None,
+                    help="steptrace 收回来的步级记录（<引擎名>.jsonl）：纯 decode 步用实测每步 p50")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--out", default=None)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    _common(sub.add_parser("run", help="跑一次模拟，写 bench 格式的结果"))
+    f = sub.add_parser("fit", help="拿 --replay 的真机结果标定 前段 / 后段每步固定开销、每跳开销")
+    _common(f)
+    f.add_argument("--rounds", type=int, default=3)
+    f.add_argument("--fix", default="", help="不调的参数（逗号分隔：front_fixed_ms,back_fixed_ms,hop_ms）")
+    c = sub.add_parser("compare", help="比两份结果的关键指标")
+    c.add_argument("--sim", required=True)
+    c.add_argument("--real", required=True)
+    a = ap.parse_args(argv)
+
+    if a.cmd == "compare":
+        lines, score = compare(json.loads(Path(a.sim).read_text(encoding="utf-8")),
+                               json.loads(Path(a.real).read_text(encoding="utf-8")))
+        print("\n".join(lines))
+        print(f"误差分（加权相对误差平方均值）：{score:.4f}")
+        return 0
+
+    stages, node_gpu, perf, net, params, steps, real, reqs_fn = _setup(a)
+
+    def make(p: Params, hop: float) -> dict:
+        net.hop_ms = hop
+        return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
+                       per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
+                       hold=not a.no_hold, front_pick=a.front_pick, steps=steps, real=real,
+                       label=a.label or f"sim {a.cmd}")
+
+    if a.cmd == "fit":
+        print("标定（坐标下降）：")
+        p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds,
+                                 fixed=[x.strip() for x in a.fix.split(",") if x.strip()])
+        print(f"结果：--front-fixed-ms {p.front_fixed_ms:g} --back-fixed-ms {p.back_fixed_ms:g} "
+              f"--hop-ms {hop:g}（误差分 {score:.4f}）")
+    else:
+        doc = make(params, a.hop_ms)
+    lines, score = compare(doc, real)
+    print("\n".join(lines))
+    print(f"误差分：{score:.4f}")
+    eng = doc["sim"]["engines"]
+    print("引擎（模拟）：" + "；".join(f"{n} 忙 {100 * (v['busy_frac'] or 0):.0f}% 批 {v['batch_mean']}"
+                                      for n, v in eng.items()))
+    if a.out:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"已写 {a.out}（python3 vllm/p2p/tiered_stats.py --b {a.out} --a {a.replay}）")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

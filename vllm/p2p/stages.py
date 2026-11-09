@@ -91,7 +91,8 @@ def agent_command(*, python: str, name: str, model_dir: str, role: str, layers: 
 def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                          front_max_num_seqs: int = 64, front_gpu_mem: float | None = None,
                          port: int = 8300, master_port: int = 29600,
-                         overrides_of=None, eager: bool = False, front_lr: bool = True) -> dict:
+                         overrides_of=None, eager: bool = False, front_lr: bool = True,
+                         step_trace: str | None = None) -> dict:
     """channels.json 的内容 → stages.json 的内容。`overrides_of(channel) -> dict` 读通道的
     hf_overrides（默认读 channel["overrides"] 指的文件）。"""
     l0, n_layers, model_dir = int(cj["l0"]), int(cj["n_layers"]), cj["model_dir"]
@@ -177,6 +178,13 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
         })
 
     fl = list(fronts.values())
+    if step_trace:
+        # 步级记录（vllm/p2p/steptrace.py）：每个引擎写 <目录>/<引擎名>.jsonl（rank 0 那台上）
+        for e in (*fl, *backs):
+            path = f"{step_trace.rstrip('/')}/{e['name']}.jsonl"
+            e["step_trace"] = path
+            for x in e["commands"]:
+                x["cmd"] = f"VLLM_P2P_STEP_TRACE={shlex.quote(path)} {x['cmd']}"
     return {"kind": "tiered", "plan": cj.get("plan"), "l0": l0, "n_layers": n_layers,
             "n_experts": cj.get("n_experts"), "model_dir": model_dir,
             "fronts": [f["name"] for f in fl], "backs": [b["name"] for b in backs],
@@ -196,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8300, help="代理的 HTTP 端口（ZMQ = 它 + 1）")
     ap.add_argument("--master-port", type=int, default=29600)
     ap.add_argument("--eager", action="store_true", help="所有分段引擎 --enforce-eager（排错用）")
+    ap.add_argument("--step-trace", default=None, metavar="DIR",
+                    help="开步级记录：每个分段引擎把每一步的开始时刻、用时、批大小写到 DIR/<引擎名>.jsonl"
+                         "（各引擎 rank 0 节点上；用 vllm/p2p/steptrace.py collect 收回来）")
     ap.add_argument("--no-front-lr", action="store_true",
                     help="前段不开识别统计（只能 oracle；默认开，lr / shadow 模式要它）")
     a = ap.parse_args(argv)
@@ -206,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         st = stages_from_channels(cj, only=only, front_max_num_seqs=a.front_max_num_seqs,
                                   front_gpu_mem=a.front_gpu_mem, port=a.port,
                                   master_port=a.master_port, eager=a.eager,
-                                  front_lr=not a.no_front_lr)
+                                  front_lr=not a.no_front_lr, step_trace=a.step_trace)
     except (ValueError, OSError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2

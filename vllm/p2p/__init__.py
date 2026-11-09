@@ -38,6 +38,10 @@
   协调器跑 LR 定 task、再绑该 task 最闲的后段，路径此后不变）。
 * `vllm/p2p/layer_bench.py` —— 各型 GPU 上「一层」的实测耗时（同一套 vLLM kernel、随机权重、
   两种层数相减），写进 p2p-framework 规划器的拓扑文件（节点的 `ms_per_layer`）。
+* `vllm/p2p/sim.py` —— 分段服务的离散事件模拟器（每个引擎每一步的粒度；挑前段 / 挑后段 / 等后段用的
+  是真网关同一套函数；回放真机结果，输出 bench 格式，`fit` 标定每步固定开销与每跳开销）。
+* `vllm/p2p/steptrace.py` —— 分段引擎的步级记录（`stages.py --step-trace DIR` 打开；collect / summary），
+  给模拟器当「一步多久」的真值。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）

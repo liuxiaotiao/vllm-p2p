@@ -203,6 +203,10 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
+        # P2P：步级记录（环境变量 VLLM_P2P_STEP_TRACE；不设 = None，零开销）
+        from vllm.p2p.steptrace import StepTrace
+        self._p2p_trace = StepTrace.from_env()
+
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
@@ -386,7 +390,13 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        tr = self._p2p_trace
+        if tr is not None:
+            tr_start = tr.now()                                  # 开始时刻含调度
         scheduler_output = self.scheduler.schedule()
+        if tr is not None:
+            tr_key = id(scheduler_output)
+            tr.begin(tr_key, scheduler_output, self.scheduler, start=tr_start)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -403,6 +413,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if tr is not None:
+            tr.end(tr_key)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -444,6 +456,8 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            if self._p2p_trace is not None:
+                self._p2p_trace.begin(id(scheduler_output), scheduler_output, self.scheduler)
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -505,6 +519,8 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self._p2p_trace is not None:
+            self._p2p_trace.end(id(scheduler_output))
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
