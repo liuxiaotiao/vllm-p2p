@@ -347,3 +347,27 @@ def test_back_pp_hop_and_score_modes(world) -> None:
     assert s_t > 0                                       # TPOT 的算法里用到了 prefill_ms（总时延 − 首 token）
     _, s_tt = S.compare(doc, {"requests": doc["requests"], "run": doc["run"]}, "ttft")
     assert s_tt == 0.0
+
+
+def test_batch_wait_merges_alternating_requests_on_one_back(world) -> None:
+    """同一后段上两条请求的输入错开到达：不等时一条一条算（批 1，交替）；凑批等待几毫秒后合成批 2，
+    两条的 TPOT 都下降（假表里批 2 只比批 1 贵 15%）。"""
+    real = {"requests": [{"req": f"req{i}", "true_task": "no_robots", "channel": "back-no_robots-0",
+                          "n_prompt": 64 + 40 * i, "n_generated": 200} for i in range(2)]}
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+
+    def run(wait):
+        d = S.run_sim(world["stages"], S.replay_requests(real, world["stages"]), perf=perf,
+                      net=S.Net(ip=ip, agent_hop_ms=1.0, lat_cross=1.25), node_gpu=gpu,
+                      params=S.Params(back_fixed_ms=3.0, batch_wait_ms=wait), per_front=1)
+        tp = [(r["total_ms"] - r["prefill_ms"]) / (r["n_generated"] - 1) for r in d["requests"]]
+        return d, sum(tp) / len(tp)
+
+    d0, tp0 = run(0.0)
+    d5, tp5 = run(15.0)
+    assert {r["channel"] for r in d0["requests"]} == {"back-no_robots-0"}
+    assert len({r["front_engine"] for r in d0["requests"]}) == 2          # 两个前段、同一个后段
+    b0, b5 = d0["sim"]["engines"]["back-no_robots-0"], d5["sim"]["engines"]["back-no_robots-0"]
+    assert b0["batch_mean"] < 1.05 and b5["batch_mean"] > 1.5 and b5["batch_waits"] > 0
+    assert tp5 < 0.85 * tp0

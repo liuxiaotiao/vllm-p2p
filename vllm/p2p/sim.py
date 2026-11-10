@@ -281,6 +281,10 @@ class Params:
     # pf_fixed_per：step = 每步一次；stage = 每个 PP 段一次；layer = 每层一次
     pf_fixed_ms: float = 0.0
     pf_fixed_per: str = "stage"
+    # 凑批等待（假设实验，真引擎还没有）：引擎空闲、手上的 decode 输入比「在它这儿跑的请求」少时，
+    # 最多再等这么久让其余请求的输入也到齐，再一起算一步。0 = 不等（= 现在的 vLLM）
+    batch_wait_ms: float = 0.0
+    batch_wait_role: str = "back"            # back / front / all
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -385,8 +389,31 @@ class SimEngine:
         if not self._in_done:            # 一步结束时逐条放回的，等全放完再开下一步
             self.kick(now)
 
+    def _should_wait(self, now: float) -> bool:
+        """凑批等待：只等「已经在这个引擎上跑、但这一步的输入还在路上」的请求；最多等 batch_wait_ms
+        （从手上最早的那个输入到达算起）。到点由一个定时事件再 kick 一次。"""
+        P = self.sim.params
+        if P.batch_wait_ms <= 0 or (P.batch_wait_role != "all" and P.batch_wait_role != self.role):
+            return False
+        if any(it[0] == "pf" for it in self.ready.values()):
+            return False
+        missing = [r for r in self.admitted if r not in self.ready]
+        if not missing:
+            return False
+        first = min(self.t_ready.get(r, now) for r in self.ready)
+        deadline = first + P.batch_wait_ms
+        if now + 1e-9 >= deadline:
+            return False
+        if getattr(self, "_wake_at", None) != deadline:
+            self._wake_at = deadline
+            self.sim.at(deadline, lambda t: self.kick(t))
+        return True
+
     def kick(self, now: float) -> None:
         if self.busy or not self.ready:
+            return
+        if self._should_wait(now):
+            self.n_waits = getattr(self, "n_waits", 0) + 1
             return
         dec, pf = [], []
         tok = 0
@@ -434,10 +461,12 @@ class SimEngine:
             self._in_done = False
         self.kick(now)
 
-    def release(self, rid: str) -> None:
+    def release(self, rid: str, now: float | None = None) -> None:
         self.admitted.discard(rid)
         self.ready.pop(rid, None)
         self.t_ready.pop(rid, None)
+        if now is not None:              # 可能有人在凑批等它：它走了就不必再等
+            self.kick(now)
 
 
 # --------------------------------------------------------------------------- #
@@ -568,13 +597,13 @@ class Sim:
         r.t_done = t
         if self.full:
             r.back.inflight -= 1
-            self.engines[r.back.name].release(r.rid)
+            self.engines[r.back.name].release(r.rid, t)
             self.on_finish(r, t)
             return
         r.back.inflight -= 1
         r.front.inflight -= 1
-        self.engines[r.front.name].release(r.rid)
-        self.engines[r.back.name].release(r.rid)
+        self.engines[r.front.name].release(r.rid, t)
+        self.engines[r.back.name].release(r.rid, t)
         for w, b in self.co.drain_plan():
             self._send_prompt(w, b, t)
         while self.gw_queue and self.co._front_has_room():
@@ -807,6 +836,7 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
                         "fixed_ms_b1": round(e.fixed_ms(512.0, 1), 4),
                         "busy_frac": round(e.busy_ms / (t1 - t0), 4) if t1 > t0 else None,
                         "batch_mean": round(e.batch_sum / e.n_steps, 3) if e.n_steps else None,
+                        "batch_waits": getattr(e, "n_waits", 0),
                         "measured_steps": {k: bool(v) for k, v in e.steps.items()}}
                     for n, e in sim.engines.items()},
     }
@@ -938,7 +968,8 @@ def _setup(a) -> tuple:
         hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
     params = Params(front_fixed_ms=a.front_fixed_ms, back_fixed_ms=a.back_fixed_ms, lr_ms=a.lr_ms,
                     client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden,
-                    pp_simple=a.pp_simple, pf_fixed_ms=a.pf_fixed_ms, pf_fixed_per=a.pf_fixed_per)
+                    pp_simple=a.pp_simple, pf_fixed_ms=a.pf_fixed_ms, pf_fixed_per=a.pf_fixed_per,
+                    batch_wait_ms=a.batch_wait_ms, batch_wait_role=a.batch_wait_role)
     steps = None
     if a.steps:
         from vllm.p2p import steptrace
@@ -983,6 +1014,10 @@ def _common(ap) -> None:
                     help="多机 PP 每次传输（段间 hidden、调度下发、结果回传）的固定开销")
     ap.add_argument("--back-pp-hop-ms", type=float, default=None,
                     help="分段部署后段（stage_agent 驱动）的 PP 每次传输开销；默认同 --pp-hop-ms")
+    ap.add_argument("--batch-wait-ms", type=float, default=0.0,
+                    help="假设实验：引擎空闲时最多再等这么久，让同一引擎上其余请求的输入到齐后一起算一步"
+                         "（O3 的凑批窗口；真 vLLM 还没有，默认 0 = 不等）")
+    ap.add_argument("--batch-wait-role", choices=("back", "front", "all"), default="back")
     ap.add_argument("--pf-fixed-ms", type=float, default=0.0,
                     help="含 prefill 的步额外的固定开销（layer_bench 的逐层斜率量不到的那部分）")
     ap.add_argument("--pf-fixed-per", choices=("step", "stage", "layer"), default="stage",
