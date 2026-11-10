@@ -185,8 +185,30 @@ def summarise(rows: Sequence[Mapping], *, t0: float | None = None, t1: float | N
         "prefill_steps": len(pf),
         "prefill_ms_per_token": (round(sum(r["ms"] for r in pf) / max(sum(r["pf"] for r in pf), 1), 4)
                                  if pf else None),
+        "prefill_fit": prefill_fit(pf),
         "ctx_mean": round(st.mean(r.get("ctx", 0.0) for r in rs), 1),
     }
+
+
+def prefill_fit(pf: Sequence[Mapping]) -> dict | None:
+    """只有 prefill 的步：每步用时 ≈ a + b × prefill token 数（最小二乘）。先去掉冷启动：
+    每 token 用时超过中位数 3 倍的步不算（引擎刚起来时前几次 prefill 慢好几倍）。"""
+    pts = [(float(r["pf"]), float(r["ms"])) for r in pf if not (r.get("n", 0) - r.get("npf", 0)) and r["pf"] > 0]
+    if not pts:
+        return None
+    per = sorted(ms / n for n, ms in pts)
+    med = per[len(per) // 2]
+    keep = [(n, ms) for n, ms in pts if ms / n <= 3 * med]
+    out = {"n": len(keep), "dropped": len(pts) - len(keep), "ms_per_token_p50": round(med, 4)}
+    if len(keep) >= 3 and len({n for n, _ in keep}) >= 2:
+        mx = sum(n for n, _ in keep) / len(keep)
+        my = sum(ms for _, ms in keep) / len(keep)
+        sxx = sum((n - mx) ** 2 for n, _ in keep)
+        b = sum((n - mx) * (ms - my) for n, ms in keep) / sxx
+        a = my - b * mx
+        if b > 0 and a >= 0:
+            out.update(a_ms=round(a, 3), b_ms_per_token=round(b, 4))
+    return out
 
 
 def cmd_collect(a) -> int:
@@ -220,6 +242,11 @@ def cmd_summary(a) -> int:
               f"平均批 {s['batch_mean']:.2f}，平均上下文 {s['ctx_mean']:.0f}；prefill {s['prefill_steps']} 步"
               + (f"（{s['prefill_ms_per_token']:.3f} ms/token）" if s["prefill_ms_per_token"] else ""))
         print(f"    纯 decode 每步 p50：{dec}")
+        pfit = s.get("prefill_fit")
+        if pfit:
+            lin = (f"{pfit['a_ms']:.1f} ms + {pfit['b_ms_per_token']:.3f} ms × token" if "a_ms" in pfit
+                   else f"{pfit['ms_per_token_p50']:.3f} ms/token（中位数）")
+            print(f"    prefill 步：{lin}（{pfit['n']} 步；去掉冷启动 {pfit['dropped']} 步）")
     if a.json:
         Path(a.json).write_text(json.dumps({k: summarise(v, t0=a.t0, t1=a.t1) for k, v in data.items()},
                                            ensure_ascii=False, indent=2), encoding="utf-8")

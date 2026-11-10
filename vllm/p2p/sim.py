@@ -290,7 +290,8 @@ class SimEngine:
             self.gpus.append(perf[g])
         self.experts = int(experts)
         self.sim = sim
-        self.steps = steps or {}                 # 实测：{批大小: 每步毫秒}（纯 decode 步）
+        # 实测（steptrace）：{"dec": {批大小: 每步毫秒}, "pf": {a_ms, b_ms_per_token | ms_per_token_p50}}
+        self.steps = steps or {}
         self.ready: dict[str, tuple] = {}        # rid → ("pf", n) | ("dec", ctx)
         self.admitted: set[str] = set()
         self.busy = False
@@ -326,8 +327,15 @@ class SimEngine:
         `Params.pp_simple` = v1 的算法（各段串行相加，只算往下传的那几跳）。"""
         b = len(dec_ctx)
         ctx = (sum(dec_ctx) / b) if b else 0.0
-        if b and not pf_tokens and b in self.steps:
-            return float(self.steps[b])
+        dec_meas = self.steps.get("dec") or {}
+        if b and not pf_tokens and b in dec_meas:
+            return float(dec_meas[b])
+        pfm = self.steps.get("pf")
+        if pf_tokens and not b and pfm:                   # 只有 prefill 的步：用实测的线性拟合
+            n = sum(pf_tokens)
+            if "a_ms" in pfm:
+                return float(pfm["a_ms"]) + float(pfm["b_ms_per_token"]) * n
+            return float(pfm["ms_per_token_p50"]) * n
         fixed = self.fixed_ms(ctx, max(b, 1))
         net = self.sim.net
         tok = b + sum(pf_tokens)
@@ -777,7 +785,7 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
                         "fixed_ms_b1": round(e.fixed_ms(512.0, 1), 4),
                         "busy_frac": round(e.busy_ms / (t1 - t0), 4) if t1 > t0 else None,
                         "batch_mean": round(e.batch_sum / e.n_steps, 3) if e.n_steps else None,
-                        "measured_steps": bool(e.steps)}
+                        "measured_steps": {k: bool(v) for k, v in e.steps.items()}}
                     for n, e in sim.engines.items()},
     }
     return out
@@ -826,7 +834,8 @@ def compare(sim: Mapping, real: Mapping) -> tuple[list[str], float]:
             continue
         e = (b - a) / a if a else 0.0
         lines.append(f"{k:<28}{a:>12.2f}{b:>12.2f}{100 * e:>9.1f}%")
-        if k in ("TTFT 均值", "TPOT 均值", "TPOT p90", "输出 tok/s"):
+        # TTFT 用中位数打分：均值会被引擎刚起来时那几条（几秒）拉偏
+        if k in ("TTFT p50", "TPOT 均值", "TPOT p90", "输出 tok/s"):
             errs.append(e * e)
             ws.append(2.0)
         elif k.startswith("TPOT 均值 "):
@@ -850,7 +859,8 @@ def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float,
         eng = make(params, hop_ms)["sim"]["engines"]
         for k, role in (("front_fixed_ms", "front"), ("back_fixed_ms", "back")):
             if cur[k] is None:
-                vs = [v["fixed_ms_b1"] for v in eng.values() if v["role"] == role]
+                vs = [v["fixed_ms_b1"] for v in eng.values()
+                      if v["role"] == role or (role == "back" and v["role"] == "full")]
                 cur[k] = round(sum(vs) / len(vs), 4) if vs else 1.0
 
     def score_of(c) -> tuple[float, dict]:
@@ -909,7 +919,8 @@ def _setup(a) -> tuple:
         steps = {}
         for name, rows in steptrace.load(a.steps).items():
             s = steptrace.summarise(rows)
-            steps[name] = {int(b): v["p50"] for b, v in (s.get("decode_ms_by_batch") or {}).items()}
+            steps[name] = {"dec": {int(b): v["p50"] for b, v in (s.get("decode_ms_by_batch") or {}).items()},
+                           "pf": s.get("prefill_fit")}
     real = json.loads(Path(a.replay).read_text(encoding="utf-8"))
     reqs_fn = lambda: replay_requests(real, stages, n=a.requests or None)   # noqa: E731
     return stages, node_gpu, perf, net, params, steps, real, reqs_fn

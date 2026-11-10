@@ -275,3 +275,23 @@ def test_layout_step_trace_for_full_channels(tmp_path) -> None:
         assert "VLLM_P2P_STEP_TRACE" in (out / f"{c['name']}.sh").read_text()
     from vllm.p2p import launch
     assert launch.venv_of(cj["channels"][0]["commands"][0]["cmd"]) == "/venv"
+
+
+def test_prefill_fit_drops_cold_start_and_sim_uses_measured_steps(world) -> None:
+    rows = [{"t": i, "ms": 20 + 2.0 * n, "n": 1, "tok": n, "pf": n, "npf": 1} for i, n in
+            enumerate((50, 80, 120, 200, 300))]
+    rows.append({"t": 9, "ms": 4000.0, "n": 1, "tok": 60, "pf": 60, "npf": 1})        # 冷启动
+    rows += [{"t": 10 + i, "ms": 55.0, "n": 1, "tok": 1, "pf": 0, "npf": 0} for i in range(5)]
+    s = T.summarise(rows)
+    pf = s["prefill_fit"]
+    assert pf["dropped"] == 1 and pf["a_ms"] == pytest.approx(20, abs=1e-6)
+    assert pf["b_ms_per_token"] == pytest.approx(2.0, abs=1e-6)
+    assert s["decode_ms_by_batch"]["1"]["p50"] == 55.0
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    sim = S.Sim(world["stages"], perf=perf, net=S.Net(ip=ip), node_gpu=gpu, params=S.Params(),
+                front_slots=None, hold=True,
+                steps={"back-gsm8k-0": {"dec": {1: 55.0}, "pf": pf}})
+    e = sim.engines["back-gsm8k-0"]
+    assert e.step_ms([300.0], []) == 55.0 and e.step_ms([], [100]) == pytest.approx(220.0)
+    assert e.step_ms([300.0, 310.0], []) != 55.0          # 没量过的批大小：回到模型
