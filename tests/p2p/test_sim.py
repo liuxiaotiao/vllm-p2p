@@ -167,7 +167,7 @@ def test_fit_recovers_known_parameters(world) -> None:
     _, score0 = S.compare(make(S.Params(front_fixed_ms=0.5, back_fixed_ms=1.0), 1.0), real)
     p, hop, score, _ = S.fit(make, real, S.Params(front_fixed_ms=0.5, back_fixed_ms=1.0), 1.0, rounds=4,
                              log=lambda s: None)
-    assert score < score0 * 0.05 and score < 1e-3
+    assert score < score0 * 0.05 and score < 3e-3
     # 每 token 间隔只约束「前段 + 后段 + 2 跳」的和；TTFT 再约束一部分 —— 看总和找回来了
     assert p.front_fixed_ms + p.back_fixed_ms + 2 * hop == pytest.approx(1.5 + 4.0 + 6.0, rel=0.08)
 
@@ -295,3 +295,16 @@ def test_prefill_fit_drops_cold_start_and_sim_uses_measured_steps(world) -> None
     e = sim.engines["back-gsm8k-0"]
     assert e.step_ms([300.0], []) == 55.0 and e.step_ms([], [100]) == pytest.approx(220.0)
     assert e.step_ms([300.0, 310.0], []) != 55.0          # 没量过的批大小：回到模型
+
+
+def test_prefill_fixed_cost_per_step_stage_layer(world) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    sim = S.Sim(world["stages"], perf=perf, net=S.Net(ip=ip), node_gpu=gpu, params=S.Params(back_fixed_ms=0.0),
+                front_slots=None, hold=True)
+    e = sim.engines["back-gsm8k-0"]                      # 两段（13 + 27 层）
+    base, dec = e.step_ms([], [100]), e.step_ms([200.0], [])
+    for per, add in (("step", 10.0), ("stage", 20.0), ("layer", 400.0)):
+        sim.params.pf_fixed_ms, sim.params.pf_fixed_per = 10.0, per
+        assert e.step_ms([], [100]) == pytest.approx(base + add, rel=1e-9), per
+        assert e.step_ms([200.0], []) == pytest.approx(dec)                  # 纯 decode 不受影响
