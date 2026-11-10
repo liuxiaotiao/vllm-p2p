@@ -365,7 +365,7 @@ def test_batch_wait_merges_alternating_requests_on_one_back(world) -> None:
         return d, sum(tp) / len(tp)
 
     d0, tp0 = run(0.0)
-    d5, tp5 = run(15.0)
+    d5, tp5 = run(8.0)
     assert {r["channel"] for r in d0["requests"]} == {"back-no_robots-0"}
     assert len({r["front_engine"] for r in d0["requests"]}) == 2          # 两个前段、同一个后段
     b0, b5 = d0["sim"]["engines"]["back-no_robots-0"], d5["sim"]["engines"]["back-no_robots-0"]

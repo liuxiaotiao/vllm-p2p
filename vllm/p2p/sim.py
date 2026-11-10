@@ -391,7 +391,7 @@ class SimEngine:
 
     def _should_wait(self, now: float) -> bool:
         """凑批等待：只等「已经在这个引擎上跑、但这一步的输入还在路上」的请求；最多等 batch_wait_ms
-        （从手上最早的那个输入到达算起）。到点由一个定时事件再 kick 一次。"""
+        （从引擎能开算的时刻算起）。到点由一个定时事件再 kick 一次。"""
         P = self.sim.params
         if P.batch_wait_ms <= 0 or (P.batch_wait_role != "all" and P.batch_wait_role != self.role):
             return False
@@ -400,8 +400,10 @@ class SimEngine:
         missing = [r for r in self.admitted if r not in self.ready]
         if not missing:
             return False
+        # 从「引擎能开算」的时刻算起：手上最早的输入到达、上一步结束，两者取晚的。两条请求交替时，
+        # 后到的那条的输入早在上一步算的时候就到了 —— 从它到达算起，窗口在上一步里就过完了，永远合不上
         first = min(self.t_ready.get(r, now) for r in self.ready)
-        deadline = first + P.batch_wait_ms
+        deadline = max(first, self.t_last_end) + P.batch_wait_ms
         if now + 1e-9 >= deadline:
             return False
         if getattr(self, "_wake_at", None) != deadline:
