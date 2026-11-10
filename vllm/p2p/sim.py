@@ -192,7 +192,8 @@ class Net:
     bw_default: float = 10000.0
     lat_gw: float = 0.1                    # 网关 ↔ 节点（没给 --gateway-node 时）
     gateway: str | None = None
-    hop_ms: float = 2.0                    # 每条前后段 / 网关消息的软件开销（代理、ZMQ、进程间转发）
+    hop_ms: float = 2.0                    # 网关 HTTP 那条路的每跳开销（整条流水线：gateway.py → vLLM API 服务器）
+    agent_hop_ms: float = 2.0              # 分段部署：协调器 ↔ 代理、前段 ↔ 后段直连（ZMQ + 代理 + EngineCore）每跳开销
     pp_hop_ms: float = 0.3                 # 后段 PP 段间（vLLM 内部 NCCL）的固定开销
 
     def one_way(self, a: str | None, b: str | None) -> float:
@@ -212,11 +213,12 @@ class Net:
         bw = self.bw.get((a, b)) or self.bw.get((b, a)) or self.bw_default
         return nbytes * 8 / (bw * 1e3)                      # Mbps → bit/ms = bw×1e3
 
-    def msg(self, a: str | None, b: str | None, nbytes: float = 0.0) -> float:
-        """一条前后段 / 网关消息：单向 + 传输 + 软件开销。a/b 为 None = 网关。"""
+    def msg(self, a: str | None, b: str | None, nbytes: float = 0.0, kind: str = "gw") -> float:
+        """一条消息：单向 + 传输 + 软件开销。a/b 为 None = 网关。kind="gw" 走 HTTP 网关那条路
+        （hop_ms），"agent" 走分段部署的代理（agent_hop_ms）—— 两条路的软件栈不同，开销分开标定。"""
         a = self.gateway if a is None else a
         b = self.gateway if b is None else b
-        return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.hop_ms
+        return self.one_way(a, b) + self.xfer(a, b, nbytes) + (self.agent_hop_ms if kind == "agent" else self.hop_ms)
 
     def pp(self, a: str, b: str, nbytes: float) -> float:
         return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.pp_hop_ms
@@ -473,6 +475,7 @@ class Sim:
         self.gw_queue: list[SimReq] = []
         self.on_finish: Callable[[SimReq, float], None] = lambda r, t: None
         self.full = stages.get("kind") != "tiered"
+        self.kind = "gw" if self.full else "agent"
         if self.full:
             # 整条流水线（A）：每条通道一个引擎；挑通道用 gateway.Router（与真网关同一份）
             from vllm.p2p.gateway import ChannelInfo, Router
@@ -522,7 +525,7 @@ class Sim:
             ch.served += 1
             r.back = ch
             e = self.engines[ch.name]
-            self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4), self._arrive, e, r.rid, ("pf", r.n_prompt))
+            self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4, kind=self.kind), self._arrive, e, r.rid, ("pf", r.n_prompt))
             return
         if self.co.front_slots and not self.co._front_has_room():
             self.co.n_front_wait += 1
@@ -535,7 +538,7 @@ class Sim:
         r.front = f
         r.t_gw_wait = t - r.t_submit
         e = self.engines[f.name]
-        self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4), self._arrive, e, r.rid, ("pf", r.n_prompt))
+        self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4, kind=self.kind), self._arrive, e, r.rid, ("pf", r.n_prompt))
 
     def _arrive(self, t: float, e: SimEngine, rid: str, item: tuple) -> None:
         if rid in self.reqs and self.reqs[rid].t_done is None:
@@ -549,7 +552,7 @@ class Sim:
 
     def _send_prompt(self, r: SimReq, b, t: float) -> None:
         e = self.engines[b.name]
-        self.at(t + self.net.msg(None, e.node0, r.n_prompt * self.params.hidden * 2),
+        self.at(t + self.net.msg(None, e.node0, r.n_prompt * self.params.hidden * 2, kind=self.kind),
                 self._arrive, e, r.rid, ("pf", r.n_prompt))
 
     def _finish(self, t: float, r: SimReq) -> None:
@@ -576,15 +579,15 @@ class Sim:
         if e.role == "front":
             if item[0] == "pf":
                 r.t_front_done = t
-                self.at(t + self.net.msg(e.node0, None, r.n_prompt * H) + self.params.lr_ms,
+                self.at(t + self.net.msg(e.node0, None, r.n_prompt * H, kind=self.kind) + self.params.lr_ms,
                         self._identified, r)
             else:
                 be = self.engines[r.back.name]
-                self.at(t + self.net.msg(e.node0, be.node0, H), self._arrive, be, rid, ("dec", item[1]))
+                self.at(t + self.net.msg(e.node0, be.node0, H, kind=self.kind), self._arrive, be, rid, ("dec", item[1]))
             return
         # 后段 / 整条流水线：出一个 token
         r.n_out += 1
-        t_cli = t + self.net.msg(e.node0, None, 8)
+        t_cli = t + self.net.msg(e.node0, None, 8, kind=self.kind)
         r.toks.append(t_cli)
         if r.n_out == 1:
             r.t_first = t_cli
@@ -596,7 +599,7 @@ class Sim:
             return
         fe = self.engines[r.front.name]
         ctx = r.n_prompt + r.n_out - 1
-        self.at(t + self.net.msg(e.node0, fe.node0, 8), self._arrive, fe, rid, ("dec", ctx))
+        self.at(t + self.net.msg(e.node0, fe.node0, 8, kind=self.kind), self._arrive, fe, rid, ("dec", ctx))
 
 
 def resident_experts(ch: Mapping) -> int | None:
@@ -786,7 +789,7 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
     out["run"] = run
     out["sim"] = {
         "params": sim.params.as_dict(),
-        "net": {"hop_ms": sim.net.hop_ms, "pp_hop_ms": sim.net.pp_hop_ms, "lat_same": sim.net.lat_same,
+        "net": {"hop_ms": sim.net.hop_ms, "agent_hop_ms": sim.net.agent_hop_ms, "pp_hop_ms": sim.net.pp_hop_ms, "lat_same": sim.net.lat_same,
                 "lat_cross": sim.net.lat_cross, "lat_gw": sim.net.lat_gw, "gateway": sim.net.gateway},
         "front_slots": front_slots or None, "hold": hold,
         "engines": {n: {"role": e.role, "task": e.task, "nodes": e.nodes, "gpus": [g.gpu for g in e.gpus],
@@ -915,7 +918,7 @@ def _setup(a) -> tuple:
         node_gpu[k] = gpu_key(v)
     perf = load_perf(a.layer_bench)
     net = Net(ip=ip, lat=lat, bw=bw, lat_same=a.lat_same, lat_cross=a.lat_cross, lat_gw=a.lat_gw,
-              gateway=a.gateway_node, hop_ms=a.hop_ms, pp_hop_ms=a.pp_hop_ms)
+              gateway=a.gateway_node, hop_ms=a.hop_ms, agent_hop_ms=a.agent_hop_ms, pp_hop_ms=a.pp_hop_ms)
     hidden = a.hidden
     if a.model_dir and (Path(a.model_dir) / "config.json").exists():
         hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
@@ -958,7 +961,10 @@ def _common(ap) -> None:
     ap.add_argument("--front-fixed-ms", type=float, default=None,
                     help="前段每步固定开销（默认 layer_bench 截距 × 0.5）")
     ap.add_argument("--back-fixed-ms", type=float, default=None, help="后段每步固定开销（默认 layer_bench 截距）")
-    ap.add_argument("--hop-ms", type=float, default=2.0, help="每条前后段 / 网关消息的软件开销")
+    ap.add_argument("--hop-ms", type=float, default=2.0,
+                    help="整条流水线（A）：网关 HTTP 那条路（gateway.py → vLLM API 服务器）每跳的软件开销")
+    ap.add_argument("--agent-hop-ms", type=float, default=2.0,
+                    help="分段部署：协调器 ↔ 代理、前段 ↔ 后段直连每跳的软件开销（O1 实测每 token 来回约 4 ms）")
     ap.add_argument("--pp-hop-ms", type=float, default=0.3,
                     help="多机 PP 每次传输（段间 hidden、调度下发、结果回传）的固定开销")
     ap.add_argument("--pf-fixed-ms", type=float, default=0.0,
@@ -987,6 +993,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     f = sub.add_parser("fit", help="拿 --replay 的真机结果标定 前段 / 后段每步固定开销、每跳开销")
     _common(f)
     f.add_argument("--rounds", type=int, default=3)
+    f.add_argument("--fit-agent", action="store_true",
+                   help="也标定 --agent-hop-ms（分段部署代理那条路每跳的开销）")
     f.add_argument("--fit-pf", action="store_true",
                    help="也标定 --pf-fixed-ms（含 prefill 的步的固定开销；按 --pf-fixed-per 计）。"
                         "不要和 --steps 一起用（那时 prefill 步用的是实测值）")
@@ -1009,8 +1017,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     stages, node_gpu, perf, net, params, steps, real, reqs_fn = _setup(a)
 
     def make(p: Params, hop: float, pp_hop_ms: float | None = None,
-             pf_fixed_ms: float | None = None) -> dict:
+             pf_fixed_ms: float | None = None, agent_hop_ms: float | None = None) -> dict:
         net.hop_ms = hop
+        if agent_hop_ms is not None:
+            net.agent_hop_ms = agent_hop_ms
         if pp_hop_ms is not None:
             net.pp_hop_ms = pp_hop_ms
         if pf_fixed_ms is not None:
@@ -1030,6 +1040,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             extra["pp_hop_ms"] = a.pp_hop_ms
         if a.fit_pf:
             extra["pf_fixed_ms"] = a.pf_fixed_ms or 10.0
+        if a.fit_agent:
+            extra["agent_hop_ms"] = a.agent_hop_ms
         p, hop, score, doc = fit(make, real, params, a.hop_ms, rounds=a.rounds, fixed=fixed,
                                  extra=extra or None)
         fp = doc["sim"]["fit"]["params"]

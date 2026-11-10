@@ -85,7 +85,8 @@ def fake_real(st, n=12, gen=(40, 70, 25)) -> dict:
 def setup(world, real, **kw):
     perf = S.load_perf([world["lb"]])
     ip, gpu = S.load_hosts(HOSTS)
-    net = S.Net(ip=ip, hop_ms=kw.pop("hop_ms", 2.0), lat_same=0.1, lat_cross=3.0, lat_gw=0.1)
+    h = kw.pop("hop_ms", 2.0)
+    net = S.Net(ip=ip, hop_ms=h, agent_hop_ms=h, lat_same=0.1, lat_cross=3.0, lat_gw=0.1)
     params = S.Params(**{k: kw.pop(k) for k in list(kw) if k in S.Params().__dict__})
     reqs = S.replay_requests(real, world["stages"])
     return S.run_sim(world["stages"], reqs, perf=perf, net=net, node_gpu=gpu, params=params, real=real, **kw)
@@ -160,7 +161,7 @@ def test_fit_recovers_known_parameters(world) -> None:
     net = S.Net(ip=ip, hop_ms=1.0, lat_same=0.1, lat_cross=3.0, lat_gw=0.1)
 
     def make(p, hop):
-        net.hop_ms = hop
+        net.hop_ms = net.agent_hop_ms = hop        # 分段部署走代理那条路
         return S.run_sim(world["stages"], S.replay_requests(real, world["stages"]), perf=perf, net=net,
                          node_gpu=gpu, params=p, per_front=1, real=real)
 
@@ -308,3 +309,20 @@ def test_prefill_fixed_cost_per_step_stage_layer(world) -> None:
         sim.params.pf_fixed_ms, sim.params.pf_fixed_per = 10.0, per
         assert e.step_ms([], [100]) == pytest.approx(base + add, rel=1e-9), per
         assert e.step_ms([200.0], []) == pytest.approx(dec)                  # 纯 decode 不受影响
+
+
+def test_agent_hop_is_separate_from_gateway_hop(world) -> None:
+    """分段部署的每 token 间隔只随 agent_hop_ms 变（前→后、后→前两跳），不随网关 HTTP 的 hop_ms 变。"""
+    real = {"requests": [{"req": "req0", "true_task": "gsm8k", "channel": "back-gsm8k-0", "n_prompt": 64,
+                          "n_generated": 4}]}
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+
+    def gap(hop, agent):
+        net = S.Net(ip=ip, hop_ms=hop, agent_hop_ms=agent)
+        d = S.run_sim(world["stages"], S.replay_requests(real, world["stages"]), perf=perf, net=net,
+                      node_gpu=gpu, params=S.Params(), inflight=1)
+        return d["requests"][0]["token_ms"][0]
+
+    assert gap(2.0, 2.0) == pytest.approx(gap(20.0, 2.0))
+    assert gap(2.0, 5.0) - gap(2.0, 2.0) == pytest.approx(6.0, rel=1e-6)
