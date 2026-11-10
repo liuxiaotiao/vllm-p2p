@@ -12,7 +12,8 @@
 
 与 A 的网关（gateway.py）对外同一套接口，`bench.py` / `deploy_15.sh report` / `compare.py` 不用改：
 `POST /v1/completions`（流式 SSE 或一次返回）、`GET /p2p/channels`、`GET /p2p/records`、
-`POST /p2p/reset`、`GET /health`。不同的是请求的路径：
+`POST /p2p/reset`、`GET /health`；另有 `POST /p2p/batch_wait`（{"ms": W, "backs": [...]}，运行时改
+后段的凑批等待窗口，0 = 关）。不同的是请求的路径：
 
     进来 → 挑一个前段（任何 task 都行）→ 前段 prefill（顺带数前 L₀ 层的逐层路由）→ 定 task →
     在这个 task 的后段里挑在飞最少的绑定 → 之后每个 token 在前段与后段之间来回（见 tiered.py），
@@ -348,7 +349,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
             "tasks": sorted({b["task"] for b in st["backs"] if b["task"]}),
             # bench 把这些当「通道」：名字要能在 stages.json 里查到 task / 节点
             "channels": [{"name": b["name"], "task": b["task"], "inflight": b["inflight"],
-                          "served": b["bound"], "peak": b.get("peak")} for b in st["backs"]],
+                          "served": b["bound"], "peak": b.get("peak"),
+                          "batch_wait_ms": b.get("batch_wait_ms", 0.0)} for b in st["backs"]],
             "fronts": st["fronts"], "hold": co.hold, "front_slots": co.front_slots,
             "n_held": st.get("n_held", 0), "n_front_wait": st.get("n_front_wait", 0),
             "waiting": len(st.get("waiting") or [])})
@@ -361,11 +363,22 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
         co.reset_counters()
         return web.json_response({"ok": True})
 
+    async def batch_wait(request: web.Request):
+        try:
+            body = await request.json()
+            ms = float(body["ms"])
+            names = body.get("backs") or None
+            done = await co.set_batch_wait(ms, names)
+        except (ValueError, KeyError, TypeError) as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        return web.json_response({"ok": True, "ms": max(0.0, ms), "backs": done})
+
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.add_routes([
         web.post("/v1/completions", completions),
         web.get("/p2p/records", get_records),
         web.post("/p2p/reset", reset),
+        web.post("/p2p/batch_wait", batch_wait),
         web.get("/p2p/channels", get_channels),
         web.get("/health", health),
     ])
@@ -411,7 +424,8 @@ async def _amain(a) -> int:
         if c["role"] == "back" and not a.no_hold:
             # 槽位 = 后段的 max_num_seqs：清单里写的优先，没写就用代理报的（vLLM 默认 256）
             slots = int(c.get("max_num_seqs") or info.get("max_num_seqs") or 0) or None
-        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task"), slots=slots))
+        engines.append(Engine(c["name"], c["role"], cl, task=c.get("task"), slots=slots,
+                              batch_wait_ms=float(info.get("batch_wait_ms") or 0)))
     fe = [e for e in engines if e.role == "front"]
     be = [e for e in engines if e.role == "back"]
     eos, stop_ids = load_stop_ids(a.model_dir)
@@ -440,6 +454,11 @@ async def _amain(a) -> int:
     if not a.no_hold:
         print("后段坐满时请求停在前段等（hold）：槽位 "
               + ", ".join(f"{b.name}={b.slots}" for b in be), flush=True)
+    if a.back_batch_wait_ms is not None:
+        await co.set_batch_wait(a.back_batch_wait_ms)
+    bw = {b.name: b.batch_wait_ms for b in be if b.batch_wait_ms}
+    if bw:
+        print("后段凑批等待：" + ", ".join(f"{k}={v:g}ms" for k, v in bw.items()), flush=True)
     co.start()
     app = make_app(co, stages=entries, tokenizer=tok, mode=a.mode,
                    max_model_len=a.max_model_len,
@@ -481,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-hold", action="store_true",
                     help="关掉「后段坐满时请求停在前段等」：识别完立刻绑定，坐满的后段在自己的 vLLM 队列里排队"
                          "（默认开：后段在飞到了 max_num_seqs 就不再往它上绑，请求在前段排先来先到的队）")
+    ap.add_argument("--back-batch-wait-ms", type=float, default=None,
+                    help="启动时把所有后段的凑批等待窗口设成这个值（ms；0 = 关）。不给 = 用后段启动时的配置"
+                         "（stages.py --back-batch-wait-ms）。运行中可 POST /p2p/batch_wait 再改")
     ap.add_argument("--via-coordinator", action="store_true",
                     help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
                          "协调器与引擎不在同一网段时每跳多一个往返）")

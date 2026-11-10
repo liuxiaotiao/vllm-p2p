@@ -92,7 +92,8 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                          front_max_num_seqs: int = 64, front_gpu_mem: float | None = None,
                          port: int = 8300, master_port: int = 29600,
                          overrides_of=None, eager: bool = False, front_lr: bool = True,
-                         step_trace: str | None = None) -> dict:
+                         step_trace: str | None = None,
+                         back_batch_wait_ms: float = 0.0) -> dict:
     """channels.json 的内容 → stages.json 的内容。`overrides_of(channel) -> dict` 读通道的
     hf_overrides（默认读 channel["overrides"] 指的文件）。"""
     l0, n_layers, model_dir = int(cj["l0"]), int(cj["n_layers"]), cj["model_dir"]
@@ -160,12 +161,18 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
         bname = f"back-{c['name']}"
         bov = dict(ov, p2p_channel=bname)
         bov.pop("p2p_stage", None)
+        if back_batch_wait_ms and back_batch_wait_ms > 0:
+            # 后段凑批等待（调度器 p2p_hold_s）：有请求的 hidden 还在路上时最多等这么久再开算
+            bov["p2p_batch_wait_ms"] = float(back_batch_wait_ms)
+        else:
+            bov.pop("p2p_batch_wait_ms", None)
         master = hosts[bnodes[0]]
         backs.append({
             "name": bname, "role": "back", "task": c["task"], "nodes": bnodes,
             "layers": [l0, n_layers], "partition": part[1:], "dtype": c["dtype"],
             "gpu_mem": {v: gm.get(v, 0.9) for v in bnodes},
             "max_num_seqs": c.get("max_num_seqs"),
+            "batch_wait_ms": float(back_batch_wait_ms or 0),
             "api": f"http://{master}:{port}/v1", "zmq": f"tcp://{master}:{port + 1}",
             "from_channels": [c["name"]],
             "commands": [{"node": v, "host": hosts[v], "cmd": agent_command(
@@ -207,6 +214,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--step-trace", default=None, metavar="DIR",
                     help="开步级记录：每个分段引擎把每一步的开始时刻、用时、批大小写到 DIR/<引擎名>.jsonl"
                          "（各引擎 rank 0 节点上；用 vllm/p2p/steptrace.py collect 收回来）")
+    ap.add_argument("--back-batch-wait-ms", type=float, default=0.0, metavar="W",
+                    help="后段凑批等待：引擎能开算时，若还有正在跑的请求的 hidden 在路上，最多等 W ms 让它并进"
+                         "同一步（0 = 关，默认）。要 ≥ 一个前段来回（B1 实测约 6–8 ms）才有用，小了反而更慢；"
+                         "运行中可用网关 POST /p2p/batch_wait 改")
     ap.add_argument("--no-front-lr", action="store_true",
                     help="前段不开识别统计（只能 oracle；默认开，lr / shadow 模式要它）")
     a = ap.parse_args(argv)
@@ -217,7 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         st = stages_from_channels(cj, only=only, front_max_num_seqs=a.front_max_num_seqs,
                                   front_gpu_mem=a.front_gpu_mem, port=a.port,
                                   master_port=a.master_port, eager=a.eager,
-                                  front_lr=not a.no_front_lr, step_trace=a.step_trace)
+                                  front_lr=not a.no_front_lr, step_trace=a.step_trace,
+                                  back_batch_wait_ms=a.back_batch_wait_ms)
     except (ValueError, OSError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2

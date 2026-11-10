@@ -76,6 +76,7 @@ class Engine:
     on_error: Callable[[str], None] | None = None
     # 远端引擎报的每 decode 位置「引擎内毫秒」的滑动平均（选前段时按它算快慢）；0 = 还没数据
     ewma_ms: float = 0.0
+    batch_wait_ms: float = 0.0       # 后段的凑批等待窗口（调度器 p2p_batch_wait_ms；0 = 关）
 
     def observe(self, ms: float, alpha: float = 0.05) -> None:
         self.ewma_ms = ms if self.ewma_ms <= 0 else (1 - alpha) * self.ewma_ms + alpha * ms
@@ -299,7 +300,7 @@ class TieredCoordinator:
                            for f in self.fronts],
                 "backs": [{"name": b.name, "task": b.task, "inflight": b.inflight,
                            "bound": b.n_bound, "slots": b.slots, "peak": b.peak,
-                           "engine_ms_ewma": round(b.ewma_ms, 2)}
+                           "engine_ms_ewma": round(b.ewma_ms, 2), "batch_wait_ms": b.batch_wait_ms}
                           for b in self.backs],
                 "waiting": [{"rid": r.rid, "task": r.task, "front": r.front.name if r.front else None,
                              "wait_ms": round((time.perf_counter() - r.t_wait) * 1e3, 1)}
@@ -404,6 +405,20 @@ class TieredCoordinator:
         f.peak = max(f.peak, f.inflight)
         f.n_served += 1
         return f
+
+    async def set_batch_wait(self, ms: float, names: Sequence[str] | None = None) -> list[str]:
+        """运行时改后段的凑批等待窗口（EngineCore utility p2p_set_batch_wait；不等回执）。
+        names = 只改这些后段（默认全部）；返回改了哪些。"""
+        ms = max(0.0, float(ms))
+        todo = [b for b in self.backs if not names or b.name in names]
+        if names:
+            miss = sorted(set(names) - {b.name for b in todo})
+            if miss:
+                raise ValueError(f"没有后段 {miss}")
+        for b in todo:
+            await b.fire("p2p_set_batch_wait", ms)
+            b.batch_wait_ms = ms
+        return [b.name for b in todo]
 
     def reset_counters(self) -> None:
         """bench 预热完调用：峰值、计数从现在的在飞重新算。"""

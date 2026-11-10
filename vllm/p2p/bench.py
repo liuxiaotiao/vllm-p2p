@@ -682,6 +682,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--per-front", type=int, default=0,
                     help="闭环：总在途 = 每个前段 N 条 × 前段数，不管请求是哪一类（一条完成补一条）。"
                          "配合分段网关 --front-slots N，保证每个前段恰好 N 条；比如 1 = 每个前段始终只服务一条")
+    ap.add_argument("--batch-wait-ms", type=float, default=None, metavar="W",
+                    help="分段网关：开测前把所有后段的凑批等待窗口设成 W ms（0 = 关；不给 = 不动）。"
+                         "同一套引擎不重启就能比开 / 关")
     ap.add_argument("--inflight", type=int, default=0,
                     help="同时在途条数；默认 = 通道数（与本框架默认 = 后段通道数同口径）")
     ap.add_argument("--requests", type=int, default=0, help="0 = 测试集全部")
@@ -718,6 +721,11 @@ def main(argv: list[str] | None = None) -> int:
             "或用 nohup 放后台）：\n  /home/ubuntu/venvs/vllm-p2p/bin/python vllm/p2p/gateway.py "
             "--mode shadow --identifier http://<识别服务所在节点>:8100 --ident-layers") from None
     mode = gw_info["mode"]
+    if a.batch_wait_ms is not None:
+        if gw_info.get("kind") != "tiered":
+            raise SystemExit("--batch-wait-ms 只对分段网关有意义")
+        r = http_json(f"{a.gateway}/p2p/batch_wait", {"ms": a.batch_wait_ms})
+        log.info("[凑批等待] 后段 %s 的窗口设为 %g ms", ",".join(r.get("backs") or []), a.batch_wait_ms)
     live = {c["name"] for c in gw_info["channels"]}
     tasks = sorted({channels[c]["task"] for c in live if c in channels})
     log.info("网关 %s（%s 模式），通道 %s", a.gateway, mode, sorted(live))
@@ -1010,6 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
                                          for f in end.get("fronts") or []}
             out["run"]["gateway_waits"] = {"front_slot": end.get("n_front_wait"),
                                            "back_hold": end.get("n_held")}
+            out["run"]["batch_wait_ms"] = {c["name"]: c.get("batch_wait_ms", 0.0)
+                                           for c in end.get("channels") or []}
         except Exception:                                     # noqa: BLE001
             pass
     if sat is not None:

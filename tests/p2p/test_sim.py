@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -371,3 +372,47 @@ def test_batch_wait_merges_alternating_requests_on_one_back(world) -> None:
     b0, b5 = d0["sim"]["engines"]["back-no_robots-0"], d5["sim"]["engines"]["back-no_robots-0"]
     assert b0["batch_mean"] < 1.05 and b5["batch_mean"] > 1.5 and b5["batch_waits"] > 0
     assert tp5 < 0.85 * tp0
+
+
+def test_steptrace_records_batch_wait(tmp_path) -> None:
+    """后段开了凑批等待：每步记「这一步之前等了多少 ms」，summary 汇总。"""
+    from types import SimpleNamespace as NS
+
+    tr = T.StepTrace(tmp_path / "b.jsonl", flush_every=1)
+    sched = NS(requests={"a": NS(num_computed_tokens=10)}, waiting=[], p2p_batch_wait_ms=8.0,
+               p2p_hold_ms=0.0)
+    for k, held in enumerate((0.0, 5.0, 5.0, 12.5)):
+        sched.p2p_hold_ms = held
+        tr.begin(k, NS(num_scheduled_tokens={"a": 1}, total_num_scheduled_tokens=1), sched)
+        tr.end(k)
+    tr.flush()
+    rows = T.load([tmp_path / "b.jsonl"])["b"]
+    assert [r["w"] for r in rows] == [0.0, 5.0, 0.0, 7.5]
+    s = T.summarise(rows)
+    assert s["hold_steps"] == 2 and s["hold_ms_total"] == 12.5
+    tr2 = T.StepTrace(tmp_path / "c.jsonl", flush_every=1)       # 没开等待：不记 w
+    tr2.begin(0, NS(num_scheduled_tokens={"a": 1}, total_num_scheduled_tokens=1),
+              NS(requests={}, waiting=[], p2p_batch_wait_ms=0.0, p2p_hold_ms=0.0))
+    tr2.end(0)
+    tr2.flush()
+    assert "w" not in T.load([tmp_path / "c.jsonl"])["c"][0]
+    assert "hold_steps" not in T.summarise(T.load([tmp_path / "c.jsonl"])["c"])
+
+
+@pytest.mark.skipif(not PLAN.exists(), reason="没有 p2p-framework 的部署清单")
+def test_stages_back_batch_wait(tmp_path) -> None:
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(PLAN), "--hosts", str(HOSTS), "--out", str(out), "--model-dir", "/w",
+                        "--vllm-bin", "/venv/bin/vllm", "--stats"]) == 0
+    cj = json.loads((out / "channels.json").read_text())
+    st = stages_from_channels(cj, back_batch_wait_ms=8)
+    for c in st["channels"]:
+        ovs = [json.loads(shlex.split(x["cmd"])[shlex.split(x["cmd"]).index("--hf-overrides") + 1])
+               for x in c["commands"]]
+        if c["role"] == "back":
+            assert c["batch_wait_ms"] == 8.0 and all(o["p2p_batch_wait_ms"] == 8.0 for o in ovs)
+        else:
+            assert all("p2p_batch_wait_ms" not in o for o in ovs)
+    st0 = stages_from_channels(cj)
+    assert all(not c.get("batch_wait_ms") for c in st0["channels"])
+    assert all("p2p_batch_wait_ms" not in x["cmd"] for c in st0["channels"] for x in c["commands"])

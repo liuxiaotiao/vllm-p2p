@@ -115,7 +115,8 @@ async def run_head(a: argparse.Namespace) -> int:
             "max_num_seqs": cfg.scheduler_config.max_num_seqs,
             "max_model_len": mc.max_model_len, "pp": a.pipeline_parallel_size,
             "kv_blocks": cfg.cache_config.num_gpu_blocks,
-            "block_size": cfg.cache_config.block_size, "startup_s": None}
+            "block_size": cfg.cache_config.block_size, "startup_s": None,
+            "batch_wait_ms": float(getattr(mc.hf_config, "p2p_batch_wait_ms", 0) or 0)}
     info["startup_s"] = round(time.perf_counter() - t0, 1)
     print(f"[stage_agent] EngineCore 就绪（{info['startup_s']}s）；KV {info['kv_blocks']} 块 × "
           f"{info['block_size']}；ZMQ tcp://*:{a.port + 1}，HTTP :{a.port}", flush=True)

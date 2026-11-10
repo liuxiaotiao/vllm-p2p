@@ -176,14 +176,17 @@ class BackRunner:
 class FakeCore:
     """EngineCore + AsyncMPClient 的替身：同一个事件循环里一步一步跑真调度器。"""
 
-    def __init__(self, sched, runner, seed: int):
+    def __init__(self, sched, runner, seed: int, delay: float = 0.0):
         self.sched, self.runner = sched, runner
+        self.delay = delay                      # 每步额外多花的秒数（模拟慢一点的前段）
         self.q: asyncio.Queue = asyncio.Queue()
         self.wake = asyncio.Event()
         self.rng = random.Random(seed)
         self.task = None
         self.aborted: list[str] = []
         self.preempted = 0
+        self.holds = 0
+        self.batches: list[int] = []            # 每一步 decode 的批大小（凑批等待的测试看它）
 
     def _ensure(self):
         if self.task is None:
@@ -224,7 +227,19 @@ class FakeCore:
                 if not self.sched.has_requests():
                     self.wake.clear()
                     await self.wake.wait()
+                hold = self.sched.p2p_hold_s() if getattr(self.sched, "p2p_batch_wait_ms", 0) else 0
+                if hold > 0:
+                    # 与 EngineCore._process_engine_step 一样：等输入或等到窗口结束，再重新判断
+                    self.holds += 1
+                    self.wake.clear()
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), hold)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
                 so = self.sched.schedule()
+                if so.total_num_scheduled_tokens:
+                    self.batches.append(len(so.num_scheduled_tokens))
                 self.preempted += len(so.preempted_req_ids or ())
                 outs = self.sched.update_from_output(so, self.runner.step(so))
                 for eco in outs.values():
@@ -237,7 +252,7 @@ class FakeCore:
                     except asyncio.TimeoutError:
                         pass
                 else:
-                    await asyncio.sleep(self.rng.random() * 0.002)   # 打乱两边的步调
+                    await asyncio.sleep(self.delay + self.rng.random() * 0.002)   # 打乱两边的步调
         except BaseException as e:   # noqa: BLE001
             self.q.put_nowait(e)
             raise
@@ -249,7 +264,8 @@ class FakeCore:
     shutdown = close
 
 
-def _run(configs, *, n_req, conc, max_tokens, front_blocks, back_blocks, eos, n_back=2):
+def _run(configs, *, n_req, conc, max_tokens, front_blocks, back_blocks, eos, n_back=2,
+         batch_wait_ms=0.0):
     from vllm.p2p.tiered import Engine, TieredCoordinator, closed_loop
 
     rng = random.Random(0)
@@ -263,6 +279,8 @@ def _run(configs, *, n_req, conc, max_tokens, front_blocks, back_blocks, eos, n_
                                [Engine(f"back{i}", "back", b, task="t") for i, b in
                                 enumerate(backs)],
                                eos=eos, ignore_eos=eos is None)
+        if batch_wait_ms:
+            await co.set_batch_wait(batch_wait_ms)
         co.start()
         try:
             res, _ = await closed_loop(co.generate, prompts, max_tokens=max_tokens,
@@ -1048,3 +1066,180 @@ def test_front_slots_one_request_per_front(configs) -> None:
     assert any(r["info"]["wait_front_slot_ms"] > 0 for r in res)
     co.reset_counters()
     assert all(f.peak == 0 and f.n_served == 0 for f in co.fronts)
+
+
+# --------------------------------------------------------------------------- #
+# 后段凑批等待（O3b）：调度器 p2p_hold_s + EngineCore 等输入
+# --------------------------------------------------------------------------- #
+def _back_two_decoding(configs, wait_ms: float):
+    """后段调度器上两条请求都 prefill 完、各采出一个 token（hidden 都还没来）。"""
+    from vllm.p2p.tiered import _core_request
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.request import Request
+
+    s = make_sched(configs["back"], 32)
+    assert s.p2p_batch_wait_ms == 0                            # 默认关
+    assert s.p2p_set_batch_wait(wait_ms) == 0
+    for rid in ("a", "b"):
+        req = _core_request(rid, prompt=None, embeds=torch.zeros(4, W, dtype=torch.float16),
+                            max_tokens=8, eos=None, logprobs=0, ignore_eos=True, stop_ids=(),
+                            arrival=0.0)
+        s.add_request(Request.from_engine_core_request(req, None))
+    so = s.schedule()
+    assert so.num_scheduled_tokens == {"a": 4, "b": 4}
+    s.update_from_output(so, ModelRunnerOutput(req_ids=["a", "b"], req_id_to_index={"a": 0, "b": 1},
+                                               sampled_token_ids=[[7], [8]]))
+    return s
+
+
+def test_back_batch_wait_holds_until_peer_hidden_arrives(configs) -> None:
+    import time
+
+    from vllm.p2p.stage import pack_rows
+
+    s = _back_two_decoding(configs, 8.0)
+    assert s.p2p_hold_s() == 0                                 # 谁都没到齐：没东西可算，不算「等」
+    s.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    t0 = time.perf_counter()
+    h = s.p2p_hold_s(t0)
+    assert 0 < h <= 0.008                                      # a 到齐、b 在路上 → 等
+    assert s.p2p_hold_s(t0 + 0.0081) == 0                      # 窗口过了 → 照常开算
+    s.p2p_feed([pack_rows("b", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert s.p2p_hold_s() == 0                                 # 都到齐 → 马上算
+    so = s.schedule()
+    assert so.num_scheduled_tokens == {"a": 1, "b": 1}         # 并进同一步
+    assert not s._p2p_t_ready                                  # 排上了就清掉到齐时刻
+
+
+def test_back_batch_wait_window_starts_at_last_step_end(configs) -> None:
+    """一条的 hidden 早在上一步算的时候就到了：窗口从上一步结束算起，不是从它到达算起。"""
+    from vllm.p2p.stage import pack_rows
+
+    s = _back_two_decoding(configs, 8.0)
+    s.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    t_feed = s._p2p_t_ready["a"]
+    s._p2p_t_last_end = t_feed + 0.010                         # 上一步在它到达 10ms 后才结束
+    assert s.p2p_hold_s(t_feed + 0.012) == pytest.approx(0.006, abs=1e-6)
+
+
+def test_back_batch_wait_not_for_prefill_or_in_flight(configs) -> None:
+    from vllm.p2p.stage import pack_rows
+    from vllm.p2p.tiered import _core_request
+    from vllm.v1.request import Request
+
+    s = _back_two_decoding(configs, 8.0)
+    s.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert s.p2p_hold_s() > 0
+    # 有新请求能排（prefill）→ 不等
+    req = _core_request("c", prompt=None, embeds=torch.zeros(3, W, dtype=torch.float16),
+                        max_tokens=8, eos=None, logprobs=0, ignore_eos=True, stop_ids=(), arrival=0.0)
+    s.add_request(Request.from_engine_core_request(req, None))
+    assert s.p2p_hold_s() == 0
+    # 关掉 → 不等
+    s2 = _back_two_decoding(configs, 8.0)
+    s2.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert s2.p2p_set_batch_wait(0) == 8.0 and s2.p2p_hold_s() == 0
+    # b 已经排进一个还没出结果的批（PP 流水线里）：它的 token 还没采出来，不算「在路上」
+    s3 = _back_two_decoding(configs, 8.0)
+    s3.p2p_feed([pack_rows("b", 4, torch.ones(1, W, dtype=torch.float16))])
+    so = s3.schedule()
+    assert so.num_scheduled_tokens == {"b": 1}                 # a 的 hidden 没来：只排 b
+    s3.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert s3.p2p_hold_s() == 0                                # a 能算、b 在流水线里 → 不等
+    with pytest.raises(RuntimeError, match="后段"):
+        make_sched(configs["front"], 32).p2p_set_batch_wait(5)
+
+
+def test_back_batch_wait_from_hf_overrides(configs) -> None:
+    import copy
+
+    vc = copy.deepcopy(configs["back"])
+    vc.model_config.hf_config.p2p_batch_wait_ms = 6
+    assert make_sched(vc, 32).p2p_batch_wait_ms == 6.0
+    vf = copy.deepcopy(configs["front"])
+    vf.model_config.hf_config.p2p_batch_wait_ms = 6          # 前段不认这个
+    assert make_sched(vf, 32).p2p_batch_wait_ms == 0.0
+
+
+def test_engine_core_hold_blocks_on_input_queue() -> None:
+    """EngineCore._process_engine_step：要等时阻塞等输入（来了马上处理、回去重判），不跑空步。"""
+    import queue
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCore, EngineCoreProc
+
+    got, noted = [], []
+    sched = SimpleNamespace(p2p_batch_wait_ms=8.0, p2p_hold_s=lambda: 0.2,
+                            p2p_note_hold=noted.append, has_unfinished_requests=lambda: True)
+    stepped = []
+    core = SimpleNamespace(batch_queue=None, scheduler=sched, input_queue=queue.Queue(),
+                           _handle_client_request=lambda *r: got.append(r),
+                           step_fn=lambda: stepped.append(1) or ({}, False))
+    core._p2p_hold_s = lambda: EngineCore._p2p_hold_s(core)
+    threading.Timer(0.02, lambda: core.input_queue.put(("U", "feed"))).start()
+    t0 = time.perf_counter()
+    assert EngineCoreProc._process_engine_step(core) is False
+    dt = time.perf_counter() - t0
+    assert got == [("U", "feed")] and not stepped and 0.015 < dt < 0.15
+    assert len(noted) == 1 and noted[0] < 0.15
+    # 窗口到了也没来：超时返回，下一轮照常
+    sched.p2p_hold_s = lambda: 0.01
+    t0 = time.perf_counter()
+    assert EngineCoreProc._process_engine_step(core) is False
+    assert 0.008 < time.perf_counter() - t0 < 0.1 and len(got) == 1
+    # 不等 → 照常一步
+    sched.p2p_hold_s = lambda: 0.0
+    core.post_step = lambda executed: None
+    core.output_queue = queue.Queue()
+    EngineCoreProc._process_engine_step(core)
+    assert stepped == [1]
+
+
+def _two_fronts_one_back(configs, batch_wait_ms: float, n_req: int = 6, max_tokens: int = 12):
+    """两个前段（一快一慢）、一个后段、每个前段 1 条：两条请求的 hidden 错开到达后段 ——
+    与 B1 per-front 1 的 gsm8k 后段同一种「交替」局面。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, closed_loop
+
+    rng = random.Random(3)
+    prompts = [[rng.randrange(3, V) for _ in range(rng.randint(3, 20))] for _ in range(n_req)]
+
+    async def go():
+        fronts = [FakeCore(make_sched(configs["front"], 64), FrontRunner(), 20 + i, delay=0.006 * i)
+                  for i in range(2)]
+        back = FakeCore(make_sched(configs["back"], 64), BackRunner(), 3)
+        co = TieredCoordinator([Engine(f"front{i}", "front", f) for i, f in enumerate(fronts)],
+                               [Engine("back0", "back", back, task="t")],
+                               eos=None, ignore_eos=True, front_pick="least", front_slots=1)
+        if batch_wait_ms:
+            await co.set_batch_wait(batch_wait_ms)
+        co.start()
+        try:
+            res, _ = await closed_loop(co.generate, prompts, max_tokens=max_tokens, concurrency=2,
+                                       tasks=["t"] * n_req, timeout=60)
+            return res, back, co
+        finally:
+            await co.close()
+            for c in (*fronts, back):
+                c.close()
+
+    return prompts, asyncio.run(go())
+
+
+def test_tiered_batch_wait_merges_and_matches_monolithic(configs) -> None:
+    """端到端：后段开凑批等待，逐 token 与整模型一致；等过、并出了 2 条的批，后段步数比不开时少。"""
+    prompts, (res, back, co) = _two_fronts_one_back(configs, 40.0)
+    for p, r in zip(prompts, res):
+        assert r["tokens"] == mono(p, 12, None), r["rid"]
+    assert back.sched.p2p_batch_wait_ms == 40.0 and co.backs[0].batch_wait_ms == 40.0
+    assert co.state()["backs"][0]["batch_wait_ms"] == 40.0
+    assert back.holds > 0 and max(back.batches) == 2
+    _, (res0, back0, _) = _two_fronts_one_back(configs, 0.0)
+    for p, r in zip(prompts, res0):
+        assert r["tokens"] == mono(p, 12, None)
+    assert back0.holds == 0
+    merged = sum(1 for b in back.batches if b > 1) / len(back.batches)
+    merged0 = sum(1 for b in back0.batches if b > 1) / len(back0.batches)
+    assert merged > merged0 + 0.2 and len(back.batches) < len(back0.batches), \
+        (merged, merged0, len(back.batches), len(back0.batches))

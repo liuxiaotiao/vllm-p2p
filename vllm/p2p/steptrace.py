@@ -12,7 +12,8 @@
 
     {"t": 开始时刻（time.time()，秒）, "ms": 用时, "n": 请求数, "tok": token 数,
      "pf": prefill token 数（这一步里 >1 个 token 的请求的 token 和）, "npf": 这种请求几条,
-     "ctx": 批里请求已算 token 数的均值, "q": 这一步开始时调度器里等着的请求数}
+     "ctx": 批里请求已算 token 数的均值, "q": 这一步开始时调度器里等着的请求数,
+     "w": 这一步之前凑批等了多少 ms（后段开了 p2p_batch_wait_ms 才有）}
 
 「用时」= 调度 + 前向 + 采样 + 更新输出（EngineCore.step 一次）。PP 多机时（batch queue）是
 这一批从调度到取回结果的时间，几批可能重叠。
@@ -54,6 +55,7 @@ class StepTrace:
         self.path = p
         self._buf: list[str] = []
         self._open: dict[Any, dict] = {}
+        self._hold_seen = 0.0                        # 调度器累计的凑批等待 ms，上一步时读到的
         self._lock = threading.Lock()
         self._flush_every, self._flush_s = int(flush_every), float(flush_s)
         self._last_flush = time.monotonic()
@@ -98,6 +100,10 @@ class StepTrace:
             if int(getattr(sched_out, "total_num_scheduled_tokens", 0) or 0) <= 0:
                 return
             rec = self.describe(sched_out, scheduler)
+            hold = getattr(scheduler, "p2p_hold_ms", None)
+            if getattr(scheduler, "p2p_batch_wait_ms", 0) and hold is not None:
+                rec["w"] = round(hold - self._hold_seen, 3)
+                self._hold_seen = hold
             rec["t"], rec["_p"] = start if start is not None else self.now()
             self._open[key] = rec
         except Exception:                                    # noqa: BLE001
@@ -187,6 +193,9 @@ def summarise(rows: Sequence[Mapping], *, t0: float | None = None, t1: float | N
                                  if pf else None),
         "prefill_fit": prefill_fit(pf),
         "ctx_mean": round(st.mean(r.get("ctx", 0.0) for r in rs), 1),
+        **({"hold_steps": sum(1 for r in rs if r.get("w", 0) > 0),
+            "hold_ms_total": round(sum(r.get("w", 0.0) for r in rs), 1)}
+           if any("w" in r for r in rs) else {}),
     }
 
 
@@ -247,6 +256,8 @@ def cmd_summary(a) -> int:
             lin = (f"{pfit['a_ms']:.1f} ms + {pfit['b_ms_per_token']:.3f} ms × token" if "a_ms" in pfit
                    else f"{pfit['ms_per_token_p50']:.3f} ms/token（中位数）")
             print(f"    prefill 步：{lin}（{pfit['n']} 步；去掉冷启动 {pfit['dropped']} 步）")
+        if "hold_steps" in s:
+            print(f"    凑批等待：{s['hold_steps']} 步之前等过，共 {s['hold_ms_total']:.0f} ms")
     if a.json:
         Path(a.json).write_text(json.dumps({k: summarise(v, t0=a.t0, t1=a.t1) for k, v in data.items()},
                                            ensure_ascii=False, indent=2), encoding="utf-8")

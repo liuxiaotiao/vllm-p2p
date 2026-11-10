@@ -255,6 +255,9 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
         title = f"连续性测试（每个前段始终 {run['per_front']} 条，不分类型）"
     if run.get("saturate") and title == "连续性测试":
         title = "满载连续测试（逐步加压 → 保持满载 → 发完收尾，全部请求）"
+    bw = {k: v for k, v in (run.get("batch_wait_ms") or {}).items() if v}
+    if bw:
+        title += "，后段凑批等待 " + "/".join(sorted({f"{v:g}ms" for v in bw.values()}))
     out = [f"{title}：{len(rows)} 条（超时 {run.get('n_timeout', 0)}），在途 {run.get('inflight', doc.get('concurrency'))}，"
            f"最大生成 {run.get('max_tokens', doc.get('tokens'))}，墙钟 {wall:.0f}s"]
     metrics = [

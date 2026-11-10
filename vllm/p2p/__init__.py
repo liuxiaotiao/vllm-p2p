@@ -24,8 +24,9 @@
   引擎）的协议与公共件；`hf_overrides` 里有 `p2p_stage` 才生效。引擎内的改动：
   模型（`qwen3_moe_partial.py`：只建本段的层、前段交出残差流、后段零 embed）、调度器
   （`v1/core/sched/scheduler.py`：后段按「已收到 hidden 的位置」设门、前段随调度结果送输入
-  token、`p2p_append` / `p2p_feed`）、EngineCore（`v1/engine/core.py`：两个 utility、
-  等输入时不空转）、runner（`v1/worker/gpu_model_runner.py`：前段不采样、后段按位置喂 hidden），
+  token、`p2p_append` / `p2p_feed`；后段凑批等待 `p2p_hold_s`：hf_overrides 的 `p2p_batch_wait_ms`
+  或运行时 `p2p_set_batch_wait`）、EngineCore（`v1/engine/core.py`：几个 utility、等输入时不空转、
+  凑批等待时阻塞等输入）、runner（`v1/worker/gpu_model_runner.py`：前段不采样、后段按位置喂 hidden），
   以及 `EngineCoreOutput` / `ModelRunnerOutput` / `SchedulerOutput` / `Request` 上各一个字段。
 * `vllm/p2p/tiered.py` —— B-1 的协调器（按请求绑定后段、两个方向搬 token / hidden）与 B0
   原型（1 前段 + 2 同 task 后段，单卡微型 checkpoint，对拍整模型 + 开销）。

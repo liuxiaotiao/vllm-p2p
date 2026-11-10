@@ -333,6 +333,21 @@ class EngineCore:
     def p2p_feed(self, items: list) -> int:
         return self.scheduler.p2p_feed(items)
 
+    def p2p_set_batch_wait(self, ms: float) -> float:
+        return self.scheduler.p2p_set_batch_wait(ms)
+
+    def p2p_hold_stats(self) -> dict:
+        sc = self.scheduler
+        return {"batch_wait_ms": getattr(sc, "p2p_batch_wait_ms", 0.0),
+                "holds": getattr(sc, "p2p_hold_n", 0),
+                "hold_ms": round(getattr(sc, "p2p_hold_ms", 0.0), 3)}
+
+    def _p2p_hold_s(self) -> float:
+        """后段凑批等待（scheduler.p2p_hold_s）：现在该再等多少秒；0 = 照常调度。"""
+        if not getattr(self.scheduler, "p2p_batch_wait_ms", 0):
+            return 0.0
+        return self.scheduler.p2p_hold_s()
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -454,7 +469,8 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # P2P 后段凑批等待：要等就先不排新批（流水线里在跑的批照常往下收）
+        if self.scheduler.has_requests() and not (batch_queue and self._p2p_hold_s() > 0):
             scheduler_output = self.scheduler.schedule()
             if self._p2p_trace is not None:
                 self._p2p_trace.begin(id(scheduler_output), scheduler_output, self.scheduler)
@@ -1008,6 +1024,21 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
+
+        if not self.batch_queue:
+            hold = self._p2p_hold_s()
+            if hold > 0:
+                # P2P 后段凑批等待：阻塞等输入（另一条请求的 hidden 来了就马上回去重新判断），
+                # 最多等到窗口结束；不调度、不跑空步
+                t0 = time.perf_counter()
+                try:
+                    req = self.input_queue.get(timeout=hold)
+                except queue.Empty:
+                    req = None
+                self.scheduler.p2p_note_hold(time.perf_counter() - t0)
+                if req is not None:
+                    self._handle_client_request(*req)
+                return False
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()

@@ -792,6 +792,9 @@ class Scheduler(SchedulerInterface):
         if self._p2p_pending:
             scheduler_output.p2p_feed = self._p2p_pending
             self._p2p_pending = {}
+        if self._p2p_t_ready:
+            for rid in num_scheduled_tokens:
+                self._p2p_t_ready.pop(rid, None)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1119,6 +1122,8 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats = model_runner_output.cudagraph_stats
         p2p_hidden = model_runner_output.p2p_hidden
         p2p_feat = model_runner_output.p2p_feat
+        if self.p2p_role == "back" and scheduler_output.total_num_scheduled_tokens:
+            self._p2p_t_last_end = time.perf_counter()      # 凑批等待的窗口从这里起算
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1484,6 +1489,14 @@ class Scheduler(SchedulerInterface):
         )
         self._p2p_pending: dict[str, list] = {}
         self._p2p_width = mc.get_hidden_size() if self.p2p_role else 0
+        # 后段凑批等待（O3b）：引擎能开算时，若还有「已经在跑、这一步的 hidden 还在路上」的请求，
+        # 最多等 p2p_batch_wait_ms 再开算（等到了就并进同一步）。0 = 关。见 p2p_hold_s。
+        bw = getattr(mc.hf_config, "p2p_batch_wait_ms", 0) if mc is not None else 0
+        self.p2p_batch_wait_ms: float = float(bw or 0) if self.p2p_role == "back" else 0.0
+        self._p2p_t_ready: dict[str, float] = {}     # 请求这一步的输入到齐的时刻
+        self._p2p_t_last_end = 0.0                   # 上一步结束（update_from_output）的时刻
+        self.p2p_hold_n = 0                          # 等过的次数 / 总时长（ms），统计用
+        self.p2p_hold_ms = 0.0
         if self.p2p_role and self.scheduler_config.async_scheduling:
             raise ValueError(
                 "P2P 分段引擎不支持 async scheduling（要按「上一步的输出」决定下一步）："
@@ -1521,10 +1534,58 @@ class Scheduler(SchedulerInterface):
             if request is None or request.is_finished():
                 continue
             assert request.p2p_ready is not None
+            if self.p2p_batch_wait_ms > 0 and request.p2p_ready <= request.num_computed_tokens:
+                self._p2p_t_ready.setdefault(req_id, time.perf_counter())
             request.p2p_ready = max(request.p2p_ready, pos + rows.shape[0])
             self._p2p_pending.setdefault(req_id, []).append((pos, rows))
             n += 1
         return n
+
+    def p2p_set_batch_wait(self, ms: float) -> float:
+        """后段：运行时改凑批等待的窗口（ms，0 = 关），返回旧值。"""
+        if self.p2p_role != "back":
+            raise RuntimeError("p2p_set_batch_wait 只能发给后段引擎")
+        old, self.p2p_batch_wait_ms = self.p2p_batch_wait_ms, max(0.0, float(ms))
+        return old
+
+    def p2p_hold_s(self, now: float | None = None) -> float:
+        """后段凑批等待：现在该再等多少秒才开下一步（0 = 现在就算）。
+
+        只在这种时候等：手上有能算的 decode（hidden 已到），同时还有别的**正在跑**的请求「上一步的
+        token 已经采出来、它的 hidden 还在前段 / 网络上」—— 再等一会儿它就能并进同一步，一步顶两步。
+        有 prefill 能排（新请求、分块 prefill 没算完）就不等；在 PP 流水线里还没出结果的请求不算
+        「在路上」（它的 token 还没采出来，等它要等一整步 + 一个来回）。窗口从「引擎能开算」算起：
+        手上最早到齐的输入、上一步结束，两者取晚的（与 vllm/p2p/sim.py 的 _should_wait 同一规则）。
+        """
+        w = self.p2p_batch_wait_ms
+        if w <= 0 or self.p2p_role != "back":
+            return 0.0
+        if len(self.waiting) and len(self.running) < self.max_num_running_reqs:
+            return 0.0
+        if now is None:
+            now = time.perf_counter()
+        first = None
+        missing = False
+        for req in self.running:
+            if req.is_finished() or req.p2p_ready is None:
+                continue
+            done = req.num_computed_tokens
+            if done < req.num_prompt_tokens:
+                return 0.0                                   # prefill 没算完：照常
+            if min(req.num_tokens, req.p2p_ready) > done:    # 输入到齐，能算
+                # 没记到到齐时刻（窗口是运行时才打开的）→ 从现在记起，窗口照样有头
+                t = self._p2p_t_ready.setdefault(req.request_id, now)
+                if first is None or t < first:
+                    first = t
+            elif req.num_tokens > done:                      # token 已采出、hidden 还在路上
+                missing = True
+        if first is None or not missing:
+            return 0.0
+        return max(0.0, max(first, self._p2p_t_last_end) + w / 1e3 - now)
+
+    def p2p_note_hold(self, seconds: float) -> None:
+        self.p2p_hold_n += 1
+        self.p2p_hold_ms += seconds * 1e3
 
     def add_request(self, request: Request) -> None:
         if self.p2p_role == "back":
@@ -1584,6 +1645,8 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if self._p2p_t_ready:
+            self._p2p_t_ready.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
