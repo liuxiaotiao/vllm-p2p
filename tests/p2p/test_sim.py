@@ -326,3 +326,24 @@ def test_agent_hop_is_separate_from_gateway_hop(world) -> None:
 
     assert gap(2.0, 2.0) == pytest.approx(gap(20.0, 2.0))
     assert gap(2.0, 5.0) - gap(2.0, 2.0) == pytest.approx(6.0, rel=1e-6)
+
+
+def test_back_pp_hop_and_score_modes(world) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    net = S.Net(ip=ip, pp_hop_ms=4.0)
+    sim = S.Sim(world["stages"], perf=perf, net=net, node_gpu=gpu, params=S.Params(back_fixed_ms=0.0),
+                front_slots=None, hold=True)
+    e = sim.engines["back-mbpp-1"]                       # 两段：下发（与往下传重叠）+ 往下传 + 回传
+    t4 = e.step_ms([200.0], [])
+    net.back_pp_hop_ms = 1.0
+    assert t4 - e.step_ms([200.0], []) == pytest.approx(2 * 3.0, rel=1e-6)
+    real = fake_real(world["stages"], n=6)
+    doc = setup(world, real, per_front=1)
+    _, s_all = S.compare(doc, doc)
+    assert s_all == 0.0
+    lines, s_t = S.compare(doc, {"requests": [dict(r, prefill_ms=r["prefill_ms"] * 2) for r in doc["requests"]],
+                                 "run": doc["run"]}, "tpot")
+    assert s_t > 0                                       # TPOT 的算法里用到了 prefill_ms（总时延 − 首 token）
+    _, s_tt = S.compare(doc, {"requests": doc["requests"], "run": doc["run"]}, "ttft")
+    assert s_tt == 0.0
