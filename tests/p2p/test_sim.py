@@ -462,3 +462,15 @@ def test_bandwidth_moves_prompt_transfer_not_decode(world) -> None:
     assert lo["后段→首 token"]["mean"] > hi["后段→首 token"]["mean"] + 2
     k = S.key_metrics
     assert k(docs[1000.0])["TPOT 均值"] == pytest.approx(k(docs[10000.0])["TPOT 均值"], rel=0.02)
+
+
+def test_replay_from_other_deployment_uses_true_task(world) -> None:
+    """别的部署（比如 petals 整条流水线）的结果回放到分段部署：通道名对不上、没有判出的类 → 按标注的类绑。"""
+    real = {"requests": [{"req": f"req{i}", "true_task": u, "channel": "petals-0", "task": None,
+                          "n_prompt": 90, "n_generated": 20} for i, u in enumerate(("gsm8k", "mbpp", "no_robots"))]}
+    reqs = S.replay_requests(real, world["stages"])
+    assert [r.task for r in reqs] == ["gsm8k", "mbpp", "no_robots"]
+    doc = setup(world, real, per_front=1)
+    st = world["stages"]
+    task_of = {c["name"]: c["task"] for c in st["channels"] if c["role"] == "back"}
+    assert all(task_of[r["channel"]] == r["true_task"] for r in doc["requests"])

@@ -688,7 +688,9 @@ def replay_requests(real: Mapping, stages: Mapping, *, n: int | None = None) -> 
     for i in range(n or len(rows)):
         r = rows[i % len(rows)]
         ch = chans.get(r.get("channel") or "")
-        task = (ch or {}).get("task") or r.get("task")
+        # 绑定用的类：回放文件的通道在这份部署里 → 它的 task；否则（比如拿 petals 的结果回放到分段部署）
+        # 用那次判出的类，再没有就用标注的类
+        task = (ch or {}).get("task") or r.get("task") or r.get("true_task")
         out.append(SimReq(rid=f"req{i}", case_id=r.get("case_id"), true_task=r.get("true_task"),
                           task=task, n_prompt=int(r.get("n_prompt") or 1),
                           n_gen=max(1, int(r.get("n_generated") or 1)),
