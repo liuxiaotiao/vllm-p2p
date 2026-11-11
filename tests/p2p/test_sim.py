@@ -493,3 +493,19 @@ def test_same_time_arrivals_share_one_step(world) -> None:
                      for r in ("a", "b", "c")})
     sim.run()
     assert e.n_steps == 2 and e.batch_sum == 3                # 第一步 a+b（旧写法是 a、b 各一步），第二步 c
+
+
+def test_summary_table_cli(world, tmp_path) -> None:
+    real = fake_real(world["stages"], n=9)
+    a = setup(world, real, per_front=1)
+    b = setup(world, real, per_front=1, hop_ms=3.0)
+    for n, d in (("r.json", a), ("s.json", b)):
+        (tmp_path / n).write_text(json.dumps(d))
+    md, js = tmp_path / "t.md", tmp_path / "t.json"
+    assert S.main(["table", f"甲={tmp_path / 'r.json'},{tmp_path / 's.json'}",
+                   f"乙={tmp_path / 'r.json'},{tmp_path / 'r.json'}", "--md", str(md), "--json", str(js)]) == 0
+    txt = md.read_text()
+    assert "| 指标 | 甲 | 乙 |" in txt and "输出 tok/s" in txt and "TTFT·后段→首 token p50" in txt
+    recs = json.loads(js.read_text())
+    assert recs[1]["metrics"]["TPOT 均值"]["err"] == 0 and recs[0]["metrics"]["TPOT 均值"]["err"] > 0
+    assert recs[0]["n"] == 9

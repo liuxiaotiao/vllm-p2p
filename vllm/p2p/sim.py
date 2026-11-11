@@ -934,6 +934,49 @@ def compare(sim: Mapping, real: Mapping, score: str = "all") -> tuple[list[str],
     return lines, score
 
 
+TABLE_KEYS = ("输出 tok/s", "TPOT 均值", "TPOT p90", "TTFT p50", "TTFT 均值")
+
+
+def summary_table(runs: Sequence[tuple[str, Mapping, Mapping]]) -> tuple[list[str], list[dict]]:
+    """若干组（标签, 真机结果, 模拟结果）→ 汇总表（markdown 行）+ 每组的数（JSON 用）。
+    每组：条数、墙钟、平均生成长度，关键指标与各后段 TPOT、TTFT 各段 p50 的 真机 / 模拟 / 误差。"""
+    recs = []
+    for label, real, sim in runs:
+        kr, ks = key_metrics(real), key_metrics(sim)
+        rows = real.get("requests") or []
+        keys = [k for k in kr if k in TABLE_KEYS or k.startswith("TPOT 均值 ") or k.startswith("TTFT·")]
+        keys = [k for k in TABLE_KEYS if k in kr] + [k for k in keys if k not in TABLE_KEYS]
+        m = {}
+        for k in keys:
+            a, b = kr.get(k), ks.get(k)
+            if a is None or b is None:
+                continue
+            m[k] = {"real": round(a, 3), "sim": round(b, 3), "err": round((b - a) / a, 4) if a else None}
+        recs.append({"label": label, "n": len(rows), "wall_s": (real.get("run") or {}).get("wall_s"),
+                     "gen_mean": (round(stt.mean(int(r.get("n_generated") or 0) for r in rows), 1) if rows else None),
+                     "metrics": m})
+    keys = []
+    for r in recs:
+        keys += [k for k in r["metrics"] if k not in keys]
+    out = ["| 指标 | " + " | ".join(r["label"] for r in recs) + " |",
+           "|---|" + "---|" * len(recs),
+           "| 条数 / 墙钟 s / 平均生成长度 | " + " | ".join(
+               f"{r['n']} / {r['wall_s'] or 0:.0f} / {r['gen_mean']}" for r in recs) + " |"]
+    for k in keys:
+        cells = []
+        for r in recs:
+            v = r["metrics"].get(k)
+            if v is None:
+                cells.append("—")
+                continue
+            e = "—" if v["err"] is None else f"{100 * v['err']:+.1f}%"
+            cells.append(f"{v['real']:.1f} / {v['sim']:.1f}（{e}）")
+        out.append(f"| {k} | " + " | ".join(cells) + " |")
+    out.append("")
+    out.append("每格：真机 / 模拟（模拟相对真机的误差）。TTFT·xx = TTFT 拆分各段的 p50（ms）。")
+    return out, recs
+
+
 def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float, *,
         rounds: int = 3, fixed: Sequence[str] = (), log: Callable[[str], None] = print,
         extra: Mapping[str, float] | None = None, score: str = "all") -> tuple[Params, float, float, dict]:
@@ -1098,7 +1141,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     c = sub.add_parser("compare", help="比两份结果的关键指标")
     c.add_argument("--sim", required=True)
     c.add_argument("--real", required=True)
+    t = sub.add_parser("table", help="几组「真机 + 模拟」并排出一张汇总表（markdown，可另存 JSON）")
+    t.add_argument("runs", nargs="+", metavar="标签=真机.json,模拟.json")
+    t.add_argument("--md", default=None, help="表另存到这个 .md")
+    t.add_argument("--json", default=None, help="数另存到这个 .json")
     a = ap.parse_args(argv)
+
+    if a.cmd == "table":
+        runs = []
+        for spec in a.runs:
+            label, _, files = spec.partition("=")
+            rp, _, sp = files.partition(",")
+            if not (label and rp and sp):
+                raise SystemExit(f"写成 标签=真机.json,模拟.json，给的是 {spec!r}")
+            runs.append((label, json.loads(Path(rp).read_text(encoding="utf-8")),
+                         json.loads(Path(sp).read_text(encoding="utf-8"))))
+        lines, recs = summary_table(runs)
+        print("\n".join(lines))
+        if a.md:
+            Path(a.md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if a.json:
+            Path(a.json).write_text(json.dumps(recs, ensure_ascii=False, indent=1), encoding="utf-8")
+        return 0
 
     if a.cmd == "compare":
         lines, score = compare(json.loads(Path(a.sim).read_text(encoding="utf-8")),
