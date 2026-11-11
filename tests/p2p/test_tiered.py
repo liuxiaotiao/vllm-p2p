@@ -186,6 +186,7 @@ class FakeCore:
         self.aborted: list[str] = []
         self.preempted = 0
         self.holds = 0
+        self.idle_skips = 0
         self.batches: list[int] = []            # 每一步 decode 的批大小（凑批等待的测试看它）
 
     def _ensure(self):
@@ -234,6 +235,16 @@ class FakeCore:
                     self.wake.clear()
                     try:
                         await asyncio.wait_for(self.wake.wait(), hold)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                if self.sched.p2p_idle():
+                    # 与 EngineCore 一样（O3c）：没东西可算就不调度，等输入。判错了（其实有活）这里会卡住，
+                    # 所有端到端测试都会超时 —— 所以它们也在验 p2p_idle
+                    self.idle_skips += 1
+                    self.wake.clear()
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), 0.05)
                     except asyncio.TimeoutError:
                         pass
                     continue
@@ -1187,18 +1198,22 @@ def test_engine_core_hold_blocks_on_input_queue() -> None:
     assert EngineCoreProc._process_engine_step(core) is False
     dt = time.perf_counter() - t0
     assert got == [("U", "feed")] and not stepped and 0.015 < dt < 0.15
-    assert len(noted) == 1 and noted[0] < 0.15
+    assert not noted                                    # 一次「等」到真正调度时才记
     # 窗口到了也没来：超时返回，下一轮照常
     sched.p2p_hold_s = lambda: 0.01
     t0 = time.perf_counter()
     assert EngineCoreProc._process_engine_step(core) is False
     assert 0.008 < time.perf_counter() - t0 < 0.1 and len(got) == 1
-    # 不等 → 照常一步
+    # 不等 → 照常一步；调度前把这次「等」（两轮合计）记一笔
     sched.p2p_hold_s = lambda: 0.0
+    sched.p2p_role, sched.p2p_idle = "back", lambda: False
+    core._p2p_skip_schedule = lambda: EngineCore._p2p_skip_schedule(core)
+    core.step_fn = lambda: (stepped.append(1) or ({}, False)) if not core._p2p_skip_schedule() else ({}, False)
     core.post_step = lambda executed: None
     core.output_queue = queue.Queue()
     EngineCoreProc._process_engine_step(core)
-    assert stepped == [1]
+    assert stepped == [1] and len(noted) == 1 and 0.025 < noted[0] < 0.3
+    assert core._p2p_hold_t0 is None
 
 
 def _two_fronts_one_back(configs, batch_wait_ms: float, n_req: int = 6, max_tokens: int = 12):
@@ -1247,3 +1262,66 @@ def test_tiered_batch_wait_merges_and_matches_monolithic(configs) -> None:
     merged0 = sum(1 for b in back0.batches if b > 1) / len(back0.batches)
     assert merged > merged0 + 0.2 and len(back.batches) < len(back0.batches), \
         (merged, merged0, len(back.batches), len(back0.batches))
+
+
+
+def test_p2p_idle_only_when_nothing_to_schedule_or_flush(configs) -> None:
+    """O3c 的判据：前段 / 后段「调度一次只会得到空批、也没有要带给 worker 的东西」。"""
+    from vllm.p2p.stage import pack_rows
+    from vllm.p2p.tiered import _core_request
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.request import Request, RequestStatus
+
+    s = _back_two_decoding(configs, 0.0)                  # a、b 各采出一个 token，hidden 都没到
+    assert s.p2p_idle()
+    s.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert not s.p2p_idle()                               # a 能算
+    so = s.schedule()
+    assert so.num_scheduled_tokens == {"a": 1} and s.p2p_idle()   # a 在流水线里、b 没到 → 空
+    s.finish_requests(["b"], RequestStatus.FINISHED_ABORTED)
+    assert not s.p2p_idle()                               # 要把 b 结束的消息带给 worker
+    s.schedule()
+    assert s.p2p_idle()
+    req = _core_request("c", prompt=None, embeds=torch.zeros(3, W, dtype=torch.float16),
+                        max_tokens=4, eos=None, logprobs=0, ignore_eos=True, stop_ids=(), arrival=0.0)
+    s.add_request(Request.from_engine_core_request(req, None))
+    assert not s.p2p_idle()                               # 新请求要 prefill
+    # 前段：prefill 完、等后段的 token → 空；p2p_append 进来 → 有活
+    f = make_sched(configs["front"], 32)
+    req = _core_request("x", prompt=[5, 6, 7], embeds=None, max_tokens=4, eos=None, logprobs=0,
+                        ignore_eos=True, stop_ids=(), arrival=0.0)
+    f.add_request(Request.from_engine_core_request(req, None))
+    assert not f.p2p_idle()
+    so = f.schedule()
+    f.update_from_output(so, ModelRunnerOutput(req_ids=["x"], req_id_to_index={"x": 0}))
+    assert f.p2p_idle()
+    f.p2p_append([["x", [9]]])
+    assert not f.p2p_idle()
+    assert not make_sched(configs["mono"], 32).p2p_idle()          # 整模型引擎不走这条
+
+
+def test_batch_queue_skips_empty_schedule_and_drains_in_flight() -> None:
+    """PP（batch queue）时：没东西可算就不调度、不发空批；队列里有在跑的批就收它，空了就返回。"""
+    import contextlib
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCore
+
+    calls = []
+    sched = SimpleNamespace(p2p_role="back", p2p_batch_wait_ms=0.0, p2p_idle=lambda: True,
+                            has_requests=lambda: True,
+                            schedule=lambda: calls.append("schedule"),
+                            update_from_output=lambda so, mo: calls.append(("update", so)) or {0: "out"})
+    core = SimpleNamespace(scheduler=sched, batch_queue=__import__("collections").deque(),
+                           batch_queue_size=2, _p2p_trace=None, _process_aborts_queue=lambda: None,
+                           log_error_detail=lambda so: contextlib.nullcontext(),
+                           log_iteration_details=lambda so: contextlib.nullcontext())
+    core._p2p_hold_s = lambda: EngineCore._p2p_hold_s(core)
+    core._p2p_skip_schedule = lambda: EngineCore._p2p_skip_schedule(core)
+    assert EngineCore.step_with_batch_queue(core) == (None, False) and calls == []   # 空：什么都不发
+    fut = Future()
+    fut.set_result("model-out")
+    core.batch_queue.appendleft((fut, "so-1", fut))                                 # 有一批在流水线里
+    outs, _ = EngineCore.step_with_batch_queue(core)
+    assert calls == [("update", "so-1")] and outs == {0: "out"} and not core.batch_queue

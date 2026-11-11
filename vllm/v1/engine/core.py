@@ -343,10 +343,28 @@ class EngineCore:
                 "hold_ms": round(getattr(sc, "p2p_hold_ms", 0.0), 3)}
 
     def _p2p_hold_s(self) -> float:
-        """后段凑批等待（scheduler.p2p_hold_s）：现在该再等多少秒；0 = 照常调度。"""
+        """后段凑批等待（scheduler.p2p_hold_s）：现在该再等多少秒；0 = 照常调度。
+        一次「等」从第一次判出要等算起，到真正调度为止（不论中间是阻塞等输入还是在收流水线里的批），
+        结束时记进 scheduler.p2p_note_hold。"""
         if not getattr(self.scheduler, "p2p_batch_wait_ms", 0):
             return 0.0
-        return self.scheduler.p2p_hold_s()
+        h = self.scheduler.p2p_hold_s()
+        if h > 0 and getattr(self, "_p2p_hold_t0", None) is None:
+            self._p2p_hold_t0 = time.perf_counter()
+        return h
+
+    def _p2p_skip_schedule(self) -> bool:
+        """分段引擎这一轮不调度：没东西可算（O3c，不发空批）或在凑批等待（O3b）。
+        真要调度时顺带结束一次「等」的计时。"""
+        if getattr(self.scheduler, "p2p_role", None) is None:
+            return False
+        if self.scheduler.p2p_idle() or self._p2p_hold_s() > 0:
+            return True
+        t0 = getattr(self, "_p2p_hold_t0", None)
+        if t0 is not None:
+            self._p2p_hold_t0 = None
+            self.scheduler.p2p_note_hold(time.perf_counter() - t0)
+        return False
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -403,7 +421,7 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        if not self.scheduler.has_requests() or self._p2p_skip_schedule():
             return {}, False
         tr = self._p2p_trace
         if tr is not None:
@@ -469,8 +487,9 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        # P2P 后段凑批等待：要等就先不排新批（流水线里在跑的批照常往下收）
-        if self.scheduler.has_requests() and not (batch_queue and self._p2p_hold_s() > 0):
+        # P2P 分段引擎：没东西可算（O3c）或在凑批等待（O3b）时不排新批 —— 不发空批绕流水线一圈；
+        # 流水线里在跑的批照常往下收，队列空了就回 _process_engine_step 阻塞等输入
+        if self.scheduler.has_requests() and not self._p2p_skip_schedule():
             scheduler_output = self.scheduler.schedule()
             if self._p2p_trace is not None:
                 self._p2p_trace.begin(id(scheduler_output), scheduler_output, self.scheduler)
@@ -1029,13 +1048,11 @@ class EngineCoreProc(EngineCore):
             hold = self._p2p_hold_s()
             if hold > 0:
                 # P2P 后段凑批等待：阻塞等输入（另一条请求的 hidden 来了就马上回去重新判断），
-                # 最多等到窗口结束；不调度、不跑空步
-                t0 = time.perf_counter()
+                # 最多等到窗口结束；不调度、不跑空步（计时在 _p2p_skip_schedule 里收尾）
                 try:
                     req = self.input_queue.get(timeout=hold)
                 except queue.Empty:
                     req = None
-                self.scheduler.p2p_note_hold(time.perf_counter() - t0)
                 if req is not None:
                     self._handle_client_request(*req)
                 return False

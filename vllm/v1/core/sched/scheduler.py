@@ -1583,6 +1583,21 @@ class Scheduler(SchedulerInterface):
             return 0.0
         return max(0.0, max(first, self._p2p_t_last_end) + w / 1e3 - now)
 
+    def p2p_idle(self) -> bool:
+        """分段引擎（O3c）：这时调度一次只会得到一个空批、也没有要带给 worker 的状态 → 不必调度。
+
+        空批在多机 PP 时要发给流水线上每一台再取回（一圈网络），新到的输入得等它回来才排得上。
+        只在下面都成立时才算「空」：没有等着进来的请求；没有要通知 worker 的结束请求；没有攒着要随
+        调度结果送下去的 hidden；正在跑的请求都没有能算的位置（前段：没有新 token；后段：hidden 没到，
+        或已在流水线里）。"""
+        if not self.p2p_role or self.finished_req_ids or self._p2p_pending or len(self.waiting):
+            return False
+        for req in self.running:
+            n = req.num_tokens if req.p2p_ready is None else min(req.num_tokens, req.p2p_ready)
+            if n > req.num_computed_tokens:
+                return False
+        return True
+
     def p2p_note_hold(self, seconds: float) -> None:
         self.p2p_hold_n += 1
         self.p2p_hold_ms += seconds * 1e3
