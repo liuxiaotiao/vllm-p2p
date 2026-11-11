@@ -441,3 +441,24 @@ def test_ttft_breakdown_real_and_sim(world) -> None:
     assert "TTFT 拆分" in txt
     ks = S.key_metrics(doc)
     assert {"TTFT·前段 prefill p50", "TTFT·后段→首 token p50"} <= set(ks)
+
+
+def test_bandwidth_moves_prompt_transfer_not_decode(world) -> None:
+    """有效带宽只影响大消息：prompt 的 hidden（每 token 4 KB）—— TTFT 的前段 / 后段两段变长，
+    每 token 间隔（只传一个位置）几乎不变。"""
+    from vllm.p2p import tiered_stats as TS
+
+    real = fake_real(world["stages"], n=9)
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    docs = {}
+    for bw in (10000.0, 1000.0):
+        net = S.Net(ip=ip, hop_ms=2.0, agent_hop_ms=2.0, lat_same=0.1, lat_cross=3.0, lat_gw=0.1, bw_default=bw)
+        docs[bw] = S.run_sim(world["stages"], S.replay_requests(real, world["stages"]), perf=perf, net=net,
+                             node_gpu=gpu, params=S.Params(), real=real, per_front=1)
+    hi, lo = (TS.ttft_breakdown(docs[b]["requests"])["all"] for b in (10000.0, 1000.0))
+    # 平均 prompt ≈ 140 token ≈ 1.1 MB（fp16，hidden 2048 × 2 字节 × 2）：1 Gbps 多 ≈ 4 ms / 次
+    assert lo["前段 prefill"]["mean"] > hi["前段 prefill"]["mean"] + 2
+    assert lo["后段→首 token"]["mean"] > hi["后段→首 token"]["mean"] + 2
+    k = S.key_metrics
+    assert k(docs[1000.0])["TPOT 均值"] == pytest.approx(k(docs[10000.0])["TPOT 均值"], rel=0.02)

@@ -985,7 +985,7 @@ def _setup(a) -> tuple:
     perf = load_perf(a.layer_bench)
     net = Net(ip=ip, lat=lat, bw=bw, lat_same=a.lat_same, lat_cross=a.lat_cross, lat_gw=a.lat_gw,
               gateway=a.gateway_node, hop_ms=a.hop_ms, agent_hop_ms=a.agent_hop_ms, pp_hop_ms=a.pp_hop_ms,
-              back_pp_hop_ms=a.back_pp_hop_ms)
+              back_pp_hop_ms=a.back_pp_hop_ms, bw_default=a.bw_mbps)
     hidden = a.hidden
     if a.model_dir and (Path(a.model_dir) / "config.json").exists():
         hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
@@ -1050,6 +1050,9 @@ def _common(ap) -> None:
     ap.add_argument("--lat-same", type=float, default=0.1, help="同网段单向时延 ms（没 --topo 时）")
     ap.add_argument("--lat-cross", type=float, default=3.15, help="跨网段单向时延 ms（没 --topo 时）")
     ap.add_argument("--lat-gw", type=float, default=0.1, help="网关 ↔ 节点单向时延（没 --gateway-node 时）")
+    ap.add_argument("--bw-mbps", type=float, default=10000.0,
+                    help="节点间 / 网关 ↔ 节点的有效带宽（Mbps；--topo 里没写的边都用它）。只影响大消息："
+                         "prompt 的 hidden（每 token 4 KB）、PP 的 prefill hidden")
     ap.add_argument("--gateway-node", default=None, help="网关在哪个节点（如 N09），网关消息按它算时延")
     ap.add_argument("--lr-ms", type=float, default=2.0)
     ap.add_argument("--client-ms", type=float, default=1.0)
