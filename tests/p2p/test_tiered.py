@@ -567,6 +567,10 @@ def test_remote_agents_and_gateway_end_to_end(configs, direct) -> None:
         # 代理量的「引擎内」耗时随输出带回来了（前段：append → hidden；后段：feed → token）
         assert r["metrics"]["front_engine_ms_p50"] is not None
         assert r["metrics"]["back_engine_ms_p50"] is not None
+        # prompt 那一下的引擎内耗时（拆 TTFT 用）：都在、且小于协调器量的对应段
+        fe0, be0 = r["metrics"]["front_prefill_engine_ms"], r["metrics"]["back_prefill_engine_ms"]
+        assert fe0 is not None and 0 < fe0 <= r["metrics"]["front_prefill_ms"]
+        assert be0 is not None and 0 < be0 <= r["metrics"]["ttft_ms"] - r["metrics"]["front_prefill_ms"]
     assert {r["front"] for r in res} == {"front-A", "front-B"}          # 前段池：两个都用上了
     assert {r["channel"] for r in res} == {"back-t-0", "back-t-1"}      # 同 task 两个后段
     assert nonstream["choices"][0]["text"] == tok.decode(mono(prompts[0], MAXT, EOS))

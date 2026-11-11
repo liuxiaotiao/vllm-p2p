@@ -495,6 +495,8 @@ class SimReq:
     t_front_done: float | None = None
     t_front_seen: float | None = None   # 前段 prefill 的输出到网关（协调器）的时刻
     t_first_gw: float | None = None     # 第一个 token 到网关的时刻
+    t_in: dict = field(default_factory=dict)   # 角色 → prompt 到这个引擎的时刻（引擎内毫秒的起点）
+    t_back_out0: float | None = None    # 后段出第 1 个 token 的时刻
     toks: list = field(default_factory=list)       # 每个 token 到客户端的时刻
     n_out: int = 0
     queue_engine_ms: dict = field(default_factory=dict)
@@ -583,7 +585,10 @@ class Sim:
         self.at(t + self.net.msg(None, e.node0, r.n_prompt * 4, kind=self.kind), self._arrive, e, r.rid, ("pf", r.n_prompt))
 
     def _arrive(self, t: float, e: SimEngine, rid: str, item: tuple) -> None:
-        if rid in self.reqs and self.reqs[rid].t_done is None:
+        r = self.reqs.get(rid)
+        if r is not None and r.t_done is None:
+            if item[0] == "pf":
+                r.t_in.setdefault(e.role, t)
             e.put(rid, item, t)
 
     def _identified(self, t: float, r: SimReq) -> None:
@@ -632,6 +637,7 @@ class Sim:
         t_cli = t + self.net.msg(e.node0, None, 8, kind=self.kind)
         r.toks.append(t_cli)
         if r.n_out == 1:
+            r.t_back_out0 = t
             r.t_first = t_cli
             r.t_first_gw = t_cli          # 模拟里网关 = 客户端：网关外这一段只有这条消息
         if r.n_out >= r.n_gen:
@@ -764,8 +770,12 @@ def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[d
             "utilisation": 0.0, "token_ms": [round(x, 2) for x in gaps], "marks": mk,
             "t_submit_s": round(r.t_submit / 1e3, 3), "t_done_s": round(r.t_done / 1e3, 3),
             **({"case_id": r.case_id} if r.case_id else {}),
-            "engine": ({"ttft_ms": round(r.t_first_gw - r.t_submit, 2)} if fe and r.t_first_gw is not None
-                       else None),
+            "engine": ({"ttft_ms": round(r.t_first_gw - r.t_submit, 2),
+                        "front_prefill_engine_ms": (round(r.t_front_done - r.t_in["front"], 2)
+                                                    if r.t_front_done is not None and "front" in r.t_in else None),
+                        "back_prefill_engine_ms": (round(r.t_back_out0 - r.t_in["back"], 2)
+                                                   if r.t_back_out0 is not None and "back" in r.t_in else None)}
+                       if fe and r.t_first_gw is not None else None),
             "identify": None, "nodes": [], "missing_traces": [],
         })
     return rows

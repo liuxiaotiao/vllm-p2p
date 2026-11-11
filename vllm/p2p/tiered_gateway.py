@@ -191,6 +191,8 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                 "front_leg_ms_p50": p50(res.get("front_leg_ms") or []),
                 "back_leg_ms_p50": p50(res.get("back_leg_ms") or []),
                 "front_engine_ms_p50": p50(res.get("front_engine_ms") or []),
+                "front_prefill_engine_ms": res.get("front_prefill_engine_ms"),
+                "back_prefill_engine_ms": res.get("back_prefill_engine_ms"),
                 "back_engine_ms_p50": p50(res.get("back_engine_ms") or []),
                 "num_generation_tokens": len(res.get("tokens") or [])}
 

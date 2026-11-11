@@ -153,7 +153,7 @@ class _Req:
     __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
                  "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
                  "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b", "feat", "body",
-                 "true_task", "t_wait", "identified")
+                 "true_task", "t_wait", "identified", "eng_f0", "eng_b0")
 
     def __init__(self, rid, prompt, max_tokens, task, loop, body=None):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
@@ -180,6 +180,10 @@ class _Req:
         # 远端引擎（remote.py）报的「引擎内毫秒」：每个 decode 位置前段 / 后段各一个
         self.eng_f: list[float] = []
         self.eng_b: list[float] = []
+        # prompt 那一下的「引擎内毫秒」（代理量：收到请求 → 交出结果，含代理 ↔ EngineCore 的进程间转发、
+        # 引擎里排队与 prefill 那一步）：前段 = 交出 prompt 的 hidden；后段 = 出第 1 个 token。拆 TTFT 用
+        self.eng_f0: float | None = None
+        self.eng_b0: float | None = None
 
     def result(self) -> dict:
         n = len(self.tokens)
@@ -200,6 +204,7 @@ class _Req:
                              if self.t_wait is not None and self.t_bound else 0.0),
             "front_leg_ms": legs_f, "back_leg_ms": legs_b,
             "front_engine_ms": self.eng_f, "back_engine_ms": self.eng_b,
+            "front_prefill_engine_ms": self.eng_f0, "back_prefill_engine_ms": self.eng_b0,
             **({"info": self.info} if self.info else {}),
         }
 
@@ -590,6 +595,8 @@ class TieredCoordinator:
                         continue          # 前段被抢占后重算，送来的是旧位置
                     start, rows = got
                     if r.back is None:
+                        if o.request_id in meta:
+                            r.eng_f0 = meta[o.request_id]
                         r.stream.keep(rows)
                         if r.stream.next >= r.n_prompt and not r.identified:
                             r.t_front = now
@@ -643,6 +650,8 @@ class TieredCoordinator:
                         if len(r.tokens) > 1 and o.request_id in meta:
                             r.eng_b.append(meta[o.request_id])      # 第 1 个 token 是 prefill，不算
                             b.observe(meta[o.request_id])
+                        elif len(r.tokens) == len(new) and o.request_id in meta:
+                            r.eng_b0 = meta[o.request_id]           # 第 1 个 token：后段 prefill
                         r.events.put_nowait(("tok", new))
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)

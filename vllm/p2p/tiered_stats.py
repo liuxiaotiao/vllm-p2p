@@ -95,6 +95,7 @@ def full_stats(xs) -> dict:
 
 
 TTFT_PARTS = ("网关外", "前段 prefill", "识别+绑定", "后段→首 token")
+TTFT_SUB = ("前段·引擎内", "后段·引擎内")       # 上面两段里「代理量的引擎内」那部分（新结果才有）
 
 
 def ttft_parts(r) -> dict | None:
@@ -103,13 +104,21 @@ def ttft_parts(r) -> dict | None:
     * 网关外 = 客户端 TTFT − 协调器 TTFT：客户端 ↔ 网关的 HTTP、网关解析请求、首 token 经网关回客户端；
     * 前段 prefill = 协调器收下请求 → 收到前段 prefill 的输出（含发给前段、前段排队与那一步、出口统计回传）；
     * 识别+绑定 = 跑 LR、挑后段（含 hold 时在前段等后段空位）；
-    * 后段→首 token = 绑定 → 协调器收到第一个 token（prompt 的 hidden 发给后段、后段 prefill、token 回传）。"""
+    * 后段→首 token = 绑定 → 协调器收到第一个 token（prompt 的 hidden 发给后段、后段 prefill、token 回传）。
+
+    结果里有代理量的 prompt 那一下的引擎内毫秒（`engine.front_prefill_engine_ms` / `back_prefill_engine_ms`：
+    代理收到请求 → 交出结果，含代理 ↔ EngineCore 的进程间转发、排队、prefill 那一步）时，另给
+    「前段·引擎内」「后段·引擎内」—— 对应段减去它 = 协调器 ↔ 代理的传输与两头的处理。"""
     t, e = r.get("tiered") or {}, r.get("engine") or {}
     fp, bd, co, cli = t.get("front_prefill_ms"), t.get("bind_ms"), e.get("ttft_ms"), r.get("prefill_ms")
     if fp is None or bd is None or co is None or cli is None:
         return None
     fp, bd, co, cli = float(fp), float(bd), float(co), float(cli)
-    return dict(zip(TTFT_PARTS, (cli - co, fp, bd, co - fp - bd)))
+    out = dict(zip(TTFT_PARTS, (cli - co, fp, bd, co - fp - bd)))
+    for k, f in zip(TTFT_SUB, ("front_prefill_engine_ms", "back_prefill_engine_ms")):
+        if e.get(f) is not None:
+            out[k] = float(e[f])
+    return out
 
 
 def ttft_breakdown(rows) -> dict | None:
@@ -118,24 +127,30 @@ def ttft_breakdown(rows) -> dict | None:
     if not parts:
         return None
 
+    keys = [k for k in (*TTFT_PARTS, *TTFT_SUB) if all(k in p for _, p in parts)]
+
     def agg(ps):
-        return {k: {"mean": st.fmean(p[k] for p in ps), "p50": _med([p[k] for p in ps])} for k in TTFT_PARTS}
+        return {k: {"mean": st.fmean(p[k] for p in ps), "p50": _med([p[k] for p in ps])} for k in keys}
     by = defaultdict(list)
     for r, p in parts:
         by[r.get("true_task") or r.get("task") or "?"].append(p)
-    return {"n": len(parts), "all": agg([p for _, p in parts]),
+    return {"n": len(parts), "keys": keys, "all": agg([p for _, p in parts]),
             "by_task": {u: agg(ps) for u, ps in sorted(by.items())}}
 
 
 def format_ttft_breakdown(tb: dict | None) -> list[str]:
     if not tb:
         return []
+    keys = tb.get("keys") or list(TTFT_PARTS)
     out = ["", f"    TTFT 拆分（{tb['n']} 条；均值 / p50，ms）",
-           f"    {'':<12}" + "".join(f"{k:>16}" for k in TTFT_PARTS)]
+           f"    {'':<12}" + "".join(f"{k:>16}" for k in keys)]
     for name, d in (("全部", tb["all"]), *tb["by_task"].items()):
-        out.append(f"    {name:<12}" + "".join(f"{d[k]['mean']:>9.1f} / {d[k]['p50']:<5.0f}" for k in TTFT_PARTS))
+        out.append(f"    {name:<12}" + "".join(f"{d[k]['mean']:>9.1f} / {d[k]['p50']:<5.0f}" for k in keys))
     out.append("    网关外 = 客户端 TTFT − 协调器 TTFT（HTTP、解析、首 token 回客户端）；前段 prefill 含发给前段与回传；"
                "识别+绑定 含 LR 与在前段等后段；后段→首 token 含 prompt hidden 发给后段、后段 prefill、token 回传")
+    if any(k in keys for k in TTFT_SUB):
+        out.append("    ·引擎内 = 代理量的「收到请求 → 交出结果」（代理 ↔ EngineCore 转发、排队、prefill 那一步）；"
+                   "所在段减去它 = 协调器 ↔ 代理的传输与处理")
     return out
 
 
