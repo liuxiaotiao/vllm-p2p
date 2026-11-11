@@ -281,6 +281,7 @@ class Params:
     # pf_fixed_per：step = 每步一次；stage = 每个 PP 段一次；layer = 每层一次
     pf_fixed_ms: float = 0.0
     pf_fixed_per: str = "stage"
+    pf_scale: float = 1.0                    # layer_bench 的 prefill 逐层用时乘这个数（随 token 数增长的那部分）
     # 凑批等待（假设实验，真引擎还没有）：引擎空闲、手上的 decode 输入比「在它这儿跑的请求」少时，
     # 最多再等这么久让其余请求的输入也到齐，再一起算一步。0 = 不等（= 现在的 vLLM）
     batch_wait_ms: float = 0.0
@@ -362,7 +363,7 @@ class SimEngine:
         P = self.sim.params
         for g, nl in zip(self.gpus, self.layers):
             c = nl * g.decode_ms(self.experts, ctx, b) if b else 0.0
-            c += sum(nl * g.prefill_ms(self.experts, n) for n in pf_tokens)
+            c += sum(nl * g.prefill_ms(self.experts, n) for n in pf_tokens) * P.pf_scale
             if pf_tokens and P.pf_fixed_ms:
                 c += P.pf_fixed_ms * (nl if P.pf_fixed_per == "layer" else 1 if P.pf_fixed_per == "stage" else 0)
             comp.append(c)
@@ -908,7 +909,8 @@ def key_metrics(doc: Mapping) -> dict:
 
 def compare(sim: Mapping, real: Mapping, score: str = "all") -> tuple[list[str], float]:
     """关键指标逐项比；返回 (表格行, 误差分 = 各项相对误差平方的均值，后段分项按条数加权)。
-    score：all = TTFT p50 + TPOT + 吞吐；tpot = 只看 TPOT（含各后段）；ttft = 只看 TTFT p50。"""
+    score：all = TTFT p50 + TPOT + 吞吐；tpot = 只看 TPOT（含各后段）；ttft = 只看 TTFT p50；
+    ttft-all = TTFT p50 + 均值（长 prompt 拉高均值，用来约束 prefill 随长度增长的那部分）。"""
     ks, kr = key_metrics(sim), key_metrics(real)
     lines = [f"{'指标':<28}{'真机':>12}{'模拟':>12}{'相对误差':>10}"]
     errs, ws = [], []
@@ -923,11 +925,11 @@ def compare(sim: Mapping, real: Mapping, score: str = "all") -> tuple[list[str],
         lines.append(f"{k:<28}{a:>12.2f}{b:>12.2f}{100 * e:>9.1f}%")
         # TTFT 用中位数打分：均值会被引擎刚起来时那几条（几秒）拉偏
         use = {"all": ("TTFT p50", "TPOT 均值", "TPOT p90", "输出 tok/s"), "tpot": ("TPOT 均值", "TPOT p90"),
-               "ttft": ("TTFT p50",)}[score]
+               "ttft": ("TTFT p50",), "ttft-all": ("TTFT p50", "TTFT 均值")}[score]
         if k in use:
             errs.append(e * e)
             ws.append(2.0)
-        elif k.startswith("TPOT 均值 ") and score != "ttft":
+        elif k.startswith("TPOT 均值 ") and score not in ("ttft", "ttft-all"):
             errs.append(e * e)
             ws.append(n_by.get(k[len("TPOT 均值 "):], 1) / max(len(real.get("requests") or [1]), 1) * 4)
     score = sum(e * w for e, w in zip(errs, ws)) / sum(ws) if ws else math.inf
@@ -1004,16 +1006,33 @@ def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float,
     best, best_doc = score_of(cur)
     log(f"  起点 {cur} → 误差分 {best:.4f}")
     for rd in range(rounds):
+        start = dict(cur)
         for k in ("front_fixed_ms", "back_fixed_ms", "hop_ms", *extra):
             if k in fixed:
                 continue
             base = cur[k] if cur[k] > 0 else 0.5
-            for m in (0.0, 0.25, 0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0):
+            # 第一轮粗找，之后加细档：两个参数互相牵制时（比如 prefill 的固定部分与斜率），粗档会在
+            # 两者之间来回跳、停在半路
+            ms = (0.0, 0.25, 0.5, 0.75, 0.9, 1.1, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0) if rd == 0 else \
+                (0.5, 0.67, 0.8, 0.87, 0.93, 0.97, 1.03, 1.07, 1.15, 1.25, 1.5, 2.0)
+            for m in ms:
                 c = dict(cur, **{k: round(base * m, 4)})
                 s, doc = score_of(c)
                 if s < best - 1e-9:
                     best, best_doc, cur = s, doc, c
             log(f"  第 {rd + 1} 轮 {k:<15} → {cur[k]:.3f}   误差分 {best:.4f}")
+        # 顺着这一轮总的走向再迈几步（Hooke–Jeeves 式的模式移动）：两个参数此消彼长时，逐个调只会锯齿式
+        # 慢慢挪，沿合起来的方向走能一下过去
+        step = {k: cur[k] - start[k] for k in cur}
+        if any(abs(v) > 1e-12 for v in step.values()):
+            for t in (1.0, 2.0, 4.0):
+                c = {k: round(max(0.0, cur[k] + t * step[k]), 4) for k in cur}
+                s_, doc = score_of(c)
+                if s_ < best - 1e-9:
+                    best, best_doc, cur = s_, doc, c
+                else:
+                    break
+            log(f"  第 {rd + 1} 轮 沿走向      → 误差分 {best:.4f}")
     p = Params(**{**params.as_dict(), "front_fixed_ms": cur["front_fixed_ms"],
                   "back_fixed_ms": cur["back_fixed_ms"]})
     best_doc.setdefault("sim", {})["fit"] = {"params": cur, "score": best}
@@ -1046,6 +1065,7 @@ def _setup(a) -> tuple:
     params = Params(front_fixed_ms=a.front_fixed_ms, back_fixed_ms=a.back_fixed_ms, lr_ms=a.lr_ms,
                     client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden,
                     pp_simple=a.pp_simple, pf_fixed_ms=a.pf_fixed_ms, pf_fixed_per=a.pf_fixed_per,
+                    pf_scale=a.pf_scale,
                     batch_wait_ms=a.batch_wait_ms, batch_wait_role=a.batch_wait_role)
     steps = None
     if a.steps:
@@ -1099,6 +1119,8 @@ def _common(ap) -> None:
                     help="含 prefill 的步额外的固定开销（layer_bench 的逐层斜率量不到的那部分）")
     ap.add_argument("--pf-fixed-per", choices=("step", "stage", "layer"), default="stage",
                     help="--pf-fixed-ms 按什么计：每步一次 / 每个 PP 段一次 / 每层一次")
+    ap.add_argument("--pf-scale", type=float, default=1.0,
+                    help="layer_bench 的 prefill 逐层用时乘这个数（只缩放随 token 数增长的部分；固定部分是 --pf-fixed-ms）")
     ap.add_argument("--pp-simple", action="store_true",
                     help="多机 PP 用 v1 的算法：只算往下传的几跳，不算调度下发与结果回传")
     ap.add_argument("--lat-same", type=float, default=0.1, help="同网段单向时延 ms（没 --topo 时）")
@@ -1126,14 +1148,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     f.add_argument("--rounds", type=int, default=3)
     f.add_argument("--fit-back-pp", action="store_true",
                    help="也标定 --back-pp-hop-ms（分段部署后段的 PP 每次传输开销）")
-    f.add_argument("--score", choices=("all", "tpot", "ttft"), default="all",
-                   help="标定看哪些指标：all = TTFT 中位数 + TPOT + 吞吐；tpot / ttft = 只看那一项"
+    f.add_argument("--score", choices=("all", "tpot", "ttft", "ttft-all"), default="all",
+                   help="标定看哪些指标：all = TTFT 中位数 + TPOT + 吞吐；tpot / ttft = 只看那一项；"
+                        "ttft-all = TTFT 中位数 + 均值（和 --fit-pf-scale 一起用）"
                         "（只调影响 TPOT 的参数时用 tpot，免得被 TTFT 里别的误差带偏）")
     f.add_argument("--fit-agent", action="store_true",
                    help="也标定 --agent-hop-ms（分段部署代理那条路每跳的开销）")
     f.add_argument("--fit-pf", action="store_true",
                    help="也标定 --pf-fixed-ms（含 prefill 的步的固定开销；按 --pf-fixed-per 计）。"
                         "不要和 --steps 一起用（那时 prefill 步用的是实测值）")
+    f.add_argument("--fit-pf-scale", action="store_true",
+                   help="也标定 --pf-scale（prefill 随 token 数增长的那部分）。和 --fit-pf、--score ttft-all 一起用："
+                        "中位数定固定部分，均值（长 prompt）定斜率")
     f.add_argument("--fit-pp", action="store_true",
                    help="也标定 --pp-hop-ms（多机 PP 每次传输的固定开销）。同一深度的流水线下它和每步固定开销"
                         "分不开 —— 有步级记录（--steps）或不同深度的部署一起看时再开")
@@ -1175,7 +1201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def make(p: Params, hop: float, pp_hop_ms: float | None = None,
              pf_fixed_ms: float | None = None, agent_hop_ms: float | None = None,
-             back_pp_hop_ms: float | None = None) -> dict:
+             back_pp_hop_ms: float | None = None, pf_scale: float | None = None) -> dict:
         net.hop_ms = hop
         if back_pp_hop_ms is not None:
             net.back_pp_hop_ms = back_pp_hop_ms
@@ -1185,6 +1211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             net.pp_hop_ms = pp_hop_ms
         if pf_fixed_ms is not None:
             p = Params(**{**p.as_dict(), "pf_fixed_ms": pf_fixed_ms})
+        if pf_scale is not None:
+            p = Params(**{**p.as_dict(), "pf_scale": pf_scale})
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
                        hold=not a.no_hold, front_pick=a.front_pick, steps=steps, real=real,
@@ -1200,6 +1228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             extra["pp_hop_ms"] = a.pp_hop_ms
         if a.fit_pf:
             extra["pf_fixed_ms"] = a.pf_fixed_ms or 10.0
+        if a.fit_pf_scale:
+            extra["pf_scale"] = a.pf_scale
         if a.fit_agent:
             extra["agent_hop_ms"] = a.agent_hop_ms
         if a.fit_back_pp:

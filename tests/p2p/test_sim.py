@@ -509,3 +509,27 @@ def test_summary_table_cli(world, tmp_path) -> None:
     recs = json.loads(js.read_text())
     assert recs[1]["metrics"]["TPOT 均值"]["err"] == 0 and recs[0]["metrics"]["TPOT 均值"]["err"] > 0
     assert recs[0]["n"] == 9
+
+
+def test_fit_prefill_fixed_and_scale_from_ttft_mean(world) -> None:
+    """prefill 的固定部分与随 token 数增长的部分一起标：中位数 + 均值（长 prompt 拉高均值）能把两个都找回来。"""
+    real_tpl = fake_real(world["stages"], n=12, gen=(8, 8, 8))
+    for i, r in enumerate(real_tpl["requests"]):
+        r["n_prompt"] = 900 if i % 6 == 5 else 60 + 10 * i      # 多数短、少数很长：均值被长的拉高
+    truth = setup(world, real_tpl, per_front=1, pf_fixed_ms=8.0, pf_scale=0.5, front_fixed_ms=1.0, back_fixed_ms=1.0)
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    net = S.Net(ip=ip, hop_ms=2.0, agent_hop_ms=2.0, lat_same=0.1, lat_cross=3.0, lat_gw=0.1)
+
+    def make(p, hop, pf_fixed_ms=None, pf_scale=None):
+        net.hop_ms = hop
+        p = S.Params(**{**p.as_dict(), **({"pf_fixed_ms": pf_fixed_ms} if pf_fixed_ms is not None else {}),
+                        **({"pf_scale": pf_scale} if pf_scale is not None else {})})
+        return S.run_sim(world["stages"], S.replay_requests(truth, world["stages"]), perf=perf, net=net,
+                         node_gpu=gpu, params=p, real=truth, per_front=1)
+    base = S.Params(front_fixed_ms=1.0, back_fixed_ms=1.0)
+    p, _, score, doc = S.fit(make, truth, base, 2.0, rounds=4, fixed=("front_fixed_ms", "back_fixed_ms", "hop_ms"),
+                             extra={"pf_fixed_ms": 20.0, "pf_scale": 1.0}, score="ttft-all", log=lambda s: None)
+    got = doc["sim"]["fit"]["params"]
+    assert score < 1e-3, (score, doc["sim"]["fit"]["params"])
+    assert got["pf_scale"] == pytest.approx(0.5, rel=0.3) and got["pf_fixed_ms"] == pytest.approx(8.0, rel=0.5), got
