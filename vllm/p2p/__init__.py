@@ -43,6 +43,7 @@
   是真网关同一套函数；回放真机结果，输出 bench 格式，`fit` 标定每步固定开销与每跳开销）。
 * `vllm/p2p/steptrace.py` —— 分段引擎的步级记录（`stages.py --step-trace DIR` 打开；collect / summary），
   给模拟器当「一步多久」的真值。
+* `vllm/p2p/plan_view.py` —— 看规划器的分配方案（段 / 节点 / 配对），可对上 vLLM 引擎名与实测每步。
 * `tests/p2p/` —— 以上各件的单测与端到端测试（假的 vLLM 通道，不要 GPU）。
 
 在集群上安装：先在一台节点上（本目录在 /home/ubuntu/vllm-p2p）
