@@ -94,6 +94,51 @@ def full_stats(xs) -> dict:
             "p50": _pct(xs, 50), "p90": _pct(xs, 90), "p99": _pct(xs, 99), "max": max(xs)}
 
 
+TTFT_PARTS = ("网关外", "前段 prefill", "识别+绑定", "后段→首 token")
+
+
+def ttft_parts(r) -> dict | None:
+    """把一条请求的 TTFT（客户端口径）拆成四段（ms），分段网关的结果才有：
+
+    * 网关外 = 客户端 TTFT − 协调器 TTFT：客户端 ↔ 网关的 HTTP、网关解析请求、首 token 经网关回客户端；
+    * 前段 prefill = 协调器收下请求 → 收到前段 prefill 的输出（含发给前段、前段排队与那一步、出口统计回传）；
+    * 识别+绑定 = 跑 LR、挑后段（含 hold 时在前段等后段空位）；
+    * 后段→首 token = 绑定 → 协调器收到第一个 token（prompt 的 hidden 发给后段、后段 prefill、token 回传）。"""
+    t, e = r.get("tiered") or {}, r.get("engine") or {}
+    fp, bd, co, cli = t.get("front_prefill_ms"), t.get("bind_ms"), e.get("ttft_ms"), r.get("prefill_ms")
+    if fp is None or bd is None or co is None or cli is None:
+        return None
+    fp, bd, co, cli = float(fp), float(bd), float(co), float(cli)
+    return dict(zip(TTFT_PARTS, (cli - co, fp, bd, co - fp - bd)))
+
+
+def ttft_breakdown(rows) -> dict | None:
+    """各段的均值 / p50（全部请求、按 task）；没有分段记录 → None。"""
+    parts = [(r, p) for r in rows if (p := ttft_parts(r)) is not None]
+    if not parts:
+        return None
+
+    def agg(ps):
+        return {k: {"mean": st.fmean(p[k] for p in ps), "p50": _med([p[k] for p in ps])} for k in TTFT_PARTS}
+    by = defaultdict(list)
+    for r, p in parts:
+        by[r.get("true_task") or r.get("task") or "?"].append(p)
+    return {"n": len(parts), "all": agg([p for _, p in parts]),
+            "by_task": {u: agg(ps) for u, ps in sorted(by.items())}}
+
+
+def format_ttft_breakdown(tb: dict | None) -> list[str]:
+    if not tb:
+        return []
+    out = ["", f"    TTFT 拆分（{tb['n']} 条；均值 / p50，ms）",
+           f"    {'':<12}" + "".join(f"{k:>16}" for k in TTFT_PARTS)]
+    for name, d in (("全部", tb["all"]), *tb["by_task"].items()):
+        out.append(f"    {name:<12}" + "".join(f"{d[k]['mean']:>9.1f} / {d[k]['p50']:<5.0f}" for k in TTFT_PARTS))
+    out.append("    网关外 = 客户端 TTFT − 协调器 TTFT（HTTP、解析、首 token 回客户端）；前段 prefill 含发给前段与回传；"
+               "识别+绑定 含 LR 与在前段等后段；后段→首 token 含 prompt hidden 发给后段、后段 prefill、token 回传")
+    return out
+
+
 def _queue(r):
     return (float(r.get("queue_ms") or 0.0) + float(r.get("queue_back_ms") or 0.0)
             + float(r.get("wait_front_ms") or 0.0))
@@ -330,6 +375,7 @@ def continuous_report(doc: dict, title: str = "连续性测试") -> list[str]:
         for r in held:
             hb[r.get("true_task") or "?"] += 1
         out.append(f"    在前段等过后段的请求 {len(held)}/{len(rows)} 条：{dict(sorted(hb.items()))}")
+    out += format_ttft_breakdown(ttft_breakdown(rows))
     out += format_mark_stats(mark_stats(rows))
     out += format_segment_stats(segment_stats(rows))
     out += format_segment_stats(

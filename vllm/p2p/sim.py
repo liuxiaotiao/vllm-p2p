@@ -493,6 +493,8 @@ class SimReq:
     t_first: float | None = None
     t_done: float | None = None
     t_front_done: float | None = None
+    t_front_seen: float | None = None   # 前段 prefill 的输出到网关（协调器）的时刻
+    t_first_gw: float | None = None     # 第一个 token 到网关的时刻
     toks: list = field(default_factory=list)       # 每个 token 到客户端的时刻
     n_out: int = 0
     queue_engine_ms: dict = field(default_factory=dict)
@@ -619,8 +621,8 @@ class Sim:
         if e.role == "front":
             if item[0] == "pf":
                 r.t_front_done = t
-                self.at(t + self.net.msg(e.node0, None, r.n_prompt * H, kind=self.kind) + self.params.lr_ms,
-                        self._identified, r)
+                r.t_front_seen = t + self.net.msg(e.node0, None, r.n_prompt * H, kind=self.kind)
+                self.at(r.t_front_seen + self.params.lr_ms, self._identified, r)
             else:
                 be = self.engines[r.back.name]
                 self.at(t + self.net.msg(e.node0, be.node0, H, kind=self.kind), self._arrive, be, rid, ("dec", item[1]))
@@ -631,6 +633,7 @@ class Sim:
         r.toks.append(t_cli)
         if r.n_out == 1:
             r.t_first = t_cli
+            r.t_first_gw = t_cli          # 模拟里网关 = 客户端：网关外这一段只有这条消息
         if r.n_out >= r.n_gen:
             self.at(t_cli, lambda tt, rr=r: self._finish(tt, rr))
             return
@@ -747,8 +750,10 @@ def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[d
             "confidence": 0.0, "zone": "", "rebinds": 0, "alarms": 0,
             "front": "+".join(fe.nodes) if fe else None, "back": "+".join(be.nodes),
             "front_engine": fe.name if fe else None,
-            **({"tiered": {"front_prefill_ms": round((r.t_front_done or 0) - r.t_submit, 2),
-                           "bind_ms": None, "wait_back_ms": round(wait_back, 2)}} if fe else {}),
+            **({"tiered": {"front_prefill_ms": round((r.t_front_seen or r.t_front_done or 0) - r.t_submit, 2),
+                           "bind_ms": (round(r.t_bound - r.t_front_seen, 2)
+                                       if r.t_bound is not None and r.t_front_seen is not None else None),
+                           "wait_back_ms": round(wait_back, 2)}} if fe else {}),
             "wait_front_ms": round(wait_back, 2),
             "channel": be.name, "n_prompt": r.n_prompt, "n_generated": r.n_out,
             "total_ms": round(total, 2), "queue_ms": round(r.t_gw_wait, 2),
@@ -759,7 +764,9 @@ def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[d
             "utilisation": 0.0, "token_ms": [round(x, 2) for x in gaps], "marks": mk,
             "t_submit_s": round(r.t_submit / 1e3, 3), "t_done_s": round(r.t_done / 1e3, 3),
             **({"case_id": r.case_id} if r.case_id else {}),
-            "engine": None, "identify": None, "nodes": [], "missing_traces": [],
+            "engine": ({"ttft_ms": round(r.t_first_gw - r.t_submit, 2)} if fe and r.t_first_gw is not None
+                       else None),
+            "identify": None, "nodes": [], "missing_traces": [],
         })
     return rows
 
@@ -871,6 +878,10 @@ def key_metrics(doc: Mapping) -> dict:
             by[r.get("channel") or "?"].append(v)
     for ch, vs in sorted(by.items()):
         out[f"TPOT 均值 {ch}"] = stt.mean(vs)
+    tb = _stats_mod().ttft_breakdown(rows)            # 分段网关：TTFT 四段的 p50（只显示，不进误差分）
+    if tb:
+        for k, v in tb["all"].items():
+            out[f"TTFT·{k} p50"] = v["p50"]
     return out
 
 

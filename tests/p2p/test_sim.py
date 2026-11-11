@@ -416,3 +416,25 @@ def test_stages_back_batch_wait(tmp_path) -> None:
     st0 = stages_from_channels(cj)
     assert all(not c.get("batch_wait_ms") for c in st0["channels"])
     assert all("p2p_batch_wait_ms" not in x["cmd"] for c in st0["channels"] for x in c["commands"])
+
+
+def test_ttft_breakdown_real_and_sim(world) -> None:
+    """TTFT 拆四段：真机行按网关 / 协调器记录拆；模拟行同一口径（网关外 = 0），四段之和 = TTFT。"""
+    from vllm.p2p import tiered_stats as TS
+
+    row = {"prefill_ms": 150.0, "true_task": "gsm8k",
+           "tiered": {"front_prefill_ms": 60.0, "bind_ms": 5.0, "wait_back_ms": 0.0},
+           "engine": {"ttft_ms": 120.0}}
+    assert TS.ttft_parts(row) == {"网关外": 30.0, "前段 prefill": 60.0, "识别+绑定": 5.0, "后段→首 token": 55.0}
+    assert TS.ttft_parts({"prefill_ms": 1.0}) is None and TS.ttft_breakdown([{"prefill_ms": 1.0}]) is None
+    doc = setup(world, fake_real(world["stages"], n=12), per_front=1)
+    tb = TS.ttft_breakdown(doc["requests"])
+    assert tb and tb["n"] == 12
+    for r in doc["requests"]:
+        p = TS.ttft_parts(r)
+        assert p["网关外"] == pytest.approx(0, abs=0.02) and p["前段 prefill"] > 0 and p["识别+绑定"] >= 0.5
+        assert p["后段→首 token"] > 0 and sum(p.values()) == pytest.approx(r["prefill_ms"], abs=0.05)
+    txt = "\n".join(TS.continuous_report(doc))
+    assert "TTFT 拆分" in txt
+    ks = S.key_metrics(doc)
+    assert {"TTFT·前段 prefill p50", "TTFT·后段→首 token p50"} <= set(ks)
