@@ -533,3 +533,17 @@ def test_fit_prefill_fixed_and_scale_from_ttft_mean(world) -> None:
     got = doc["sim"]["fit"]["params"]
     assert score < 1e-3, (score, doc["sim"]["fit"]["params"])
     assert got["pf_scale"] == pytest.approx(0.5, rel=0.3) and got["pf_fixed_ms"] == pytest.approx(8.0, rel=0.5), got
+
+
+def test_detail_cli(world, tmp_path) -> None:
+    real = fake_real(world["stages"], n=9)
+    a = setup(world, real, per_front=1)
+    (tmp_path / "a.json").write_text(json.dumps(a))
+    md = tmp_path / "d.md"
+    assert S.main(["detail", "--real", str(tmp_path / "a.json"), "--sim", str(tmp_path / "a.json"),
+                   "--md", str(md)]) == 0
+    txt = md.read_text()
+    assert "### TTFT ms" in txt and "### TPOT ms" in txt and "| 全部 | 9 / 9 |" in txt
+    assert "| gsm8k | 3 / 3 |" in txt and "（+0.0%）" in txt
+    assert S.main(["detail", "--real", str(tmp_path / "a.json"), "--sim", str(tmp_path / "a.json"),
+                   "--by", "channel"]) == 0

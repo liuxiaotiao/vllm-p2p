@@ -979,6 +979,47 @@ def summary_table(runs: Sequence[tuple[str, Mapping, Mapping]]) -> tuple[list[st
     return out, recs
 
 
+DETAIL_METRICS = (("TTFT ms", lambda r: r.get("prefill_ms")),
+                  ("TPOT ms", lambda r: _tpot(r)),
+                  ("生成时延 ms", lambda r: r.get("total_ms")),
+                  ("单请求 token/s", lambda r: (int(r.get("n_generated") or 0) / (float(r["total_ms"]) / 1e3)
+                                              if r.get("total_ms") else None)))
+DETAIL_STATS = ("mean", "p50", "p90", "p99", "max")
+
+
+def detail_table(real: Mapping, sim: Mapping, by: str = "true_task") -> list[str]:
+    """真机 / 模拟的逐请求分布并排：TTFT、TPOT、生成时延、单请求 token/s 的 均值 / p50 / p90 / p99 / 最大，
+    全部请求一行、再按 `by`（true_task 或 channel）分组。每格「真机 / 模拟（误差）」。"""
+    full = _stats_mod().full_stats
+
+    def cell(a, b):
+        if a is None or b is None:
+            return "—"
+        e = f"{100 * (b - a) / a:+.1f}%" if a else "—"
+        return f"{a:.1f} / {b:.1f}（{e}）"
+
+    def groups(doc):
+        g = defaultdict(list)
+        for r in doc.get("requests") or []:
+            g["全部"].append(r)
+            g[str(r.get(by) or "?")].append(r)
+        return g
+    gr, gs = groups(real), groups(sim)
+    names = ["全部"] + sorted(k for k in gr if k != "全部")
+    out = []
+    for mname, fn in DETAIL_METRICS:
+        out += [f"### {mname}（真机 / 模拟，误差）", "",
+                "| 分组 | 条数 | " + " | ".join({"mean": "均值"}.get(k, k) for k in DETAIL_STATS) + " |",
+                "|---|---|" + "---|" * len(DETAIL_STATS)]
+        for n in names:
+            a = full([fn(r) for r in gr.get(n, []) if fn(r) is not None])
+            b = full([fn(r) for r in gs.get(n, []) if fn(r) is not None])
+            out.append(f"| {n} | {a.get('n', 0)} / {b.get('n', 0)} | "
+                       + " | ".join(cell(a.get(k), b.get(k)) for k in DETAIL_STATS) + " |")
+        out.append("")
+    return out
+
+
 def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float, *,
         rounds: int = 3, fixed: Sequence[str] = (), log: Callable[[str], None] = print,
         extra: Mapping[str, float] | None = None, score: str = "all") -> tuple[Params, float, float, dict]:
@@ -1167,11 +1208,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     c = sub.add_parser("compare", help="比两份结果的关键指标")
     c.add_argument("--sim", required=True)
     c.add_argument("--real", required=True)
+    dt = sub.add_parser("detail", help="一组真机 / 模拟的逐请求分布并排（均值 / p50 / p90 / p99 / 最大，全部与分组）")
+    dt.add_argument("--real", required=True)
+    dt.add_argument("--sim", required=True)
+    dt.add_argument("--by", choices=("true_task", "channel"), default="true_task",
+                    help="分组：true_task = 按请求类别（默认）；channel = 按通道 / 后段")
+    dt.add_argument("--md", default=None, help="另存到这个 .md")
     t = sub.add_parser("table", help="几组「真机 + 模拟」并排出一张汇总表（markdown，可另存 JSON）")
     t.add_argument("runs", nargs="+", metavar="标签=真机.json,模拟.json")
     t.add_argument("--md", default=None, help="表另存到这个 .md")
     t.add_argument("--json", default=None, help="数另存到这个 .json")
     a = ap.parse_args(argv)
+
+    if a.cmd == "detail":
+        lines = detail_table(json.loads(Path(a.real).read_text(encoding="utf-8")),
+                             json.loads(Path(a.sim).read_text(encoding="utf-8")), by=a.by)
+        print("\n".join(lines))
+        if a.md:
+            Path(a.md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return 0
 
     if a.cmd == "table":
         runs = []
