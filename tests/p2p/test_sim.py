@@ -474,3 +474,22 @@ def test_replay_from_other_deployment_uses_true_task(world) -> None:
     st = world["stages"]
     task_of = {c["name"]: c["task"] for c in st["channels"] if c["role"] == "back"}
     assert all(task_of[r["channel"]] == r["true_task"] for r in doc["requests"])
+
+
+def test_same_time_arrivals_share_one_step(world) -> None:
+    """同一时刻到同一个引擎的几条输入（真机里是代理按目的地合成的一条消息：后段一步出的几个 token
+    发给同一个前段）要进同一步 —— 不能第一条一到就开算、其余等下一步。"""
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    net = S.Net(ip=ip, hop_ms=0.5, agent_hop_ms=0.5, lat_same=0.1, lat_cross=1.0, lat_gw=0.1)
+    sim = S.Sim(world["stages"], perf=perf, net=net, node_gpu=gpu, params=S.Params(), front_slots=None, hold=True)
+    sim.on_step_out = lambda e, rid, item, t: None
+    e = sim.engines[world["stages"]["fronts"][0]]
+    e.admitted |= {"a", "b", "c"}
+    for rid in ("a", "b"):                                    # 同一时刻到
+        sim.at(5.0, sim._arrive, e, rid, ("dec", 100))
+    sim.at(50.0, sim._arrive, e, "c", ("dec", 100))            # 很晚才到：自己一步
+    sim.reqs.update({r: S.SimReq(rid=r, case_id=None, true_task=None, task=None, n_prompt=1, n_gen=2)
+                     for r in ("a", "b", "c")})
+    sim.run()
+    assert e.n_steps == 2 and e.batch_sum == 3                # 第一步 a+b（旧写法是 a、b 各一步），第二步 c

@@ -313,6 +313,7 @@ class SimEngine:
         self.admitted: set[str] = set()
         self.busy = False
         self._in_done = False
+        self._kick_due = False
         self.t_ready: dict[str, float] = {}
         # 统计
         self.n_steps = 0
@@ -386,8 +387,16 @@ class SimEngine:
     def put(self, rid: str, item: tuple, now: float) -> None:
         self.ready[rid] = item
         self.t_ready.setdefault(rid, now)
-        if not self._in_done:            # 一步结束时逐条放回的，等全放完再开下一步
-            self.kick(now)
+        if not self._in_done and not self._kick_due:
+            # 不马上开算：排一个同一时刻的事件（排在已经排好的同时刻到达之后）。同一时刻到的几条输入
+            # 是真机里代理按目的地合成的一条消息（后段一步出的几个 token 发给同一个前段，前段一步的
+            # 几个 hidden 发给同一个后段），要进同一步。一步结束时逐条放回的，等全放完再开下一步（_done）
+            self._kick_due = True
+            self.sim.at(now, self._kick_now)
+
+    def _kick_now(self, now: float) -> None:
+        self._kick_due = False
+        self.kick(now)
 
     def _should_wait(self, now: float) -> bool:
         """凑批等待：只等「已经在这个引擎上跑、但这一步的输入还在路上」的请求；最多等 batch_wait_ms
