@@ -803,6 +803,61 @@ def test_lr_classify_reads_route_stats_wire() -> None:
     assert v2["zone"] == "prior" and v2.get("error")
 
 
+def test_lr_cmw_selector_from_route_stats_wire(tmp_path) -> None:
+    """11-16 的默认选择器（前 2 层 counts 份额 + 平均门控权重）：前段统计钩子交出的 count / w（top-k 重归一
+    后的权重之和，只数 body token）→ LR 的概率，与按训练口径手算的逐位一致。"""
+    fw = ROOT.parent / "p2p-framework"
+    fixture = fw / "tests" / "data" / "selector_L2_cmw_fixture.npz"
+    if not fixture.is_file():
+        pytest.skip("旁边没有 p2p-framework 的 L2 选择器夹具")
+    import sys
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    sys.path.insert(0, str(fw))
+    from vllm.p2p.stats import RouteStats
+    from vllm.p2p.tiered_gateway import make_lr_classify
+
+    fx = np.load(fixture, allow_pickle=True)
+    npz = tmp_path / "selector_body_L2_cmw_params.npz"
+    np.savez(npz, mean=fx["sel_mean"], scale=fx["sel_scale"], coef=fx["sel_coef"],
+             intercept=fx["sel_intercept"], classes=fx["sel_classes"], n_layers=fx["sel_n_layers"],
+             n_experts=fx["sel_n_experts"], feature=fx["sel_feature"])
+    E, K, L0 = 128, 8, 2
+    tasks5 = [str(c) for c in fx["sel_classes"]]
+    classify, clf = make_lr_classify(lr_model=str(npz), l0=L0, n_experts=E,
+                                     tasks={u: 1.0 for u in tasks5})
+    st = RouteStats(n_experts=E, top_k=K, norm_topk=True, lr_layers=range(L0), channel="f",
+                    emit_lr=True, write=False, prefill_only=True)
+    for l in range(L0):
+        st.register_layer(l, None)
+    st.allocate(64, "cpu")
+    rng = np.random.default_rng(1)
+    for slot in range(L0):
+        st.capture(slot, torch.from_numpy(rng.standard_normal((30, E)).astype(np.float32) * 3))
+    reqs = {"r": SimpleNamespace(num_prompt_tokens=30, sampling_params=SimpleNamespace(
+        extra_args={"p2p_id": "r", "p2p_body": "4:26"}))}
+    st.on_step(["r"], [30], np.arange(30), reqs)
+    feat = st.take_lr("r")
+    v = classify(feat, {"n_prompt": 30, "body": [[4, 26]]})
+    assert not v.get("error") and v["n_body"] == 22
+    # 按训练口径（verify/task_selector.features）手算
+    blocks = []
+    for l in range(1, L0 + 1):
+        d = feat[str(l)]
+        c, w = np.zeros(E), np.zeros(E)
+        c[d["i"]], w[d["i"]] = d["c"], d["w"]
+        assert c.sum() == 22 * K and abs(w.sum() - 22) < 1e-3     # 只数 body；每 token 权重和 = 1
+        blocks.append(np.concatenate([c / c.sum(), np.divide(w, c, out=np.zeros(E), where=c > 0)]))
+    x = np.concatenate(blocks)
+    lg = ((x - fx["sel_mean"]) / fx["sel_scale"]) @ fx["sel_coef"].T + fx["sel_intercept"]
+    p = np.exp(lg - lg.max())
+    p /= p.sum()
+    got = np.array([v["raw"][u] for u in tasks5])
+    assert np.abs(got - p).max() < 1e-5
+
+
 def test_tiered_stats_groups_by_path(tmp_path, capsys) -> None:
     from vllm.p2p import tiered_stats
 

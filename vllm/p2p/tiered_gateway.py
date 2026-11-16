@@ -30,7 +30,11 @@
 * `shadow`：按 `p2p_task` 绑定，同时记下前段出口识别的结果（量准确率、不影响路由）。
 
     python vllm/p2p/tiered_gateway.py --stages … --model-dir … --mode lr \
-        --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz
+        --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L2_cmw_params.npz
+
+默认选择器（11-16 起）是 selector_body_L2_cmw：前 2 层的 counts 份额 + 平均门控权重（前段只需 ≥ 2 层；
+特征口径 `prefill_counts_body+meanw` 由 p2p-framework 的 LRClassifier 从文件里读）。旧的 8 层 counts
+选择器仍可用 `--lr-model …/selector_body_L8_params.npz` 指定。
 
 只支持贪心（temperature 0）与 token id 的 prompt（bench 就是这么发的）。停止条件：模型的
 EOS（generation_config 优先，同 vLLM 的默认）+ max_tokens + max_model_len。
@@ -516,7 +520,8 @@ def main(argv: list[str] | None = None) -> int:
     g = ap.add_argument_group("前段出口识别（--mode lr / shadow）")
     g.add_argument("--p2p-framework", default=None, help="p2p-framework 源码目录（默认自动找）")
     g.add_argument("--lr-model",
-                   default="/home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz")
+                   default="/home/ubuntu/p2p-framework/selector/selector_body_L2_cmw_params.npz",
+                   help="前段出口的 task 选择器（默认：前 2 层 counts 份额 + 平均权重）")
     g.add_argument("--tasks", default=None,
                    help="部署的 task 与先验，如 gsm8k=1,mbpp=1（默认 = 后段的 task，先验各 1）")
     g.add_argument("--lr-classes", default=None)
