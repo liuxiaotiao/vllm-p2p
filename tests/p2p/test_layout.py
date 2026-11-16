@@ -435,3 +435,47 @@ def test_manual_plan_without_pairings_or_model_shape(tmp_path) -> None:
     assert LY.manual_wiring(bad) is None
     with pytest.raises(LY.LayoutError, match="--wiring"):
         LY.pair_static(bad)
+
+
+def _one_front_plan(plan: dict) -> dict:
+    """11-16 的新方案形状：只留一个前段（F0），其余前段段删掉，组合矩阵只留 F0 的。"""
+    p = copy.deepcopy(plan)
+    for sid in [s for s, info in p["segments"].items() if info["role"] == "front" and s != "F0"]:
+        del p["segments"][sid]
+    p["pairings"] = [pr for pr in p.get("pairings") or [] if pr["front"] == "F0"]
+    return p
+
+
+def test_shared_front_one_channel_per_back(plan) -> None:
+    from vllm.p2p.layout import back_segments, pair_shared
+
+    p1 = _one_front_plan(plan)
+    # 一对一的老配对只会配出一条（前段被第一个后段占了）—— 这就是「只起了一条路径」
+    assert len(pair_static(p1)) == 1
+    wired = pair_shared(p1)
+    assert sorted(b for _, b, _ in wired) == sorted(back_segments(p1)) and {f for f, _, _ in wired} == {"F0"}
+    chans = channels_from_plan(p1, wired, shared_front=True)
+    assert len(chans) == len(back_segments(p1)) == 5
+    assert {c.name for c in chans} == {"gsm8k-0", "gsm8k-1", "mbpp-0", "mbpp-1", "no_robots-0"}
+    assert all(c.stages[0].node == "N01" for c in chans)
+    with pytest.raises(LayoutError, match="多条通道"):
+        channels_from_plan(p1, wired)                     # 不开 shared_front：前段重复仍要拦
+
+
+def test_shared_front_end_to_end_to_stages(plan, tmp_path) -> None:
+    """清单只有 1 个前段 → layout 自动按共享前段出 5 条通道 → stages.py 出 1 个前段引擎 + 5 个后段引擎。"""
+    from vllm.p2p.stages import stages_from_channels
+
+    pf = tmp_path / "plan_1f.json"
+    pf.write_text(json.dumps(_one_front_plan(json.loads(PLAN.read_text()))))
+    out = tmp_path / "vc"
+    assert layout_main(["--plan", str(pf), "--hosts", str(HOSTS), "--out", str(out), "--stats",
+                        "--model-dir", "/w", "--vllm-bin", "/venv/bin/vllm"]) == 0
+    cj = json.loads((out / "channels.json").read_text())
+    assert cj["shared_front"] is True and len(cj["channels"]) == 5
+    st = stages_from_channels(cj)
+    roles = [c["role"] for c in st["channels"]]
+    assert roles.count("front") == 1 and roles.count("back") == 5
+    front = next(c for c in st["channels"] if c["role"] == "front")
+    assert front["name"] == "front-N01"
+    assert {c["task"] for c in st["channels"] if c["role"] == "back"} == {"gsm8k", "mbpp", "no_robots"}

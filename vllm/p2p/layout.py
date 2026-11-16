@@ -248,14 +248,72 @@ def pair_static(plan: Mapping, wiring: Mapping | None = None) -> dict[str, tuple
     return out
 
 
+def front_segments(plan: Mapping) -> list[str]:
+    return [sid for sid, info in plan["segments"].items() if str(info.get("role")) == "front"]
+
+
+def back_segments(plan: Mapping) -> list[str]:
+    return [sid for sid, info in plan["segments"].items()
+            if str(info.get("role", "")).startswith("back") and not str(info["role"]).endswith("standby")]
+
+
+def pair_shared(plan: Mapping, wiring: Mapping | None = None) -> list[tuple[str, str, str]]:
+    """共享前段：**每个后段**一条通道，前段可以被几条通道共用（11-16 的「一个前段放前 2 层、所有流量经它
+    分发」）。→ [(前段段 id, 后段段 id, task)]。
+
+    后段挑哪个前段：给了 `wiring` 就照它（前段可重复、后段不可）；否则在组合矩阵里取这个后段 t50 最小的
+    前段；没有组合矩阵时，只有一个前段就全接它，否则要 --wiring。
+    """
+    segs = plan["segments"]
+    fronts, backs = front_segments(plan), back_segments(plan)
+    if not fronts or not backs:
+        raise LayoutError(f"清单里前段 {fronts}、后段 {backs} —— 共享前段要至少各一个")
+
+    def task_of(b: str) -> str:
+        role = str(segs[b]["role"])
+        return role.split(":", 1)[1] if ":" in role else str(segs[b].get("task") or "general")
+
+    by_node = {v: sid for sid, info in segs.items() for v in info["nodes"]}
+    out: list[tuple[str, str, str]] = []
+    if wiring is not None:
+        pairs = wiring.get("pairs", wiring if isinstance(wiring, list) else None)
+        if not pairs:
+            raise LayoutError("wiring 里没有 pairs")
+        used: set[str] = set()
+        for i, it in enumerate(pairs):
+            f = it["front"] if it["front"] in segs else by_node.get(it["front"])
+            b = it["back"] if it["back"] in segs else by_node.get(it["back"])
+            if f not in fronts or b not in backs:
+                raise LayoutError(f"wiring 第 {i} 条 {it['front']}→{it['back']} 不是 前段→后段")
+            if b in used:
+                raise LayoutError(f"wiring 第 {i} 条：后段 {b} 用了两次")
+            used.add(b)
+            out.append((f, b, task_of(b)))
+        return out
+    pairings = plan.get("pairings") or []
+    for b in sorted(backs, key=lambda x: (task_of(x), x)):
+        cand = [pr for pr in pairings if pr["back"] == b and pr["front"] in fronts]
+        if cand:
+            f = min(cand, key=lambda x: float(x["t50"]))["front"]
+        elif len(fronts) == 1:
+            f = fronts[0]
+        else:
+            raise LayoutError(f"后段 {b} 在组合矩阵里没有前段可配，前段又不止一个 —— 请给 --wiring")
+        out.append((f, b, task_of(b)))
+    return out
+
+
 def channels_from_plan(
     plan: Mapping,
-    wired: Mapping[str, tuple[str, str]],
+    wired: "Mapping[str, tuple[str, str]] | Sequence[tuple[str, str, str]]",
     *,
     n_layers: int | None = None,
     n_experts: int | None = None,
+    shared_front: bool = False,
 ) -> list[Channel]:
-    """把清单 + 配对翻成通道。会核对：层区间首尾相接、覆盖 1..L、专家 id 合法。"""
+    """把清单 + 配对翻成通道。会核对：层区间首尾相接、覆盖 1..L、专家 id 合法。
+    `wired` 是 pair_static 的 {前段: (后段, task)}，或 pair_shared 的 [(前段, 后段, task)]。
+    `shared_front`：允许几条通道共用同一个前段节点（只给分段部署 stages.py 用：每个前段节点一个前段引擎）。"""
     L, E = _model_shape(plan, n_layers, n_experts)
     plans = {p["node"]: p for p in plan["nodes"]}
     segs = plan["segments"]
@@ -285,7 +343,8 @@ def channels_from_plan(
     counter: dict[str, int] = {}
     chans: list[Channel] = []
     # 按 task、再按后段 id 排，让通道编号稳定（gsm8k-0 永远是 Bgsm8k0 那条，若它被配上）
-    for f, (b, task) in sorted(wired.items(), key=lambda kv: (kv[1][1], kv[1][0])):
+    items = ([(f, b, t) for f, (b, t) in wired.items()] if isinstance(wired, Mapping) else list(wired))
+    for f, b, task in sorted(items, key=lambda x: (x[2], x[1])):
         if segs[f]["role"] != "front":
             raise LayoutError(f"{f} 不是前段")
         st = stages_of(f, "front") + stages_of(b, "back")
@@ -302,10 +361,16 @@ def channels_from_plan(
         counter[task] = k + 1
         chans.append(Channel(name=f"{task}-{k}", task=task, front=f, back=b,
                              stages=tuple(st), n_layers=L, n_experts=E))
-    used = [n for c in chans for n in c.nodes]
-    dup = sorted({n for n in used if used.count(n) > 1})
+    if shared_front:
+        fnodes = {s.node for c in chans for s in c.stages if s.role == "front"}
+        used = [s.node for c in chans for s in c.stages if s.role != "front"]
+        dup = sorted({n for n in used if used.count(n) > 1} | (fnodes & set(used)))
+    else:
+        used = [n for c in chans for n in c.nodes]
+        dup = sorted({n for n in used if used.count(n) > 1})
     if dup:
-        raise LayoutError(f"节点 {dup} 出现在多条通道里 —— 一台卡只能是一个实例的一级")
+        raise LayoutError(f"节点 {dup} 出现在多条通道里 —— 一台卡只能是一个实例的一级"
+                          + ("（共享前段时只有前段节点可以共用）" if shared_front else ""))
     return chans
 
 
@@ -535,6 +600,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--wiring", type=Path, default=None,
                     help="前后段配对（control.py --save-wiring 的格式）；不给就按 t50 贪心")
     ap.add_argument("--hosts", type=Path, default=None, help="节点 id → 地址（task/hosts.txt）")
+    ap.add_argument("--shared-front", action="store_true",
+                    help="共享前段：每个后段一条通道、前段可被多条通道共用（只给 stages.py 的分段部署用）。"
+                         "清单只有 1 个前段时自动打开")
     ap.add_argument("--model-dir", default="$WEIGHTS",
                     help="各节点上的 checkpoint 目录（同一路径；可以是 fetch 拉下的部分 checkpoint）")
     ap.add_argument("--out", type=Path, default=Path("p2p_channels"),
@@ -589,9 +657,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"清单里没有层数 / 专家数：按 {cfg_path} 取 {args.n_layers} 层 × {args.n_experts} 专家")
     if wiring is None and not plan.get("pairings") and manual_wiring(plan) is not None:
         print(f"清单没有组合矩阵：按段名编号配对 {manual_wiring(plan)}（手动放置的清单）")
+    shared = args.shared_front or (len(front_segments(plan)) == 1 and len(back_segments(plan)) > 1)
+    if shared and not args.shared_front:
+        print(f"清单只有 1 个前段、{len(back_segments(plan))} 个后段：按共享前段配对（每个后段一条通道，"
+              f"前段共用）。只能用 stages.py 起分段部署，不能按 channels.json 起整条流水线")
     try:
-        chans = channels_from_plan(plan, pair_static(plan, wiring),
-                                   n_layers=args.n_layers, n_experts=args.n_experts)
+        wired = pair_shared(plan, wiring) if shared else pair_static(plan, wiring)
+        chans = channels_from_plan(plan, wired, n_layers=args.n_layers, n_experts=args.n_experts,
+                                   shared_front=shared)
     except LayoutError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -629,7 +702,8 @@ def main(argv: list[str] | None = None) -> int:
     # 没给 --remote-out 时用 --out 的绝对路径（假设各节点上代码目录与这台同路径）
     remote = (args.remote_out or str(args.out.resolve())).rstrip("/")
     summary = []
-    how = ("按 --wiring" if wiring else "按 t50 贪心配对" if plan.get("pairings") else "按段名编号配对")
+    how = ("共享前段" + ("、按 --wiring" if wiring else "") if shared else
+           "按 --wiring" if wiring else "按 t50 贪心配对" if plan.get("pairings") else "按段名编号配对")
     print(f"{len(chans)} 条通道（L₀={plan['l0']}，{how}）")
     for ch in chans:
         auto, old = channel_dtype(ch, hosts, sm75)
@@ -681,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    API {entry['api']}   命令见 {sh}")
         summary.append(entry)
     (args.out / "channels.json").write_text(
-        json.dumps({"plan": str(args.plan), "l0": plan["l0"],
+        json.dumps({"plan": str(args.plan), "l0": plan["l0"], "shared_front": bool(shared),
                     "n_layers": chans[0].n_layers if chans else None,
                     "n_experts": chans[0].n_experts if chans else None,
                     "model_dir": args.model_dir, "channels": summary},
