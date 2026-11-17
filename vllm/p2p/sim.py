@@ -14,6 +14,21 @@
     python -m vllm.p2p.sim fit  …同上… --out results/sim_fit_x.json
     # 3. 对比任意两份结果（关键指标 + 相对误差）
     python -m vllm.p2p.sim compare --sim results/sim_pf1_x.json --real results/b1_lr_pf1_x.json
+    # 4. 按卡型标定：拿几份部署的步级记录拟合「只靠 layer_bench」时要补的几项，之后不给 --steps 也准
+    python -m vllm.p2p.sim calib --layer-bench … --hosts … $SIMP \
+        --deploy p2p_channels_new/stages.json results/steps_n150 \
+        --deploy p2p_channels_ffa95/stages.json results/steps_ffa95_pf6_n150 \
+        --real results/b1_o3c_pf3_n150.json results/ffa95_pf6_n150.json --out results/sim_calib.json
+    python -m vllm.p2p.sim run … $SIMP --calib results/sim_calib.json      # 新部署：没上过机也能估
+
+按卡型标定（calib）
+------------------
+只靠 layer_bench 时每步用时 = 每步固定 + Σ各段 [层数 × layer_bench 每层 × 倍数] + PP 传输。`calib` 用各引擎
+实测的「纯 decode 每批 p50」与「单条 prefill 各长度」拟合：decode 每层倍数（按「角色:卡型」，如 back:A30）、
+前段每步固定、开了逐请求统计（layout.py --stats）的引擎每步多出的 stats_ms、后段 PP 每次传输开销（跨网段另加）；
+prefill 每层倍数、每段固定、每 token 另加；给了 --real 时另取「网关外」中位数（gw_client_ms）。
+layer_bench 的 prefill 表从 128 个 token 起，更短的用 decode 表最短上下文那行（批 = token 数）接上。
+标定只学得到数据里出现过的东西：某种卡没在某个角色上出现过、或所有部署都开（都没开）统计，那一项就拟不出来。
 
 模型
 ----
@@ -145,9 +160,26 @@ class GpuPerf:
             return 0.0
 
     def prefill_ms(self, experts: int, n: int) -> float:
-        tab = self._e(self.prefill, experts)
-        ps = sorted(int(p) for p in tab)
-        return _interp(ps, [tab[str(p)] for p in ps], n)
+        """prefill n 个 token 的每层用时。layer_bench 的 prefill 表从 128 个 token 起；短于最小档的，
+        用 decode 表最短上下文那一行（批大小 = 同时过 MoE 的 token 数）接上 —— 不然只能拿 128 与 256 两档
+        往下外推，在 Turing 卡上会差很多（那里 MoE 用时随被激活的专家数涨，几十个 token 时还远没饱和）。"""
+        cache = self.__dict__.setdefault("_pfcache", {})
+        if experts not in cache:
+            tab = self._e(self.prefill, experts)
+            ps = sorted(int(p) for p in tab)
+            pts = {p: float(tab[str(p)]) for p in ps}
+            try:
+                dtab = self._e(self.decode, experts)
+                row = dtab[str(min(int(c) for c in dtab))]
+                for b in sorted(int(x) for x in row):
+                    if b < ps[0]:
+                        pts.setdefault(b, float(row[str(b)]))
+            except (ValueError, KeyError):
+                pass
+            xs = sorted(pts)
+            cache[experts] = (xs, [pts[x] for x in xs])
+        xs, ys = cache[experts]
+        return _interp(xs, ys, n)
 
 
 def load_perf(paths: Sequence[str | Path]) -> dict[str, GpuPerf]:
@@ -196,6 +228,7 @@ class Net:
     agent_hop_ms: float = 2.0              # 分段部署：协调器 ↔ 代理、前段 ↔ 后段直连（ZMQ + 代理 + EngineCore）每跳开销
     pp_hop_ms: float = 0.3                 # 多机 PP 每次传输（段间 hidden / 调度下发 / 结果回传）的固定开销
     back_pp_hop_ms: float | None = None    # 分段部署后段的；None = 同 pp_hop_ms
+    back_pp_cross_ms: float = 0.0          # 分段部署后段的 PP 传输跨网段时另加（标定出来的；见 calib）
 
     def one_way(self, a: str | None, b: str | None) -> float:
         if a is None or b is None:
@@ -227,6 +260,20 @@ class Net:
     def ctrl(self, a: str, b: str, hop: float | None = None) -> float:
         """多机 PP：node_rank 0 把这一步的调度结果发给 b（小消息）。"""
         return self.one_way(a, b) + (self.pp_hop_ms if hop is None else hop)
+
+    def cross(self, a: str, b: str) -> bool:
+        """a、b 不在同一 /24 网段（拓扑里给了这对的时延时不算跨，由拓扑负责）。"""
+        if a == b or (a, b) in self.lat or (b, a) in self.lat:
+            return False
+        ia, ib = self.ip.get(a, ""), self.ip.get(b, "")
+        return bool(ia and ib) and ia.rsplit(".", 1)[0] != ib.rsplit(".", 1)[0]
+
+    def pp_hop_between(self, role: str, a: str, b: str) -> float:
+        """PP 一次传输的软件开销：pp_hop_for(role)，分段后段跨网段时再加 back_pp_cross_ms。"""
+        h = self.pp_hop_for(role)
+        if role == "back" and self.back_pp_cross_ms and self.cross(a, b):
+            h += self.back_pp_cross_ms
+        return h
 
     def pp_hop_for(self, role: str) -> float:
         """分段部署的后段（stage_agent 驱动）与整条流水线（vllm serve）的 PP 每次传输开销分开标定。"""
@@ -286,9 +333,29 @@ class Params:
     # 最多再等这么久让其余请求的输入也到齐，再一起算一步。0 = 不等（= 现在的 vLLM）
     batch_wait_ms: float = 0.0
     batch_wait_role: str = "back"            # back / front / all
+    # ---- 按卡型的标定（`sim calib` 从步级记录拟合，`--calib` 读进来；不给 = 不修正）----
+    # 键是卡型（"A30"），或「角色:卡型」（"front:A30"、"back:A30"，优先）：
+    dec_scale: dict = field(default_factory=dict)   # layer_bench 的 decode 每层用时 × 这个数
+    pf_gpu_scale: dict = field(default_factory=dict)  # layer_bench 的 prefill 每层用时 × 这个数（再乘 pf_scale）
+    stats_ms: float = 0.0                    # 开了逐请求路由统计（A5 钩子、不是只统计 prefill）的引擎每步多花的
+    pf_fixed_front_ms: float | None = None   # 含 prefill 的步的固定开销，按角色；None = 用 pf_fixed_ms
+    pf_fixed_back_ms: float | None = None
+    pf_token_front_ms: float = 0.0           # 含 prefill 的步每个 prompt token 另加（每步一次，与层数无关）
+    pf_token_back_ms: float = 0.0
+    gw_client_ms: float = 0.0                # 网关 → 客户端（TTFT 拆分里的「网关外」）；只推后客户端看到的时刻
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
+
+    def scale(self, table: Mapping, role: str, gpu: str) -> float:
+        return float(table.get(f"{role}:{gpu}", table.get(gpu, 1.0)))
+
+    def pf_token_for(self, role: str) -> float:
+        return float(self.pf_token_front_ms if role == "front" else self.pf_token_back_ms)
+
+    def pf_fixed_for(self, role: str) -> float:
+        v = self.pf_fixed_front_ms if role == "front" else self.pf_fixed_back_ms
+        return float(self.pf_fixed_ms if v is None else v)
 
 
 class SimEngine:
@@ -308,6 +375,7 @@ class SimEngine:
             self.gpus.append(perf[g])
         self.experts = int(experts)
         self.sim = sim
+        self.stats_full = stats_full(ch)             # 开了逐请求统计（每步一次同步拷贝）
         # 实测（steptrace）：{"dec": {批大小: 每步毫秒}, "pf": {a_ms, b_ms_per_token | ms_per_token_p50}}
         self.steps = steps or {}
         self.ready: dict[str, tuple] = {}        # rid → ("pf", n) | ("dec", ctx)
@@ -329,12 +397,13 @@ class SimEngine:
 
     def fixed_ms(self, ctx: float, batch: int) -> float:
         p = self.sim.params
+        extra = p.stats_ms if self.stats_full else 0.0
         v = p.front_fixed_ms if self.role == "front" else p.back_fixed_ms
         if v is not None:
-            return float(v)
+            return float(v) + extra
         g = self.gpus[0] if self.role == "front" else self.gpus[-1]
         oh = g.overhead_ms(self.experts, ctx, batch)
-        return oh * (0.5 if self.role == "front" else 1.0)
+        return oh * (0.5 if self.role == "front" else 1.0) + extra
 
     def step_ms(self, dec_ctx: Sequence[float], pf_tokens: Sequence[int]) -> float:
         """一步的用时。多机 PP 时按 vLLM 的实际过程排时间线：
@@ -361,27 +430,33 @@ class SimEngine:
         H = self.sim.params.hidden * 2
         comp = []
         P = self.sim.params
+        pff = P.pf_fixed_for(self.role)
         for g, nl in zip(self.gpus, self.layers):
-            c = nl * g.decode_ms(self.experts, ctx, b) if b else 0.0
-            c += sum(nl * g.prefill_ms(self.experts, n) for n in pf_tokens) * P.pf_scale
-            if pf_tokens and P.pf_fixed_ms:
-                c += P.pf_fixed_ms * (nl if P.pf_fixed_per == "layer" else 1 if P.pf_fixed_per == "stage" else 0)
+            c = nl * g.decode_ms(self.experts, ctx, b) * P.scale(P.dec_scale, self.role, g.gpu) if b else 0.0
+            c += (sum(nl * g.prefill_ms(self.experts, n) for n in pf_tokens) * P.pf_scale
+                  * P.scale(P.pf_gpu_scale, self.role, g.gpu))
+            if pf_tokens and pff:
+                c += pff * (nl if P.pf_fixed_per == "layer" else 1 if P.pf_fixed_per == "stage" else 0)
             comp.append(c)
-        if pf_tokens and P.pf_fixed_ms and P.pf_fixed_per == "step":
-            fixed += P.pf_fixed_ms
-        if self.sim.params.pp_simple or len(self.nodes) == 1:
+        if pf_tokens and pff and P.pf_fixed_per == "step":
+            fixed += pff
+        if pf_tokens:
+            fixed += P.pf_token_for(self.role) * sum(pf_tokens)
+        nd = self.nodes
+        if self.sim.params.pp_simple or len(nd) == 1:
             t = fixed + sum(comp)
-            for i in range(len(self.nodes) - 1):
-                t += net.pp(self.nodes[i], self.nodes[i + 1], tok * H, hop=net.pp_hop_for(self.role))
+            for i in range(len(nd) - 1):
+                t += net.pp(nd[i], nd[i + 1], tok * H, hop=net.pp_hop_between(self.role, nd[i], nd[i + 1]))
             return t
-        n0 = self.nodes[0]
+        n0 = nd[0]
         end = comp[0]
-        for i in range(1, len(self.nodes)):
-            ph = net.pp_hop_for(self.role)
-            start = max(net.ctrl(n0, self.nodes[i], hop=ph),
-                        end + net.pp(self.nodes[i - 1], self.nodes[i], tok * H, hop=ph))
+        for i in range(1, len(nd)):
+            start = max(net.ctrl(n0, nd[i], hop=net.pp_hop_between(self.role, n0, nd[i])),
+                        end + net.pp(nd[i - 1], nd[i], tok * H,
+                                     hop=net.pp_hop_between(self.role, nd[i - 1], nd[i])))
             end = start + comp[i]
-        end += net.pp(self.nodes[-1], n0, max(b, 1) * 8, hop=net.pp_hop_for(self.role))   # 采样结果回 node_rank 0
+        end += net.pp(nd[-1], n0, max(b, 1) * 8,                         # 采样结果回 node_rank 0
+                      hop=net.pp_hop_between(self.role, nd[-1], n0))
         return fixed + end
 
     # ---- 调度 ----
@@ -644,12 +719,13 @@ class Sim:
             return
         # 后段 / 整条流水线：出一个 token
         r.n_out += 1
-        t_cli = t + self.net.msg(e.node0, None, 8, kind=self.kind)
+        t_gw = t + self.net.msg(e.node0, None, 8, kind=self.kind)
+        t_cli = t_gw + self.params.gw_client_ms     # 网关 → 客户端（HTTP 流式那一段）
         r.toks.append(t_cli)
         if r.n_out == 1:
             r.t_back_out0 = t
             r.t_first = t_cli
-            r.t_first_gw = t_cli          # 模拟里网关 = 客户端：网关外这一段只有这条消息
+            r.t_first_gw = t_gw
         if r.n_out >= r.n_gen:
             self.at(t_cli, lambda tt, rr=r: self._finish(tt, rr))
             return
@@ -659,6 +735,28 @@ class Sim:
         fe = self.engines[r.front.name]
         ctx = r.n_prompt + r.n_out - 1
         self.at(t + self.net.msg(e.node0, fe.node0, 8, kind=self.kind), self._arrive, fe, rid, ("dec", ctx))
+
+
+def _overrides(ch: Mapping) -> dict:
+    for c in ch.get("commands") or []:
+        if " --hf-overrides " in c.get("cmd", ""):
+            try:
+                return json.loads(shlex.split(c["cmd"].split(" --hf-overrides ", 1)[1])[0])
+            except (ValueError, IndexError):
+                return {}
+    if ch.get("overrides") and Path(ch["overrides"]).is_file():
+        try:
+            return json.loads(Path(ch["overrides"]).read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+
+def stats_full(ch: Mapping) -> bool:
+    """这个引擎开了逐请求路由统计、而且不是只统计 prefill（layout.py --stats 那种）：每步都要把路由
+    搬回 CPU、按请求累加 —— 比不开每步多几毫秒（`Params.stats_ms`）。前段出口识别（只统计 prompt）不算。"""
+    st = _overrides(ch).get("p2p_stats")
+    return bool(st) and not (isinstance(st, Mapping) and st.get("prefill_only"))
 
 
 def resident_experts(ch: Mapping) -> int | None:
@@ -1081,12 +1179,258 @@ def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float,
 
 
 # --------------------------------------------------------------------------- #
+# 按卡型标定（calib）：拿各引擎的步级记录，拟合 layer_bench 之外的那几项
+# --------------------------------------------------------------------------- #
+# 只靠 layer_bench 估每步用时（不给 --steps）时，要补的几项（都从步级记录拟合，见 `sim calib`）：
+#   decode 每层 × dec_scale[角色:卡型]、每步固定（前段 front_fixed_ms；后段用 layer_bench 截距）、
+#   开逐请求统计的引擎每步 + stats_ms、后段 PP 每次传输 back_pp_hop_ms（跨网段再 + back_pp_cross_ms）；
+#   prefill 每层 × pf_gpu_scale[角色:卡型]、含 prefill 的步每个 PP 段 + pf_fixed_{front,back}_ms。
+CALIB_PARAMS = ("dec_scale", "pf_gpu_scale", "stats_ms", "front_fixed_ms", "back_fixed_ms",
+                "pf_fixed_front_ms", "pf_fixed_back_ms", "pf_token_front_ms", "pf_token_back_ms",
+                "pf_fixed_per", "pf_scale", "pf_fixed_ms", "gw_client_ms")
+CALIB_NET = ("back_pp_hop_ms", "back_pp_cross_ms")
+
+
+def apply_calib(cal: Mapping, params: Params, net: Net) -> tuple[Params, Net]:
+    """`sim calib` 写的 JSON → 套到参数与网络上（JSON 里有的项覆盖命令行的）。"""
+    pv = {k: v for k, v in (cal.get("params") or {}).items() if k in CALIB_PARAMS}
+    params = Params(**{**params.as_dict(), **pv})
+    for k, v in (cal.get("net") or {}).items():
+        if k in CALIB_NET:
+            setattr(net, k, v)
+    return params, net
+
+
+def _load_rows(spec: str | Path) -> dict[str, list[dict]]:
+    """一个目录（里面 <引擎名>.jsonl）或若干个文件（逗号 / 通配）→ {引擎名: 步级记录}。"""
+    from glob import glob
+    paths: list[Path] = []
+    for part in str(spec).split(","):
+        q = Path(part)
+        if q.is_dir():
+            paths += sorted(q.glob("*.jsonl"))
+        else:
+            paths += [Path(x) for x in sorted(glob(part))]
+    out: dict[str, list[dict]] = {}
+    for q in paths:
+        rows = []
+        for ln in q.read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(ln))
+            except ValueError:
+                pass
+        out[q.stem] = rows
+    return out
+
+
+def calib_points(rows: Sequence[Mapping], *, min_n: int = 30, pf_bins: int = 6) -> tuple[list, list]:
+    """一个引擎的步级记录 → decode 点 [(批, 平均上下文, 每步 p50, 步数)]（纯 decode 步，按批分组）与
+    prefill 点 [(token 数, 每步中位数, 步数)]（只有一条 prefill、没有 decode 的步，按 token 数分几档；
+    去掉冷启动：每 token 用时超过中位数 3 倍的）。"""
+    dec: dict[int, list] = defaultdict(list)
+    pf = []
+    for r in rows:
+        n, npf = int(r.get("n", 0)), int(r.get("npf", 0))
+        if npf == 0 and n > 0:
+            dec[n].append(r)
+        elif npf == 1 and n == 1 and float(r.get("pf", 0)) > 0:
+            pf.append((float(r["pf"]), float(r["ms"])))
+    dpts = []
+    for b, rs in sorted(dec.items()):
+        if len(rs) >= min_n:
+            ms = sorted(float(r["ms"]) for r in rs)
+            dpts.append((b, stt.mean(float(r.get("ctx", 0.0)) for r in rs), ms[len(ms) // 2], len(rs)))
+    ppts = []
+    if pf:
+        med = sorted(ms / n for n, ms in pf)[len(pf) // 2]
+        pf = sorted((n, ms) for n, ms in pf if ms / n <= 3 * med)
+        k = max(1, min(pf_bins, len(pf) // 5))
+        for i in range(k):
+            chunk = pf[i * len(pf) // k:(i + 1) * len(pf) // k]
+            if len(chunk) >= 3:
+                ppts.append((sorted(c[0] for c in chunk)[len(chunk) // 2],
+                             sorted(c[1] for c in chunk)[len(chunk) // 2], len(chunk)))
+    return dpts, ppts
+
+
+def _nelder_mead(f: Callable[[list[float]], float], x0: Sequence[float], steps: Sequence[float], *,
+                 iters: int = 3000, tol: float = 1e-10) -> tuple[list[float], float]:
+    n = len(x0)
+    pts = [list(x0)] + [[x0[j] + (steps[j] if j == i else 0.0) for j in range(n)] for i in range(n)]
+    vals = [f(p) for p in pts]
+    for _ in range(iters):
+        order = sorted(range(n + 1), key=lambda i: vals[i])
+        pts, vals = [pts[i] for i in order], [vals[i] for i in order]
+        if abs(vals[-1] - vals[0]) < tol:
+            break
+        cen = [sum(p[j] for p in pts[:-1]) / n for j in range(n)]
+        refl = [cen[j] + (cen[j] - pts[-1][j]) for j in range(n)]
+        fr = f(refl)
+        if fr < vals[0]:
+            exp_ = [cen[j] + 2 * (cen[j] - pts[-1][j]) for j in range(n)]
+            fe = f(exp_)
+            pts[-1], vals[-1] = (exp_, fe) if fe < fr else (refl, fr)
+        elif fr < vals[-2]:
+            pts[-1], vals[-1] = refl, fr
+        else:
+            con = [cen[j] + 0.5 * (pts[-1][j] - cen[j]) for j in range(n)]
+            fc = f(con)
+            if fc < vals[-1]:
+                pts[-1], vals[-1] = con, fc
+            else:
+                for i in range(1, n + 1):
+                    pts[i] = [pts[0][j] + 0.5 * (pts[i][j] - pts[0][j]) for j in range(n)]
+                    vals[i] = f(pts[i])
+    i = min(range(n + 1), key=lambda k: vals[k])
+    return pts[i], vals[i]
+
+
+class _Knob:
+    """一个待拟合的量：倍数（在对数上搜）或毫秒（非负）。"""
+
+    def __init__(self, name: str, kind: str, init: float, get_set: Callable[[float], None]):
+        self.name, self.kind, self.init, self.set = name, kind, float(init), get_set
+
+    def x0(self) -> float:
+        return math.log(max(self.init, 1e-3)) if self.kind == "scale" else self.init
+
+    def value(self, x: float) -> float:
+        return math.exp(x) if self.kind == "scale" else abs(x)
+
+    def step(self) -> float:
+        return 0.2 if self.kind == "scale" else max(0.05 if self.init < 1 else 1.0, 0.3 * abs(self.init))
+
+
+def calibrate(deps: Sequence[tuple[str, Mapping, Sim, Mapping[str, list[dict]]]], *, min_n: int = 30,
+              log: Callable[[str], None] = print, gw_client_ms: float | None = None,
+              ridge: float = 0.02) -> dict:
+    """deps：[(标签, stages, Sim（只用它的引擎）, {引擎名: 步级记录})]。先拟合 decode 的几项，再在它之上拟合
+    prefill 的几项。目标：每个引擎的点 log(模拟 / 实测)² 的均值，再对引擎取均值（大引擎、点多的不占便宜）。"""
+    engs = []                                         # (标签, SimEngine, decode 点, prefill 点)
+    for label, _stages, sim, rows in deps:
+        for name, e in sim.engines.items():
+            if name in rows and e.role in ("front", "back"):
+                d, pfp = calib_points(rows[name], min_n=min_n)
+                if d or pfp:
+                    engs.append((label, e, d, pfp))
+    if not engs:
+        raise SystemExit("步级记录里没有对得上 stages.json 引擎名的（文件名要是 <引擎名>.jsonl）")
+    sims = [sim for _, _, sim, _ in deps]
+    P0 = sims[0].params
+
+    def every(attr: str, v) -> None:
+        for s in sims:
+            setattr(s.params, attr, v)
+
+    def every_net(attr: str, v) -> None:
+        for s in sims:
+            setattr(s.net, attr, v)
+
+    def every_map(attr: str, key: str, v: float) -> None:
+        for s in sims:
+            getattr(s.params, attr)[key] = v
+
+    keys = sorted({f"{e.role}:{g.gpu}" for _, e, _, _ in engs for g in e.gpus})
+    has_stats = {e.stats_full for _, e, _, _ in engs}
+    backs_pp = [e for _, e, d, _ in engs if e.role == "back" and len(e.nodes) > 1]
+    cross = {any(e.sim.net.cross(e.nodes[i], e.nodes[(i + 1) % len(e.nodes)]) for i in range(len(e.nodes)))
+             for e in backs_pp}
+
+    dec_knobs = [_Knob(f"dec_scale[{k}]", "scale", 1.0, lambda v, k=k: every_map("dec_scale", k, v))
+                 for k in keys if any(f"{e.role}:{g.gpu}" == k and d for _, e, d, _ in engs for g in e.gpus)]
+    if any(e.role == "front" and d for _, e, d, _ in engs):
+        dec_knobs.append(_Knob("front_fixed_ms", "ms", P0.front_fixed_ms if P0.front_fixed_ms is not None else 1.0,
+                               lambda v: every("front_fixed_ms", v)))
+    if has_stats == {True, False}:
+        dec_knobs.append(_Knob("stats_ms", "ms", 3.0, lambda v: every("stats_ms", v)))
+    if backs_pp:
+        bh = sims[0].net.back_pp_hop_ms
+        dec_knobs.append(_Knob("back_pp_hop_ms", "ms", bh if bh is not None else sims[0].net.pp_hop_ms,
+                               lambda v: every_net("back_pp_hop_ms", v)))
+        if cross == {True, False}:
+            dec_knobs.append(_Knob("back_pp_cross_ms", "ms", 1.0, lambda v: every_net("back_pp_cross_ms", v)))
+    pf_knobs = [_Knob(f"pf_gpu_scale[{k}]", "scale", 1.0, lambda v, k=k: every_map("pf_gpu_scale", k, v))
+                for k in keys if any(f"{e.role}:{g.gpu}" == k and pp for _, e, _, pp in engs for g in e.gpus)]
+    for role in ("front", "back"):
+        if any(e.role == role and pp for _, e, _, pp in engs):
+            pf_knobs.append(_Knob(f"pf_fixed_{role}_ms", "ms", 5.0,
+                                  lambda v, role=role: every(f"pf_fixed_{role}_ms", v)))
+            pf_knobs.append(_Knob(f"pf_token_{role}_ms", "ms", 0.05,
+                                  lambda v, role=role: every(f"pf_token_{role}_ms", v)))
+
+    def dec_err(e, d) -> list[float]:
+        return [math.log(max(e.step_ms([ctx] * b, []), 1e-3) / ms) for b, ctx, ms, _ in d]
+
+    def pf_err(e, pp) -> list[float]:
+        return [math.log(max(e.step_ms([], [int(n)]), 1e-3) / ms) for n, ms, _ in pp]
+
+    def objective(knobs, errf, which):
+        def f(x):
+            for k, xi in zip(knobs, x):
+                k.set(k.value(xi))
+            per = [errf(e, pts) for _, e, *rest in engs for pts in [rest[which]] if pts]
+            fit = sum(sum(v * v for v in es) / len(es) for es in per) / max(len(per), 1)
+            # 倍数往 1 拉一点：数据分不开的几项（比如只见过一种层数的卡）不至于漂到离谱的值
+            return fit + ridge * sum(xi * xi for k, xi in zip(knobs, x) if k.kind == "scale")
+        return f
+
+    def table(title):
+        log(title)
+        for label, e, d, pp in engs:
+            cells = [f"b{b} 实{ms:.1f}/模{e.step_ms([ctx] * b, []):.1f}" for b, ctx, ms, _ in d[:4]]
+            cells += [f"pf{int(n)} 实{ms:.0f}/模{e.step_ms([], [int(n)]):.0f}" for n, ms, _ in pp[:: max(1, len(pp) // 2)]]
+            log(f"  {label:10} {e.name:18} {'+'.join(g.gpu for g in e.gpus):18}{' 统计' if e.stats_full else '     '}  "
+                + "  ".join(cells))
+
+    def rms(errf, which):
+        es = [v for _, e, *rest in engs for pts in [rest[which]] if pts for v in errf(e, pts)]
+        return math.sqrt(sum(v * v for v in es) / len(es)) if es else 0.0
+
+    before = {"decode": rms(dec_err, 0), "prefill": rms(pf_err, 1)}
+    table("标定前（命令行给的参数）：")
+    for s in sims:                                     # 从头拟合：表清空，prefill 的固定部分改按角色、每个 PP 段计
+        s.params.dec_scale, s.params.pf_gpu_scale = {}, {}
+        s.params.pf_scale, s.params.pf_fixed_ms = 1.0, 0.0
+        s.params.pf_fixed_per = "stage"
+    out: dict[str, float] = {}
+    for knobs, errf, which, label in ((dec_knobs, dec_err, 0, "decode"), (pf_knobs, pf_err, 1, "prefill")):
+        if not knobs:
+            continue
+        f = objective(knobs, errf, which)
+        x, _ = _nelder_mead(f, [k.x0() for k in knobs], [k.step() for k in knobs])
+        x, _ = _nelder_mead(f, x, [k.step() / 4 for k in knobs])          # 再从最优点重启一次
+        for k, xi in zip(knobs, x):
+            k.set(k.value(xi))
+            out[k.name] = round(k.value(xi), 4)
+    after = {"decode": rms(dec_err, 0), "prefill": rms(pf_err, 1)}
+    table("标定后：")
+    log(f"每步用时的相对误差（均方根，对数）：decode {before['decode']:.3f} → {after['decode']:.3f}，"
+        f"prefill {before['prefill']:.3f} → {after['prefill']:.3f}")
+    p, n = sims[0].params, sims[0].net
+    return {
+        "params": {"dec_scale": dict(p.dec_scale), "pf_gpu_scale": dict(p.pf_gpu_scale),
+                   "stats_ms": p.stats_ms, "front_fixed_ms": p.front_fixed_ms, "back_fixed_ms": p.back_fixed_ms,
+                   "pf_fixed_front_ms": p.pf_fixed_front_ms, "pf_fixed_back_ms": p.pf_fixed_back_ms,
+                   "pf_token_front_ms": p.pf_token_front_ms, "pf_token_back_ms": p.pf_token_back_ms,
+                   "pf_fixed_per": "stage", "pf_scale": 1.0, "pf_fixed_ms": 0.0,
+                   **({"gw_client_ms": gw_client_ms} if gw_client_ms is not None else {})},
+        "net": {"back_pp_hop_ms": n.back_pp_hop_ms, "back_pp_cross_ms": n.back_pp_cross_ms},
+        "fit": {"knobs": out, "rms_log_before": before, "rms_log_after": after,
+                "deploys": [label for label, *_ in deps],
+                "engines": [{"deploy": label, "engine": e.name, "gpus": [g.gpu for g in e.gpus],
+                             "stats": e.stats_full, "decode_points": len(d), "prefill_points": len(pp)}
+                            for label, e, d, pp in engs]},
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 命令行
 # --------------------------------------------------------------------------- #
-def _setup(a) -> tuple:
-    stages = json.loads(Path(a.stages).read_text(encoding="utf-8"))
+def _env(a, stages_path: str | Path, perf: Mapping | None = None) -> tuple:
+    """命令行参数 + 一份 stages.json → (stages, 节点卡型, layer_bench 表, 网络, 参数)；给了 --calib 就套上。"""
+    stages = json.loads(Path(stages_path).read_text(encoding="utf-8"))
     if stages.get("kind") != "tiered" and not all("partition" in c for c in stages.get("channels") or [{}]):
-        raise SystemExit(f"{a.stages} 既不是分段部署的 stages.json，也不是 layout.py 的 channels.json")
+        raise SystemExit(f"{stages_path} 既不是分段部署的 stages.json，也不是 layout.py 的 channels.json")
     ip, gpu_h = load_hosts(a.hosts)
     for c in stages["channels"]:
         for x in c.get("commands") or []:
@@ -1096,7 +1440,7 @@ def _setup(a) -> tuple:
     for kv in a.gpu or []:
         k, v = kv.split("=", 1)
         node_gpu[k] = gpu_key(v)
-    perf = load_perf(a.layer_bench)
+    perf = perf if perf is not None else load_perf(a.layer_bench)
     net = Net(ip=ip, lat=lat, bw=bw, lat_same=a.lat_same, lat_cross=a.lat_cross, lat_gw=a.lat_gw,
               gateway=a.gateway_node, hop_ms=a.hop_ms, agent_hop_ms=a.agent_hop_ms, pp_hop_ms=a.pp_hop_ms,
               back_pp_hop_ms=a.back_pp_hop_ms, bw_default=a.bw_mbps)
@@ -1106,8 +1450,16 @@ def _setup(a) -> tuple:
     params = Params(front_fixed_ms=a.front_fixed_ms, back_fixed_ms=a.back_fixed_ms, lr_ms=a.lr_ms,
                     client_ms=a.client_ms, max_batched_tokens=a.max_batched_tokens, hidden=hidden,
                     pp_simple=a.pp_simple, pf_fixed_ms=a.pf_fixed_ms, pf_fixed_per=a.pf_fixed_per,
-                    pf_scale=a.pf_scale,
-                    batch_wait_ms=a.batch_wait_ms, batch_wait_role=a.batch_wait_role)
+                    pf_scale=a.pf_scale, gw_client_ms=a.gw_client_ms,
+                    batch_wait_ms=getattr(a, "batch_wait_ms", 0.0),
+                    batch_wait_role=getattr(a, "batch_wait_role", "back"))
+    if getattr(a, "calib", None):
+        params, net = apply_calib(json.loads(Path(a.calib).read_text(encoding="utf-8")), params, net)
+    return stages, node_gpu, perf, net, params
+
+
+def _setup(a) -> tuple:
+    stages, node_gpu, perf, net, params = _env(a, a.stages)
     steps = None
     if a.steps:
         from vllm.p2p import steptrace
@@ -1121,12 +1473,12 @@ def _setup(a) -> tuple:
     return stages, node_gpu, perf, net, params, steps, real, reqs_fn
 
 
-def _common(ap) -> None:
-    ap.add_argument("--stages", required=True,
+def _common(ap, *, run: bool = True) -> None:
+    ap.add_argument("--stages", required=run,
                     help="分段部署的 stages.json；或整条流水线（A）的 channels.json（layout.py 生成）")
     ap.add_argument("--a-mode", choices=("any", "oracle"), default="any",
                     help="整条流水线（A）时网关怎么挑通道（同 gateway.py --mode）")
-    ap.add_argument("--replay", required=True,
+    ap.add_argument("--replay", required=run,
                     help="一次真机结果（bench 的 --out）：请求顺序、prompt / 生成长度、绑到哪类都照它")
     ap.add_argument("--layer-bench", nargs="+", required=True,
                     help="layer_bench 的 summary_by_gpu.json，或各台的单机结果（同卡型取均值）")
@@ -1171,11 +1523,15 @@ def _common(ap) -> None:
                     help="节点间 / 网关 ↔ 节点的有效带宽（Mbps；--topo 里没写的边都用它）。只影响大消息："
                          "prompt 的 hidden（每 token 4 KB）、PP 的 prefill hidden")
     ap.add_argument("--gateway-node", default=None, help="网关在哪个节点（如 N09），网关消息按它算时延")
+    ap.add_argument("--gw-client-ms", type=float, default=0.0,
+                    help="网关 → 客户端那一段（TTFT 拆分的「网关外」，真机约 2 ms）；只推后客户端看到的时刻")
     ap.add_argument("--lr-ms", type=float, default=2.0)
     ap.add_argument("--client-ms", type=float, default=1.0)
     ap.add_argument("--max-batched-tokens", type=int, default=8192)
     ap.add_argument("--steps", nargs="*", default=None,
                     help="steptrace 收回来的步级记录（<引擎名>.jsonl）：纯 decode 步用实测每步 p50")
+    ap.add_argument("--calib", default=None,
+                    help="`sim calib` 写的按卡型标定（JSON）：套在上面这些参数之上（它里面有的项以它为准）")
     ap.add_argument("--label", default="")
     ap.add_argument("--out", default=None)
 
@@ -1205,6 +1561,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="也标定 --pp-hop-ms（多机 PP 每次传输的固定开销）。同一深度的流水线下它和每步固定开销"
                         "分不开 —— 有步级记录（--steps）或不同深度的部署一起看时再开")
     f.add_argument("--fix", default="", help="不调的参数（逗号分隔：front_fixed_ms,back_fixed_ms,hop_ms）")
+    cb = sub.add_parser("calib", help="按卡型标定：拿几份部署的步级记录，拟合只靠 layer_bench 时要补的几项，写 JSON（run --calib 用）")
+    _common(cb, run=False)
+    cb.add_argument("--deploy", nargs=2, action="append", required=True, metavar=("STAGES", "STEPS"),
+                    help="一份部署：stages.json 与它的步级记录（目录，或逗号分隔的文件 / 通配）；可多次，"
+                         "卡型、PP 深度、开没开统计各不相同的部署放在一起，拟合才分得开各项")
+    cb.add_argument("--min-steps", type=int, default=30, help="某个批大小的纯 decode 步少于这么多就不用")
+    cb.add_argument("--ridge", type=float, default=0.02,
+                    help="倍数项往 1 拉的力度（对数平方的系数；0 = 不拉）")
+    cb.add_argument("--real", nargs="*", default=[],
+                    help="这几份部署的真机结果（可选）：取 TTFT 拆分里「网关外」的中位数当 gw_client_ms")
     c = sub.add_parser("compare", help="比两份结果的关键指标")
     c.add_argument("--sim", required=True)
     c.add_argument("--real", required=True)
@@ -1250,6 +1616,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                                json.loads(Path(a.real).read_text(encoding="utf-8")))
         print("\n".join(lines))
         print(f"误差分（加权相对误差平方均值）：{score:.4f}")
+        return 0
+
+    if a.cmd == "calib":
+        perf = load_perf(a.layer_bench)
+        deps = []
+        for stg, steps_spec in a.deploy:
+            stages, node_gpu, _, net, params = _env(a, stg, perf=perf)
+            sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params, front_slots=1, hold=True)
+            deps.append((Path(stg).parent.name or Path(stg).stem, stages, sim, _load_rows(steps_spec)))
+        gwc = None
+        if a.real:
+            vals = []
+            for rp in a.real:
+                for r in json.loads(Path(rp).read_text(encoding="utf-8")).get("requests") or []:
+                    co = (r.get("engine") or {}).get("ttft_ms")       # 协调器口径；prefill_ms = 客户端口径
+                    if co is not None and r.get("prefill_ms") is not None:
+                        vals.append(float(r["prefill_ms"]) - float(co))
+            vals = sorted(v for v in vals if v >= 0)
+            gwc = round(vals[len(vals) // 2], 3) if vals else None
+        cal = calibrate(deps, min_n=a.min_steps, gw_client_ms=gwc, ridge=a.ridge)
+        print("标定结果：" + json.dumps({**cal["params"], **cal["net"]}, ensure_ascii=False))
+        out = a.out or "results/sim_calib.json"
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(json.dumps(cal, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"已写 {out}（之后 run / fit 加 --calib {out}，不要再加 --steps）")
         return 0
 
     stages, node_gpu, perf, net, params, steps, real, reqs_fn = _setup(a)

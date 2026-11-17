@@ -528,7 +528,7 @@ def test_fit_prefill_fixed_and_scale_from_ttft_mean(world) -> None:
         return S.run_sim(world["stages"], S.replay_requests(truth, world["stages"]), perf=perf, net=net,
                          node_gpu=gpu, params=p, real=truth, per_front=1)
     base = S.Params(front_fixed_ms=1.0, back_fixed_ms=1.0)
-    p, _, score, doc = S.fit(make, truth, base, 2.0, rounds=4, fixed=("front_fixed_ms", "back_fixed_ms", "hop_ms"),
+    p, _, score, doc = S.fit(make, truth, base, 2.0, rounds=6, fixed=("front_fixed_ms", "back_fixed_ms", "hop_ms"),
                              extra={"pf_fixed_ms": 20.0, "pf_scale": 1.0}, score="ttft-all", log=lambda s: None)
     got = doc["sim"]["fit"]["params"]
     assert score < 1e-3, (score, doc["sim"]["fit"]["params"])
@@ -547,3 +547,149 @@ def test_detail_cli(world, tmp_path) -> None:
     assert "| gsm8k | 3 / 3 |" in txt and "（+0.0%）" in txt
     assert S.main(["detail", "--real", str(tmp_path / "a.json"), "--sim", str(tmp_path / "a.json"),
                    "--by", "channel"]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# 按卡型标定（calib）
+# --------------------------------------------------------------------------- #
+def test_prefill_below_table_continues_from_decode_rows() -> None:
+    """layer_bench 的 prefill 表从 128 起；更短的 prompt 用 decode 表最短上下文那行（批 = token 数）接上。"""
+    perf = fake_perf()["A30"]
+    gp = S.GpuPerf("A30", perf["decode"], perf["prefill"], perf["decode_overhead_ms"])
+    row = perf["decode"]["64"]["128"]
+    assert gp.prefill_ms(64, 8) == pytest.approx(row["8"])
+    assert gp.prefill_ms(64, 1) == pytest.approx(row["1"])
+    assert gp.prefill_ms(64, 128) == pytest.approx(perf["prefill"]["64"]["128"])
+    mid = gp.prefill_ms(64, 68)                                    # 8 与 128 之间线性
+    assert mid == pytest.approx(row["8"] + (perf["prefill"]["64"]["128"] - row["8"]) * 60 / 120)
+
+
+def test_stats_full_detection() -> None:
+    def ch(ov):
+        return {"commands": [{"node": "N1", "host": "h", "cmd": "x --hf-overrides " + shlex.quote(json.dumps(ov))}]}
+    assert S.stats_full(ch({"p2p_stats": {"lr_layers": [0, 1]}}))
+    assert not S.stats_full(ch({"p2p_stats": {"lr_layers": [0, 1], "emit_lr": True, "prefill_only": True}}))
+    assert not S.stats_full(ch({"p2p_layer_experts": {}}))
+    assert not S.stats_full({"commands": []})
+
+
+def _back_pp(sim):
+    for e in sim.engines.values():
+        if e.role == "back" and len(e.nodes) > 1:
+            return e
+    raise AssertionError("清单里没有多机后段")
+
+
+def test_calib_knobs_move_step_time(world) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    net = S.Net(ip=ip, lat_same=0.1, lat_cross=3.0, pp_hop_ms=0.5, back_pp_hop_ms=0.5)
+    p = S.Params(front_fixed_ms=1.0, back_fixed_ms=1.0)
+    sim = S.Sim(world["stages"], perf=perf, net=net, node_gpu=gpu, params=p, front_slots=1, hold=True)
+    e = _back_pp(sim)
+    assert e.stats_full                                    # layout --stats：后段开了逐请求统计
+    base = e.step_ms([300.0], [])
+    p.stats_ms = 4.0
+    assert e.step_ms([300.0], []) == pytest.approx(base + 4.0)
+    p.stats_ms = 0.0
+    comp = sum(nl * g.decode_ms(e.experts, 300.0, 1) for g, nl in zip(e.gpus, e.layers))
+    p.dec_scale = {f"back:{g.gpu}": 2.0 for g in e.gpus}
+    assert e.step_ms([300.0], []) == pytest.approx(base + comp, rel=1e-6)   # 单段串行时恰好多一份
+    p.dec_scale = {}
+    ncross = sum(1 for a, b in [(e.nodes[0], v) for v in e.nodes[1:]] + list(zip(e.nodes, e.nodes[1:]))
+                 + [(e.nodes[-1], e.nodes[0])] if net.cross(a, b))
+    net.back_pp_cross_ms = 1.0
+    if ncross:
+        assert e.step_ms([300.0], []) > base
+    else:
+        assert e.step_ms([300.0], []) == pytest.approx(base)
+    pf = e.step_ms([], [200])
+    p.pf_token_back_ms = 0.1
+    assert e.step_ms([], [200]) == pytest.approx(pf + 20.0)
+
+
+def _synth_rows(sim, *, b_max=3, n_per=40, pf_sizes=(20, 60, 120, 300, 600)) -> dict:
+    """拿当前参数下模拟器自己的每步用时造步级记录（纯 decode 各批 n_per 步、单条 prefill 各长度 8 步）。"""
+    rows = {}
+    for name, e in sim.engines.items():
+        rs, t = [], 0.0
+        for b in range(1, b_max + 1):
+            ms = e.step_ms([300.0] * b, [])
+            for _ in range(n_per):
+                rs.append({"t": t, "ms": ms, "n": b, "npf": 0, "pf": 0, "ctx": 300.0})
+                t += ms / 1e3 + 0.01
+        for n in pf_sizes:
+            ms = e.step_ms([], [n])
+            for _ in range(8):
+                rs.append({"t": t, "ms": ms, "n": 1, "npf": 1, "pf": n, "ctx": 0.0})
+                t += ms / 1e3 + 0.01
+        rows[name] = rs
+    return rows
+
+
+def test_calibrate_recovers_known_step_model(world) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    truth = dict(dec_scale={"back:A30": 0.8, "back:RTX6000": 1.3, "back:T4": 1.1, "front:A30": 1.2,
+                            "front:RTX6000": 1.2, "front:T4": 1.2},
+                 pf_gpu_scale={"back:A30": 1.1, "back:RTX6000": 0.9, "back:T4": 1.2, "front:A30": 1.0,
+                               "front:RTX6000": 1.0, "front:T4": 1.0},
+                 front_fixed_ms=0.9, pf_fixed_front_ms=1.0, pf_fixed_back_ms=2.0, pf_token_back_ms=0.08,
+                 pf_fixed_per="stage")
+    net_t = S.Net(ip=ip, lat_same=0.1, lat_cross=1.25, pp_hop_ms=0.5, back_pp_hop_ms=1.5)
+    sim_t = S.Sim(world["stages"], perf=perf, net=net_t, node_gpu=gpu, params=S.Params(**truth), front_slots=1,
+                  hold=True)
+    rows = _synth_rows(sim_t)
+    # 从「命令行默认」出发：倍数全 1、固定开销是别的值
+    net0 = S.Net(ip=ip, lat_same=0.1, lat_cross=1.25, pp_hop_ms=0.5, back_pp_hop_ms=3.3)
+    sim0 = S.Sim(world["stages"], perf=perf, net=net0, node_gpu=gpu,
+                 params=S.Params(front_fixed_ms=None, pf_fixed_ms=27.0), front_slots=1, hold=True)
+    cal = S.calibrate([("w", world["stages"], sim0, rows)], ridge=0.0, log=lambda s: None)
+    assert cal["fit"]["rms_log_after"]["decode"] < 0.02, cal["fit"]
+    assert cal["fit"]["rms_log_after"]["prefill"] < 0.03, cal["fit"]
+    assert cal["fit"]["rms_log_before"]["decode"] > cal["fit"]["rms_log_after"]["decode"]
+    # 单项不一定唯一（后段 PP 开销与每层倍数在同一种部署里分不太开），要求的是每步用时对得上
+    # 套回去：每步用时和「真值」一致
+    p2, n2 = S.apply_calib(cal, S.Params(), S.Net(ip=ip, lat_same=0.1, lat_cross=1.25, pp_hop_ms=0.5))
+    sim2 = S.Sim(world["stages"], perf=perf, net=n2, node_gpu=gpu, params=p2, front_slots=1, hold=True)
+    for name, e in sim_t.engines.items():
+        assert sim2.engines[name].step_ms([300.0, 300.0], []) == pytest.approx(e.step_ms([300.0, 300.0], []), rel=0.05)
+
+
+def test_calib_cli_then_run_with_calib(world, tmp_path) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    sim_t = S.Sim(world["stages"], perf=perf, net=S.Net(ip=ip, back_pp_hop_ms=1.0), node_gpu=gpu,
+                  params=S.Params(dec_scale={"back:A30": 0.9}, front_fixed_ms=1.0), front_slots=1, hold=True)
+    d = tmp_path / "steps"
+    d.mkdir()
+    for name, rs in _synth_rows(sim_t).items():
+        (d / f"{name}.jsonl").write_text("\n".join(json.dumps(r) for r in rs))
+    real = setup(world, fake_real(world["stages"], n=6), per_front=1, gw_client_ms=2.0)   # 「网关外」2 ms
+    rp = tmp_path / "real.json"
+    rp.write_text(json.dumps(real))
+    out = tmp_path / "calib.json"
+    assert S.main(["calib", "--layer-bench", str(world["lb"]), "--hosts", str(HOSTS), "--back-pp-hop-ms", "3",
+                   "--deploy", str(world["stages_path"]), str(d), "--real", str(rp), "--out", str(out)]) == 0
+    cal = json.loads(out.read_text())
+    assert cal["params"]["gw_client_ms"] == pytest.approx(2.0)
+    assert set(cal["params"]["dec_scale"]) >= {"back:A30"}
+    so = tmp_path / "sim.json"
+    assert S.main(["run", "--stages", str(world["stages_path"]), "--replay", str(rp), "--layer-bench", str(world["lb"]),
+                   "--hosts", str(HOSTS), "--per-front", "1", "--calib", str(out), "--out", str(so)]) == 0
+    doc = json.loads(so.read_text())
+    assert doc["sim"]["params"]["gw_client_ms"] == pytest.approx(2.0)
+    assert doc["sim"]["params"]["dec_scale"] == cal["params"]["dec_scale"]
+
+
+def test_gw_client_ms_shifts_ttft_not_tpot(world) -> None:
+    real = fake_real(world["stages"], n=6)
+    a = setup(world, real, per_front=1)
+    b = setup(world, real, per_front=1, gw_client_ms=3.0)
+    for r in a["requests"]:                          # 客户端口径 − 协调器口径 = 「网关外」
+        assert r["prefill_ms"] - r["engine"]["ttft_ms"] == pytest.approx(0.0, abs=0.02)
+    for r in b["requests"]:
+        assert r["prefill_ms"] - r["engine"]["ttft_ms"] == pytest.approx(3.0, abs=0.02)
+    ta = sorted(r["per_token_p50_ms"] for r in a["requests"])
+    tb = sorted(r["per_token_p50_ms"] for r in b["requests"])
+    assert tb == pytest.approx(ta, rel=0.05)                 # 只推后客户端看到的时刻，不改 token 间隔
