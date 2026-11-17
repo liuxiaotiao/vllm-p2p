@@ -451,7 +451,7 @@ async def _amain(a) -> int:
             lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo)
         ident_desc = f"前段出口 LR（{Path(a.lr_model).name}）"
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
-    co = TieredCoordinator(fe, be, bind="least", eos=eos, stop_ids=stop_ids, ignore_eos=False,
+    co = TieredCoordinator(fe, be, bind=a.bind, eos=eos, stop_ids=stop_ids, ignore_eos=False,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
                            classify=classify, route="lr" if a.mode == "lr" else "task",
                            hold=not a.no_hold, front_slots=a.front_slots or None)
@@ -473,7 +473,7 @@ async def _amain(a) -> int:
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, a.host, a.port).start()
-    print(f"分段网关（{a.mode}，前段按 {a.front_pick} 挑，"
+    print(f"分段网关（{a.mode}，前段按 {a.front_pick} 挑、后段按 {a.bind} 挑，"
           f"{'经协调器转' if a.via_coordinator else '前后段直连'}）：前段 {[e.name for e in fe]}，后段 "
           f"{ {u: [b.name for b in be if b.task == u] for u in sorted({b.task for b in be})} }；"
           f"停止 token {stop_ids}；监听 {a.host}:{a.port}", flush=True)
@@ -512,6 +512,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--via-coordinator", action="store_true",
                     help="每 token 的 hidden / token 都经协调器转（默认前后段代理直连；"
                          "协调器与引擎不在同一网段时每跳多一个往返）")
+    ap.add_argument("--bind", choices=("least", "least-free", "speed", "rr"), default="least",
+                    help="同类后段怎么挑：least = 在飞最少、一样多轮流；least-free = 在飞最少、一样多先给最早空出来的；"
+                         "speed = 按量到的「同时 n 条时每位置多少毫秒」估再放一条后谁最快、一样先给最早空出来的")
     ap.add_argument("--front-pick", choices=("speed", "least"), default="speed",
                     help="选前段：speed =（在飞+1）×实测每位置耗时最小（默认）；least = 在飞最少")
     ap.add_argument("--mode", choices=MODES, default="oracle",

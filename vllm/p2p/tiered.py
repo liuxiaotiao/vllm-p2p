@@ -77,9 +77,42 @@ class Engine:
     # 远端引擎报的每 decode 位置「引擎内毫秒」的滑动平均（选前段时按它算快慢）；0 = 还没数据
     ewma_ms: float = 0.0
     batch_wait_ms: float = 0.0       # 后段的凑批等待窗口（调度器 p2p_batch_wait_ms；0 = 关）
+    # 上一次少掉一条在飞的时刻（协调器的钟）：在飞一样多时，先派给最早空出来的那个（bind=least-free / speed）
+    t_free: float = 0.0
+    # 按「同时在飞几条」分开的每位置毫秒（滑动平均）：bind=speed 用它估「再放一条以后每位置多久」
+    lvl_ms: dict = field(default_factory=dict)
 
-    def observe(self, ms: float, alpha: float = 0.05) -> None:
+    def observe(self, ms: float, alpha: float = 0.05, level: int | None = None) -> None:
         self.ewma_ms = ms if self.ewma_ms <= 0 else (1 - alpha) * self.ewma_ms + alpha * ms
+        if level is not None and level > 0:
+            old = self.lvl_ms.get(level)
+            self.lvl_ms[level] = ms if old is None else (1 - alpha) * old + alpha * ms
+
+    def release_one(self, now: float) -> None:
+        """少一条在飞（做完 / 中止）。"""
+        self.inflight -= 1
+        self.t_free = now
+
+    def est_ms(self, n: int) -> float | None:
+        """同时 n 条时每位置大概多少毫秒：量过就用量的；没量过按相邻两档线性外推（只有一档时就用那一档，
+        偏乐观 —— 让它先接几条、量出来）；什么都没量过 = None。"""
+        lv = self.lvl_ms
+        if not lv:
+            return None
+        if n in lv:
+            return lv[n]
+        ks = sorted(lv)
+        lo, hi = [k for k in ks if k < n], [k for k in ks if k > n]
+        if lo and hi:
+            a, b = lo[-1], hi[0]
+            return lv[a] + (lv[b] - lv[a]) * (n - a) / (b - a)
+        if lo:
+            a = lo[-1]
+            if len(lo) >= 2:
+                z = lo[-2]
+                return lv[a] + max(0.0, (lv[a] - lv[z]) / (a - z)) * (n - a)
+            return lv[a]
+        return lv[hi[0]]
 
     async def add(self, req) -> None:
         await self.client.add_request_async(req)
@@ -360,7 +393,7 @@ class TieredCoordinator:
         if r.back is not None:
             await r.back.abort([r.rid])
             if r.finish is None:
-                r.back.inflight -= 1
+                r.back.release_one(self.clock())
                 await self._drain()
 
     async def stream(self, prompt: list[int], max_tokens: int, *, task: str | None = None,
@@ -475,8 +508,20 @@ class TieredCoordinator:
         k = next(self._rr[r.task])
         if self.bind == "rr":
             return cands[k % len(cands)]
-        low = min(b.inflight for b in cands)
-        least = [b for b in cands if b.inflight == low]
+        if self.bind == "speed":
+            # 放上去以后每位置大概多久，选最短的；还没量过的按已知最快的算（先让它接、量出来）
+            est = {id(b): b.est_ms(b.inflight + 1) for b in cands}
+            known = [v for v in est.values() if v is not None]
+            base = min(known) if known else 0.0
+            cost = {i: (base if v is None else v) for i, v in est.items()}
+            low = min(cost.values())
+            least = [b for b in cands if cost[id(b)] <= low * (1 + 1e-9) + 1e-12]
+        else:
+            low = min(b.inflight for b in cands)
+            least = [b for b in cands if b.inflight == low]
+        if self.bind in ("least-free", "speed") and len(least) > 1:
+            first = min(b.t_free for b in least)       # 一样好时：先派给最早空出来的那个
+            least = [b for b in least if b.t_free == first]
         return least[k % len(least)]
 
     def _identify(self, r: _Req) -> None:
@@ -649,13 +694,13 @@ class TieredCoordinator:
                         r.t_tok.extend([now] * len(new))
                         if len(r.tokens) > 1 and o.request_id in meta:
                             r.eng_b.append(meta[o.request_id])      # 第 1 个 token 是 prefill，不算
-                            b.observe(meta[o.request_id])
+                            b.observe(meta[o.request_id], level=b.inflight)
                         elif len(r.tokens) == len(new) and o.request_id in meta:
                             r.eng_b0 = meta[o.request_id]           # 第 1 个 token：后段 prefill
                         r.events.put_nowait(("tok", new))
                     if o.finish_reason is not None:
                         r.finish = str(o.finish_reason)
-                        b.inflight -= 1
+                        b.release_one(self.clock())
                         freed = True
                         f.inflight -= 1
                         aborts.setdefault(f.name, (f, []))[1].append(r.rid)

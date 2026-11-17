@@ -540,6 +540,10 @@ class SimEngine:
             self.t_ready.pop(rid, None)
         if self.role == "front" and dec:
             self.sim.co_eng[self.name].observe(ms)
+        elif self.role == "back" and dec:          # 和真网关一样：每个 decode token 记一次，按当时绑了几条分档
+            ce = self.sim.co_eng[self.name]
+            for _ in dec:
+                ce.observe(ms, level=ce.inflight)
         self.sim.at(now + ms, self._done, dec, pf, ms)
 
     def _done(self, now: float, dec, pf, ms) -> None:
@@ -699,7 +703,7 @@ class Sim:
             self.engines[r.back.name].release(r.rid, t)
             self.on_finish(r, t)
             return
-        r.back.inflight -= 1
+        r.back.release_one(t)
         r.front.inflight -= 1
         self.engines[r.front.name].release(r.rid, t)
         self.engines[r.back.name].release(r.rid, t)
@@ -818,7 +822,7 @@ def _req_index(rid: Any) -> int:
 
 def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu, params: Params,
             per_front: int = 0, inflight: int = 0, front_slots: int = 0, hold: bool = True,
-            front_pick: str = "least", steps=None, marks: Sequence[int] = DEFAULT_MARKS,
+            front_pick: str = "least", bind: str = "least", steps=None, marks: Sequence[int] = DEFAULT_MARKS,
             real: Mapping | None = None, label: str = "", a_mode: str = "any") -> dict:
     full = stages.get("kind") != "tiered"
     if per_front:
@@ -827,7 +831,8 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
         inflight, front_slots = per_front * len(stages["fronts"]), per_front
     inflight = inflight or len(stages["channels"] if full else stages["backs"])
     sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params,
-              front_slots=front_slots or None, hold=hold, front_pick=front_pick, steps=steps, a_mode=a_mode)
+              front_slots=front_slots or None, hold=hold, front_pick=front_pick, bind=bind, steps=steps,
+              a_mode=a_mode)
     queue = list(reqs)
     nxt = iter(range(len(queue)))
 
@@ -964,7 +969,7 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
         "net": {"hop_ms": sim.net.hop_ms, "agent_hop_ms": sim.net.agent_hop_ms, "pp_hop_ms": sim.net.pp_hop_ms,
                 "back_pp_hop_ms": sim.net.back_pp_hop_ms, "lat_same": sim.net.lat_same,
                 "lat_cross": sim.net.lat_cross, "lat_gw": sim.net.lat_gw, "gateway": sim.net.gateway},
-        "front_slots": front_slots or None, "hold": hold,
+        "front_slots": front_slots or None, "hold": hold, "front_pick": getattr(sim.co, "front_pick", None), "bind": getattr(sim.co, "bind", None),
         "engines": {n: {"role": e.role, "task": e.task, "nodes": e.nodes, "gpus": [g.gpu for g in e.gpus],
                         "experts": e.experts, "steps": e.n_steps,
                         "fixed_ms_b1": round(e.fixed_ms(512.0, 1), 4),
@@ -1556,6 +1561,9 @@ def _common(ap, *, run: bool = True) -> None:
     ap.add_argument("--front-slots", type=int, default=0, help="同网关 --front-slots（--per-front 时自动）")
     ap.add_argument("--no-hold", action="store_true", help="同网关 --no-hold")
     ap.add_argument("--front-pick", choices=("least", "speed"), default="least")
+    ap.add_argument("--bind", choices=("least", "least-free", "speed", "rr"), default="least",
+                    help="同类后段怎么挑：least = 在飞最少、一样多轮流；least-free = 在飞最少、一样多先给最早空出来的；"
+                         "speed = 估「再放一条后每位置多久」最短（按量到的分档步时）、一样先给最早空出来的")
     ap.add_argument("--requests", type=int, default=0, help="请求数（默认 = 回放文件的条数，多了循环用）")
     ap.add_argument("--front-fixed-ms", type=float, default=None,
                     help="前段每步固定开销（默认 layer_bench 截距 × 0.5）")
@@ -1746,7 +1754,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             p = Params(**{**p.as_dict(), "pf_scale": pf_scale})
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
-                       hold=not a.no_hold, front_pick=a.front_pick, steps=steps, real=real,
+                       hold=not a.no_hold, front_pick=a.front_pick, bind=a.bind, steps=steps, real=real,
                        label=a.label or f"sim {a.cmd}", a_mode=a.a_mode)
 
     if a.cmd == "fit":

@@ -1380,3 +1380,61 @@ def test_batch_queue_skips_empty_schedule_and_drains_in_flight() -> None:
     core.batch_queue.appendleft((fut, "so-1", fut))                                 # 有一批在流水线里
     outs, _ = EngineCore.step_with_batch_queue(core)
     assert calls == [("update", "so-1")] and outs == {0: "out"} and not core.batch_queue
+
+
+def test_bind_least_free_goes_to_earliest_freed_back() -> None:
+    """在飞一样多（都空着）：least 轮流挑；least-free 先给最早空出来的那个，不轮流。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, _Req
+
+    loop = asyncio.new_event_loop()
+    try:
+        def mk(bind):
+            a, b = Engine("a", "back", None, task="t"), Engine("b", "back", None, task="t")
+            a.inflight = b.inflight = 1
+            b.release_one(3.0)              # b 先空出来
+            a.release_one(5.0)
+            return TieredCoordinator(Engine("f", "front", None), [a, b], bind=bind), a, b
+        r = _Req("x", [1], 4, "t", loop)
+        co, a, b = mk("least")
+        assert {co._pick(r).name for _ in range(4)} == {"a", "b"}
+        co, a, b = mk("least-free")
+        assert [co._pick(r).name for _ in range(4)] == ["b"] * 4
+        assert b.t_free == 3.0 and a.t_free == 5.0 and a.inflight == b.inflight == 0
+        a.inflight = 0
+        b.inflight = 1                      # 不一样多时还是在飞少的优先
+        assert co._pick(r).name == "a"
+    finally:
+        loop.close()
+
+
+def test_bind_speed_uses_per_level_step_ms() -> None:
+    """speed：按量到的「同时 n 条时每位置多少毫秒」估再放一条后谁快；快的有 1 条、慢的空着也给快的。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, _Req
+
+    fast, slow = Engine("fast", "back", None, task="t"), Engine("slow", "back", None, task="t")
+    co = TieredCoordinator(Engine("f", "front", None), [fast, slow], bind="speed")
+    loop = asyncio.new_event_loop()
+    try:
+        r = _Req("x", [1], 4, "t", loop)
+        # 都没量过：一样 → 先给最早空出来的（都是 0 → 轮流）
+        assert {co._pick(r).name for _ in range(4)} == {"fast", "slow"}
+        fast.observe(16.0, level=1)
+        fast.observe(19.0, level=2)
+        slow.observe(43.0, level=1)
+        assert fast.est_ms(1) == 16.0 and fast.est_ms(2) == 19.0
+        assert fast.est_ms(4) == 25.0                # 按最后两档的斜率外推
+        assert slow.est_ms(3) == 43.0                # 只有一档：就用那一档
+        fast.inflight, slow.inflight = 1, 0
+        assert co._pick(r).name == "fast"            # least 会给 slow
+        fast.inflight = 5                            # 再放一条：19 + 3×4 = 31 < 43
+        assert co._pick(r).name == "fast"
+        fast.observe(60.0, level=6)                  # 量到同时 6 条要 60 ms：给 slow
+        assert co._pick(r).name == "slow"
+        # 还没量过的后段按已知最快的算：先让它接、量出来
+        new = Engine("new", "back", None, task="t")
+        co2 = TieredCoordinator(Engine("f", "front", None), [fast, new], bind="speed")
+        fast.inflight = 0
+        new.t_free, fast.t_free = 0.0, 1.0
+        assert co2._pick(r).name == "new"
+    finally:
+        loop.close()

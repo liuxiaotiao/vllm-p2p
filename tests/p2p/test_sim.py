@@ -722,3 +722,18 @@ def test_fit_agent_nodes_finds_slow_front_host(world) -> None:
                             params=p, steps=steps, real=real, log=lambda s: None)
     assert got[slow] == pytest.approx(2.0, abs=0.5), got
     assert all(v <= 0.5 for k, v in got.items() if k != slow), got
+
+
+def test_bind_speed_keeps_requests_on_fast_back(world) -> None:
+    """mbpp 有一个 A30×2 的快后段、一个 RTX6000+T4 的慢后段：bind=speed 把更多请求放到快的上，TPOT 更低；
+    least-free 只换「一样多时给谁」，结果合法。"""
+    st = world["stages"]
+    rows = [{"req": f"req{i}", "case_id": f"mbpp:{i}", "true_task": "mbpp", "channel": "back-mbpp-0",
+             "n_prompt": 120, "n_generated": 60, "stop_reason": "length"} for i in range(24)]
+    real = {"requests": rows}
+    out = {b: setup(world, real, inflight=2, bind=b) for b in ("least", "least-free", "speed")}
+    for b, doc in out.items():
+        assert len(doc["requests"]) == 24 and doc["sim"]["bind"] == b
+    n_fast = {b: sum(r["channel"] == "back-mbpp-0" for r in d["requests"]) for b, d in out.items()}
+    tpot = {b: S.key_metrics(d)["TPOT 均值"] for b, d in out.items()}
+    assert n_fast["speed"] > n_fast["least"] and tpot["speed"] < tpot["least"]
