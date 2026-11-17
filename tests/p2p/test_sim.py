@@ -670,9 +670,11 @@ def test_calib_cli_then_run_with_calib(world, tmp_path) -> None:
     rp.write_text(json.dumps(real))
     out = tmp_path / "calib.json"
     assert S.main(["calib", "--layer-bench", str(world["lb"]), "--hosts", str(HOSTS), "--back-pp-hop-ms", "3",
-                   "--deploy", str(world["stages_path"]), str(d), "--real", str(rp), "--out", str(out)]) == 0
+                   "--deploy", str(world["stages_path"]), str(d), str(rp), "--out", str(out)]) == 0
     cal = json.loads(out.read_text())
-    assert cal["params"]["gw_client_ms"] == pytest.approx(2.0)
+    assert cal["params"]["gw_client_ms"] == pytest.approx(2.0)        # 第三个值（真机结果）也当 --real 用
+    fronts = {c["nodes"][0] for c in world["stages"]["channels"] if c["role"] == "front"}
+    assert set(cal["net"]["agent_node_ms"]) == fronts
     assert set(cal["params"]["dec_scale"]) >= {"back:A30"}
     so = tmp_path / "sim.json"
     assert S.main(["run", "--stages", str(world["stages_path"]), "--replay", str(rp), "--layer-bench", str(world["lb"]),
@@ -693,3 +695,30 @@ def test_gw_client_ms_shifts_ttft_not_tpot(world) -> None:
     ta = sorted(r["per_token_p50_ms"] for r in a["requests"])
     tb = sorted(r["per_token_p50_ms"] for r in b["requests"])
     assert tb == pytest.approx(ta, rel=0.05)                 # 只推后客户端看到的时刻，不改 token 间隔
+
+
+def test_agent_node_ms_adds_to_agent_messages_only() -> None:
+    net = S.Net(ip={"A": "10.0.1.1", "B": "10.0.1.2"}, lat_same=0.1, agent_hop_ms=1.0, hop_ms=5.0,
+                agent_node_ms={"B": 2.0})
+    assert net.msg("A", "B", 0, kind="agent") == pytest.approx(0.1 + 1.0 + 2.0)
+    assert net.msg("B", "A", 0, kind="agent") == pytest.approx(0.1 + 1.0 + 2.0)
+    assert net.msg("A", "B", 0, kind="gw") == pytest.approx(0.1 + 5.0)          # HTTP 网关那条路不算
+
+
+def test_fit_agent_nodes_finds_slow_front_host(world) -> None:
+    perf = S.load_perf([world["lb"]])
+    ip, gpu = S.load_hosts(HOSTS)
+    p = S.Params(front_fixed_ms=1.0, back_fixed_ms=1.0)
+    sim0 = S.Sim(world["stages"], perf=perf, net=S.Net(ip=ip), node_gpu=gpu, params=p, front_slots=1, hold=True)
+    steps = S.steps_model(_synth_rows(sim0))
+    fronts = [c["nodes"][0] for c in world["stages"]["channels"] if c["role"] == "front"]
+    slow = fronts[0]
+    truth_net = S.Net(ip=ip, agent_hop_ms=1.0, agent_node_ms={slow: 2.0})
+    real = S.run_sim(world["stages"], S.replay_requests(fake_real(world["stages"], n=24, gen=(30, 40, 20)),
+                                                        world["stages"]),
+                     perf=perf, net=truth_net, node_gpu=gpu, params=p, per_front=2, steps=steps)
+    real["run"] = {**(real.get("run") or {}), "per_front": 2}
+    got = S.fit_agent_nodes(world["stages"], perf=perf, net=S.Net(ip=ip, agent_hop_ms=1.0), node_gpu=gpu,
+                            params=p, steps=steps, real=real, log=lambda s: None)
+    assert got[slow] == pytest.approx(2.0, abs=0.5), got
+    assert all(v <= 0.5 for k, v in got.items() if k != slow), got

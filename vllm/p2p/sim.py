@@ -16,9 +16,9 @@
     python -m vllm.p2p.sim compare --sim results/sim_pf1_x.json --real results/b1_lr_pf1_x.json
     # 4. 按卡型标定：拿几份部署的步级记录拟合「只靠 layer_bench」时要补的几项，之后不给 --steps 也准
     python -m vllm.p2p.sim calib --layer-bench … --hosts … $SIMP \
-        --deploy p2p_channels_new/stages.json results/steps_n150 \
-        --deploy p2p_channels_ffa95/stages.json results/steps_ffa95_pf6_n150 \
-        --real results/b1_o3c_pf3_n150.json results/ffa95_pf6_n150.json --out results/sim_calib.json
+        --deploy p2p_channels_new/stages.json results/steps_n150 results/b1_o3c_pf3_n150.json \
+        --deploy p2p_channels_ffa95/stages.json results/steps_ffa95_pf6_n150 results/ffa95_pf6_n150.json \
+        --out results/sim_calib.json
     python -m vllm.p2p.sim run … $SIMP --calib results/sim_calib.json      # 新部署：没上过机也能估
 
 按卡型标定（calib）
@@ -26,7 +26,8 @@
 只靠 layer_bench 时每步用时 = 每步固定 + Σ各段 [层数 × layer_bench 每层 × 倍数] + PP 传输。`calib` 用各引擎
 实测的「纯 decode 每批 p50」与「单条 prefill 各长度」拟合：decode 每层倍数（按「角色:卡型」，如 back:A30）、
 前段每步固定、开了逐请求统计（layout.py --stats）的引擎每步多出的 stats_ms、后段 PP 每次传输开销（跨网段另加）；
-prefill 每层倍数、每段固定、每 token 另加；给了 --real 时另取「网关外」中位数（gw_client_ms）。
+prefill 每层倍数、每段固定、每 token 另加；给了真机结果时另取「网关外」中位数（gw_client_ms），并用实测步回放
+那次真机、拟合前段所在机器的代理开销（agent_node_ms：每收 / 发一条消息另加；T4 那台约 2 ms，A30 的几台 0）。
 layer_bench 的 prefill 表从 128 个 token 起，更短的用 decode 表最短上下文那行（批 = token 数）接上。
 标定只学得到数据里出现过的东西：某种卡没在某个角色上出现过、或所有部署都开（都没开）统计，那一项就拟不出来。
 
@@ -229,6 +230,7 @@ class Net:
     pp_hop_ms: float = 0.3                 # 多机 PP 每次传输（段间 hidden / 调度下发 / 结果回传）的固定开销
     back_pp_hop_ms: float | None = None    # 分段部署后段的；None = 同 pp_hop_ms
     back_pp_cross_ms: float = 0.0          # 分段部署后段的 PP 传输跨网段时另加（标定出来的；见 calib）
+    agent_node_ms: dict = field(default_factory=dict)   # 某台机器上的代理收 / 发一条消息另加（CPU 慢、被引擎抢 CPU）
 
     def one_way(self, a: str | None, b: str | None) -> float:
         if a is None or b is None:
@@ -252,7 +254,10 @@ class Net:
         （hop_ms），"agent" 走分段部署的代理（agent_hop_ms）—— 两条路的软件栈不同，开销分开标定。"""
         a = self.gateway if a is None else a
         b = self.gateway if b is None else b
-        return self.one_way(a, b) + self.xfer(a, b, nbytes) + (self.agent_hop_ms if kind == "agent" else self.hop_ms)
+        if kind == "agent":
+            return (self.one_way(a, b) + self.xfer(a, b, nbytes) + self.agent_hop_ms
+                    + self.agent_node_ms.get(a, 0.0) + self.agent_node_ms.get(b, 0.0))
+        return self.one_way(a, b) + self.xfer(a, b, nbytes) + self.hop_ms
 
     def pp(self, a: str, b: str, nbytes: float, hop: float | None = None) -> float:
         return self.one_way(a, b) + self.xfer(a, b, nbytes) + (self.pp_hop_ms if hop is None else hop)
@@ -1188,7 +1193,7 @@ def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float,
 CALIB_PARAMS = ("dec_scale", "pf_gpu_scale", "stats_ms", "front_fixed_ms", "back_fixed_ms",
                 "pf_fixed_front_ms", "pf_fixed_back_ms", "pf_token_front_ms", "pf_token_back_ms",
                 "pf_fixed_per", "pf_scale", "pf_fixed_ms", "gw_client_ms")
-CALIB_NET = ("back_pp_hop_ms", "back_pp_cross_ms")
+CALIB_NET = ("back_pp_hop_ms", "back_pp_cross_ms", "agent_node_ms")
 
 
 def apply_calib(cal: Mapping, params: Params, net: Net) -> tuple[Params, Net]:
@@ -1196,7 +1201,9 @@ def apply_calib(cal: Mapping, params: Params, net: Net) -> tuple[Params, Net]:
     pv = {k: v for k, v in (cal.get("params") or {}).items() if k in CALIB_PARAMS}
     params = Params(**{**params.as_dict(), **pv})
     for k, v in (cal.get("net") or {}).items():
-        if k in CALIB_NET:
+        if k == "agent_node_ms":
+            net.agent_node_ms = {**dict(v or {}), **net.agent_node_ms}      # 命令行给了的节点以命令行为准
+        elif k in CALIB_NET:
             setattr(net, k, v)
     return params, net
 
@@ -1443,7 +1450,8 @@ def _env(a, stages_path: str | Path, perf: Mapping | None = None) -> tuple:
     perf = perf if perf is not None else load_perf(a.layer_bench)
     net = Net(ip=ip, lat=lat, bw=bw, lat_same=a.lat_same, lat_cross=a.lat_cross, lat_gw=a.lat_gw,
               gateway=a.gateway_node, hop_ms=a.hop_ms, agent_hop_ms=a.agent_hop_ms, pp_hop_ms=a.pp_hop_ms,
-              back_pp_hop_ms=a.back_pp_hop_ms, bw_default=a.bw_mbps)
+              back_pp_hop_ms=a.back_pp_hop_ms, bw_default=a.bw_mbps,
+              agent_node_ms={k: float(v) for k, _, v in (x.partition("=") for x in a.agent_node_ms or [])})
     hidden = a.hidden
     if a.model_dir and (Path(a.model_dir) / "config.json").exists():
         hidden = int(json.loads((Path(a.model_dir) / "config.json").read_text())["hidden_size"])
@@ -1458,16 +1466,72 @@ def _env(a, stages_path: str | Path, perf: Mapping | None = None) -> tuple:
     return stages, node_gpu, perf, net, params
 
 
+def steps_model(rows_by_engine: Mapping[str, Sequence[Mapping]]) -> dict:
+    """步级记录 → 模拟器用的「实测步」：纯 decode 每批 p50、prefill 拟合（--steps）。"""
+    from vllm.p2p import steptrace
+    out = {}
+    for name, rows in rows_by_engine.items():
+        s = steptrace.summarise(rows)
+        out[name] = {"dec": {int(b): v["p50"] for b, v in (s.get("decode_ms_by_batch") or {}).items()},
+                     "pf": s.get("prefill_fit")}
+    return out
+
+
+def _tpot_by_channel(rows: Sequence[Mapping]) -> dict[str, float]:
+    by: dict[str, list] = defaultdict(list)
+    for r in rows:
+        n = int(r.get("n_generated") or 0)
+        if n > 1 and r.get("total_ms") is not None and r.get("prefill_ms") is not None and r.get("channel"):
+            by[r["channel"]].append((float(r["total_ms"]) - float(r["prefill_ms"])) / (n - 1))
+    return {k: stt.mean(v) for k, v in by.items()}
+
+
+def fit_agent_nodes(stages: Mapping, *, perf, net: Net, node_gpu, params: Params, steps: Mapping,
+                    real: Mapping, grid: Sequence[float] = (0, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5),
+                    log: Callable[[str], None] = print) -> dict[str, float]:
+    """前段所在机器上的代理每收 / 发一条消息多花多少（agent_node_ms）：用实测步（--steps）回放这份真机，
+    在网格上找让各后段 TPOT 均值最对得上的值（每个前段节点轮流找，两遍）。慢 CPU 的节点（比如 T4 那台）
+    前段每个 token 收发各一次，前段一忙，这点开销还会被排队放大。"""
+    run = real.get("run") or {}
+    per_front = int(run.get("per_front") or 0)
+    inflight = int(run.get("inflight") or 0)
+    bw = run.get("batch_wait_ms")
+    if isinstance(bw, Mapping):                       # bench 记的是每个后段一项：取最常见的那个
+        vals = [float(v) for v in bw.values() if v is not None]
+        bw = max(set(vals), key=vals.count) if vals else None
+    p = Params(**{**params.as_dict(), "batch_wait_ms": float(bw if bw is not None else params.batch_wait_ms)})
+    want = _tpot_by_channel(real.get("requests") or [])
+    nodes = sorted({c["nodes"][0] for c in stages["channels"] if c.get("role") == "front"})
+    cur = {v: float(net.agent_node_ms.get(v, 0.0)) for v in nodes}
+
+    def score(vals: Mapping[str, float]) -> float:
+        n2 = Net(**{**net.__dict__, "agent_node_ms": {**net.agent_node_ms, **vals}})
+        doc = run_sim(stages, replay_requests(real, stages), perf=perf, net=n2, node_gpu=node_gpu, params=p,
+                      per_front=per_front, inflight=0 if per_front else inflight, steps=steps)
+        got = _tpot_by_channel(doc["requests"])
+        es = [math.log(got[k] / want[k]) for k in want if k in got and want[k] > 0]
+        return sum(e * e for e in es) / max(len(es), 1)
+
+    best = score(cur)
+    for _ in range(2):
+        for v in nodes:
+            cand = sorted(set(grid) | {cur[v]} | {max(0.0, cur[v] + d) for d in (-0.25, 0.25)})
+            for x in cand:
+                if x == cur[v]:
+                    continue
+                sc = score({**cur, v: x})
+                if sc < best - 1e-9:
+                    best, cur = sc, {**cur, v: x}
+    log(f"  前段节点代理开销：{ {k: round(x, 2) for k, x in cur.items()} }（各后段 TPOT 的对数误差均方 {best:.4f}）")
+    return {k: round(x, 3) for k, x in cur.items()}
+
+
 def _setup(a) -> tuple:
     stages, node_gpu, perf, net, params = _env(a, a.stages)
     steps = None
     if a.steps:
         from vllm.p2p import steptrace
-        steps = {}
-        for name, rows in steptrace.load(a.steps).items():
-            s = steptrace.summarise(rows)
-            steps[name] = {"dec": {int(b): v["p50"] for b, v in (s.get("decode_ms_by_batch") or {}).items()},
-                           "pf": s.get("prefill_fit")}
+        steps = steps_model(steptrace.load(a.steps))
     real = json.loads(Path(a.replay).read_text(encoding="utf-8"))
     reqs_fn = lambda: replay_requests(real, stages, n=a.requests or None)   # noqa: E731
     return stages, node_gpu, perf, net, params, steps, real, reqs_fn
@@ -1523,6 +1587,8 @@ def _common(ap, *, run: bool = True) -> None:
                     help="节点间 / 网关 ↔ 节点的有效带宽（Mbps；--topo 里没写的边都用它）。只影响大消息："
                          "prompt 的 hidden（每 token 4 KB）、PP 的 prefill hidden")
     ap.add_argument("--gateway-node", default=None, help="网关在哪个节点（如 N09），网关消息按它算时延")
+    ap.add_argument("--agent-node-ms", action="append", default=[], metavar="节点=毫秒",
+                    help="这台机器上的代理每收 / 发一条消息另加（如 N13=2.5：CPU 慢的节点）；可多次")
     ap.add_argument("--gw-client-ms", type=float, default=0.0,
                     help="网关 → 客户端那一段（TTFT 拆分的「网关外」，真机约 2 ms）；只推后客户端看到的时刻")
     ap.add_argument("--lr-ms", type=float, default=2.0)
@@ -1563,9 +1629,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     f.add_argument("--fix", default="", help="不调的参数（逗号分隔：front_fixed_ms,back_fixed_ms,hop_ms）")
     cb = sub.add_parser("calib", help="按卡型标定：拿几份部署的步级记录，拟合只靠 layer_bench 时要补的几项，写 JSON（run --calib 用）")
     _common(cb, run=False)
-    cb.add_argument("--deploy", nargs=2, action="append", required=True, metavar=("STAGES", "STEPS"),
-                    help="一份部署：stages.json 与它的步级记录（目录，或逗号分隔的文件 / 通配）；可多次，"
-                         "卡型、PP 深度、开没开统计各不相同的部署放在一起，拟合才分得开各项")
+    cb.add_argument("--deploy", nargs="+", action="append", required=True, metavar="STAGES STEPS [REAL]",
+                    help="一份部署：stages.json、它的步级记录（目录，或逗号分隔的文件 / 通配），可再给这次的真机结果"
+                         "（给了就另拟前段节点的代理开销 agent_node_ms）；可多次。卡型、PP 深度、开没开统计各不相同的"
+                         "部署放在一起，拟合才分得开各项")
     cb.add_argument("--min-steps", type=int, default=30, help="某个批大小的纯 decode 步少于这么多就不用")
     cb.add_argument("--ridge", type=float, default=0.02,
                     help="倍数项往 1 拉的力度（对数平方的系数；0 = 不拉）")
@@ -1620,11 +1687,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if a.cmd == "calib":
         perf = load_perf(a.layer_bench)
-        deps = []
-        for stg, steps_spec in a.deploy:
+        deps, with_real = [], []
+        for spec in a.deploy:
+            if len(spec) not in (2, 3):
+                raise SystemExit(f"--deploy 要 2 或 3 个值（stages.json 步级记录 [真机结果]），给了 {spec}")
+            stg, steps_spec = spec[0], spec[1]
             stages, node_gpu, _, net, params = _env(a, stg, perf=perf)
             sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params, front_slots=1, hold=True)
-            deps.append((Path(stg).parent.name or Path(stg).stem, stages, sim, _load_rows(steps_spec)))
+            rows = _load_rows(steps_spec)
+            deps.append((Path(stg).parent.name or Path(stg).stem, stages, sim, rows))
+            if len(spec) == 3:
+                with_real.append((stg, rows, json.loads(Path(spec[2]).read_text(encoding="utf-8"))))
+        if a.real is None:
+            a.real = []
+        a.real = list(a.real) + [spec[2] for spec in a.deploy if len(spec) == 3 and spec[2] not in a.real]
         gwc = None
         if a.real:
             vals = []
@@ -1636,6 +1712,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             vals = sorted(v for v in vals if v >= 0)
             gwc = round(vals[len(vals) // 2], 3) if vals else None
         cal = calibrate(deps, min_n=a.min_steps, gw_client_ms=gwc, ridge=a.ridge)
+        if with_real:
+            print("前段节点的代理开销（用实测步回放真机来拟合）：")
+            agent: dict[str, list[float]] = defaultdict(list)
+            for stg, rows, realj in with_real:
+                stages, node_gpu, _, net, params = _env(a, stg, perf=perf)
+                for k, v in fit_agent_nodes(stages, perf=perf, net=net, node_gpu=node_gpu, params=params,
+                                            steps=steps_model(rows), real=realj).items():
+                    agent[k].append(v)
+            cal["net"]["agent_node_ms"] = {k: round(stt.mean(v), 3) for k, v in agent.items()}
         print("标定结果：" + json.dumps({**cal["params"], **cal["net"]}, ensure_ascii=False))
         out = a.out or "results/sim_calib.json"
         Path(out).parent.mkdir(parents=True, exist_ok=True)
