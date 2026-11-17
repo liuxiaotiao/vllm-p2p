@@ -1006,6 +1006,9 @@ def main(argv: list[str] | None = None) -> int:
     out["summary"]["errors"] = len(failed)
     out["run"] = run_metrics(rows, wall, usage=usage or None, inflight=inflight,
                              n_timeout=len(dead))
+    # 闭环的起止（time.time()）：对齐各引擎的步级记录（front_bench occ 按它取窗口）
+    off = time.time() - time.perf_counter()
+    out["run"]["t0_wall"], out["run"]["t1_wall"] = round(t0 + off, 3), round(t1 + off, 3)
     out["run"]["order"] = a.order
     out["run"]["max_tokens"] = a.max_tokens
     out["run"]["marks"] = list(marks)

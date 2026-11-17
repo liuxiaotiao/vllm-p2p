@@ -56,6 +56,17 @@ fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的
 （`--per-node` 改用各台自己的）。
 
 `cluster` 与 `topo` 只用标准库，控制机上按文件路径直接跑。
+
+前段（单前段方案：一个前段装前 L₀ 层、全专家，所有流量从它分发）另有三个子命令，实现在
+`front_bench.py`（详见那里的说明）::
+
+    # 本机：c = 1、2、4、6 条同时在飞时前段每个 token 的服务 / 等待（均值、p95），
+    # prefill 128 / 512 / 1024，固定开销（层数相减、统计开关、词嵌入与拷贝、选择器打分）
+    python -m vllm.p2p.layer_bench front --node N13 --out /tmp/front_bench_N13.json
+    # 控制机：每种卡一台（A30 / RTX6000 / T4）
+    python3 vllm/p2p/layer_bench.py front-cluster --hosts task/hosts.txt --out-dir results/front_bench
+    # 控制机：一次 continuous 里前段（和后段）忙的比例、每 token 时延里排队占多少
+    python3 vllm/p2p/layer_bench.py front-occ --result results/<TAG>.json --steps results/steps_<TAG>/*.jsonl
 """
 
 from __future__ import annotations
@@ -861,8 +872,25 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--allow-missing", action="store_true",
                    help="没量到的卡型按原算力比例换算（默认报错）")
 
+    # 前段（前 L₀ 层、全专家）的实测：vllm/p2p/front_bench.py
+    fb = _front_bench()
+    fb.add_run_args(sub.add_parser("front", help="本机 GPU：前段并发单步、prefill、固定开销（front_bench run）"))
+    fb.add_run_args(sub.add_parser("front-cluster", help="控制机：每种卡一台跑 front（front_bench cluster）"),
+                    cluster=True)
+    fb.add_occ_args(sub.add_parser("front-occ", help="控制机：真实运行里前段 / 后段的占用率（front_bench occ）"))
+
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "cluster": cmd_cluster, "topo": cmd_topo}[a.cmd](a)
+    return {"run": cmd_run, "cluster": cmd_cluster, "topo": cmd_topo, "front": fb.cmd_run,
+            "front-cluster": fb.cmd_cluster, "front-occ": fb.cmd_occ}[a.cmd](a)
+
+
+def _front_bench():
+    if __package__:
+        from vllm.p2p import front_bench
+    else:                                                    # 按文件路径跑（控制机，不 import vllm）
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import front_bench                                   # type: ignore[no-redef]
+    return front_bench
 
 
 if __name__ == "__main__":

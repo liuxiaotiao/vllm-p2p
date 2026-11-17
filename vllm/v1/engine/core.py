@@ -342,6 +342,15 @@ class EngineCore:
                 "holds": getattr(sc, "p2p_hold_n", 0),
                 "hold_ms": round(getattr(sc, "p2p_hold_ms", 0.0), 3)}
 
+    def p2p_trace_flush(self) -> str | None:
+        """步级记录（VLLM_P2P_STEP_TRACE）马上写盘；返回文件路径（没开记录 = None）。
+        前段压测（vllm/p2p/front_bench.py）每段量完读文件前调一次。"""
+        tr = getattr(self, "_p2p_trace", None)
+        if tr is None:
+            return None
+        tr.flush()
+        return str(tr.path)
+
     def _p2p_hold_s(self) -> float:
         """后段凑批等待（scheduler.p2p_hold_s）：现在该再等多少秒；0 = 照常调度。
         一次「等」从第一次判出要等算起，到真正调度为止（不论中间是阻塞等输入还是在收流水线里的批），
