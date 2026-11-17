@@ -186,7 +186,7 @@ class _Req:
     __slots__ = ("rid", "prompt", "n_prompt", "max_tokens", "task", "front", "back", "stream",
                  "tokens", "lps", "t_arrive", "t_front", "t_bound", "t_first", "t_last", "t_tok",
                  "t_hid", "finish", "done", "events", "info", "eng_f", "eng_b", "feat", "body",
-                 "true_task", "t_wait", "identified", "eng_f0", "eng_b0")
+                 "true_task", "t_wait", "identified", "eng_f0", "eng_b0", "t_gw_in")
 
     def __init__(self, rid, prompt, max_tokens, task, loop, body=None):
         self.rid, self.prompt, self.max_tokens, self.task = rid, prompt, max_tokens, task
@@ -200,6 +200,7 @@ class _Req:
         self.tokens: list[int] = []
         self.lps: list[dict] = []
         self.t_arrive = time.perf_counter()
+        self.t_gw_in = self.t_arrive          # 到网关的时刻（含等前段空位之前）：在前段等后段时按它排先后
         self.t_front = self.t_bound = self.t_first = self.t_last = None
         self.t_wait = None                   # 开始在前段等后段空位的时刻（没等过 = None）
         self.identified = False
@@ -368,6 +369,7 @@ class TieredCoordinator:
         r = self.reqs[rid] = _Req(rid, list(prompt), max_tokens, task, asyncio.get_running_loop(),
                                   body=body)
         r.front = f
+        r.t_gw_in = t_in
         r.info["wait_front_slot_ms"] = round((time.perf_counter() - t_in) * 1e3, 3)
         xa = {"p2p_id": rid}
         if body:
@@ -563,7 +565,7 @@ class TieredCoordinator:
                         for w in self._waiting)
             if not free or ahead:
                 r.t_wait = self.clock()
-                self._waiting.append(r)
+                self._enqueue(r)
                 self.n_held += 1
                 return None
             b = self._pick(r, free)
@@ -571,6 +573,23 @@ class TieredCoordinator:
             b = self._pick(r)
         self.reserve(r, b)
         return b
+
+    @staticmethod
+    def _arrival(r) -> float:
+        """请求到网关的时刻（真网关 `_Req.t_gw_in`，模拟器 `SimReq.t_submit`）。"""
+        for k in ("t_gw_in", "t_submit", "t_arrive"):
+            v = getattr(r, k, None)
+            if v is not None:
+                return float(v)
+        return 0.0
+
+    def _enqueue(self, r) -> None:
+        """进等待队列：按到网关的先后排（不是按前段算完的先后）；同一时刻到的按进队先后。"""
+        t = self._arrival(r)
+        i = len(self._waiting)
+        while i > 0 and self._arrival(self._waiting[i - 1]) > t:
+            i -= 1
+        self._waiting.insert(i, r)
 
     def drain_plan(self) -> list:
         """有后段空出槽位：等待队列里按先来先到，能绑的都绑上（每条只在自己 task 的后段里挑）。

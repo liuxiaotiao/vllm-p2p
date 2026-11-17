@@ -737,3 +737,20 @@ def test_bind_speed_keeps_requests_on_fast_back(world) -> None:
     n_fast = {b: sum(r["channel"] == "back-mbpp-0" for r in d["requests"]) for b, d in out.items()}
     tpot = {b: S.key_metrics(d)["TPOT 均值"] for b, d in out.items()}
     assert n_fast["speed"] > n_fast["least"] and tpot["speed"] < tpot["least"]
+
+
+def test_back_slots_one_request_per_path(world) -> None:
+    """--back-slots 1：每条后段 path 同时只跑一条；同类 path 都满时在前段等（wait_back_ms > 0）。"""
+    real = fake_real(world["stages"], n=24)
+    doc = setup(world, real, inflight=6, back_slots=1)
+    assert set(doc["sim"]["back_slots"].values()) == {1}
+    ev = {}
+    for r in doc["requests"]:
+        t0 = r["t_submit_s"] + r["prefill_ms"] / 1e3
+        ev.setdefault(r["channel"], []).extend([(r["t_done_s"], -1), (t0, 1)])
+    for e in ev.values():
+        c = 0
+        for _, d in sorted(e):
+            c += d
+            assert c <= 1
+    assert any((r["tiered"].get("wait_back_ms") or 0) > 0 for r in doc["requests"])

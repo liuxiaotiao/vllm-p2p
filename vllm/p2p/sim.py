@@ -599,7 +599,7 @@ class SimReq:
 class Sim:
     def __init__(self, stages: Mapping, *, perf: Mapping[str, GpuPerf], net: Net, node_gpu: Mapping,
                  params: Params, front_slots: int | None, hold: bool, front_pick: str = "least",
-                 bind: str = "least", steps: Mapping[str, Mapping] | None = None,
+                 bind: str = "least", steps: Mapping[str, Mapping] | None = None, back_slots: int = 0,
                  n_experts: int | None = None, a_mode: str = "any"):
         self.params, self.net = params, net
         self.now = 0.0
@@ -633,8 +633,8 @@ class Sim:
             e = ne if c["role"] == "front" else (resident_experts(c) or ne)
             self.engines[name] = SimEngine(c, perf, node_gpu, e, self, steps.get(name))
         self.co_eng = {n: Engine(n, chans[n]["role"], None, task=chans[n].get("task"),
-                                 slots=(int(chans[n]["max_num_seqs"]) if hold and chans[n]["role"] == "back"
-                                        and chans[n].get("max_num_seqs") else None))
+                                 slots=((back_slots or int(chans[n].get("max_num_seqs") or 0) or None)
+                                        if hold and chans[n]["role"] == "back" else None))
                        for n in self.engines}
         self.co = TieredCoordinator([self.co_eng[n] for n in stages["fronts"]],
                                     [self.co_eng[n] for n in stages["backs"]], bind=bind,
@@ -822,7 +822,8 @@ def _req_index(rid: Any) -> int:
 
 def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu, params: Params,
             per_front: int = 0, inflight: int = 0, front_slots: int = 0, hold: bool = True,
-            front_pick: str = "least", bind: str = "least", steps=None, marks: Sequence[int] = DEFAULT_MARKS,
+            front_pick: str = "least", bind: str = "least", back_slots: int = 0, steps=None,
+            marks: Sequence[int] = DEFAULT_MARKS,
             real: Mapping | None = None, label: str = "", a_mode: str = "any") -> dict:
     full = stages.get("kind") != "tiered"
     if per_front:
@@ -831,7 +832,7 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
         inflight, front_slots = per_front * len(stages["fronts"]), per_front
     inflight = inflight or len(stages["channels"] if full else stages["backs"])
     sim = Sim(stages, perf=perf, net=net, node_gpu=node_gpu, params=params,
-              front_slots=front_slots or None, hold=hold, front_pick=front_pick, bind=bind, steps=steps,
+              front_slots=front_slots or None, hold=hold, front_pick=front_pick, bind=bind, back_slots=back_slots, steps=steps,
               a_mode=a_mode)
     queue = list(reqs)
     nxt = iter(range(len(queue)))
@@ -970,6 +971,7 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
                 "back_pp_hop_ms": sim.net.back_pp_hop_ms, "lat_same": sim.net.lat_same,
                 "lat_cross": sim.net.lat_cross, "lat_gw": sim.net.lat_gw, "gateway": sim.net.gateway},
         "front_slots": front_slots or None, "hold": hold, "front_pick": getattr(sim.co, "front_pick", None), "bind": getattr(sim.co, "bind", None),
+        "back_slots": ({b.name: b.slots for b in sim.co.backs} if sim.co is not None else None),
         "engines": {n: {"role": e.role, "task": e.task, "nodes": e.nodes, "gpus": [g.gpu for g in e.gpus],
                         "experts": e.experts, "steps": e.n_steps,
                         "fixed_ms_b1": round(e.fixed_ms(512.0, 1), 4),
@@ -1561,6 +1563,8 @@ def _common(ap, *, run: bool = True) -> None:
     ap.add_argument("--front-slots", type=int, default=0, help="同网关 --front-slots（--per-front 时自动）")
     ap.add_argument("--no-hold", action="store_true", help="同网关 --no-hold")
     ap.add_argument("--front-pick", choices=("least", "speed"), default="least")
+    ap.add_argument("--back-slots", type=int, default=0,
+                    help="每条后段 path 同时最多几条（1 = 一条 path 只跑一个请求）；0 = 用 max_num_seqs")
     ap.add_argument("--bind", choices=("least", "least-free", "speed", "rr"), default="least",
                     help="同类后段怎么挑：least = 在飞最少、一样多轮流；least-free = 在飞最少、一样多先给最早空出来的；"
                          "speed = 估「再放一条后每位置多久」最短（按量到的分档步时）、一样先给最早空出来的")
@@ -1660,6 +1664,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     t.add_argument("--md", default=None, help="表另存到这个 .md")
     t.add_argument("--json", default=None, help="数另存到这个 .json")
     a = ap.parse_args(argv)
+    if getattr(a, "back_slots", 0) and getattr(a, "no_hold", False):
+        ap.error("--back-slots 要靠 hold（满了在前段等）：不能和 --no-hold 一起用")
 
     if a.cmd == "detail":
         lines = detail_table(json.loads(Path(a.real).read_text(encoding="utf-8")),
@@ -1754,7 +1760,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             p = Params(**{**p.as_dict(), "pf_scale": pf_scale})
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
-                       hold=not a.no_hold, front_pick=a.front_pick, bind=a.bind, steps=steps, real=real,
+                       hold=not a.no_hold, front_pick=a.front_pick, bind=a.bind, back_slots=a.back_slots, steps=steps, real=real,
                        label=a.label or f"sim {a.cmd}", a_mode=a.a_mode)
 
     if a.cmd == "fit":

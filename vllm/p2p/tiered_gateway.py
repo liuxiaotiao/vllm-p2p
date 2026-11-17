@@ -428,8 +428,9 @@ async def _amain(a) -> int:
               f"  {c['zmq']}", flush=True)
         slots = None
         if c["role"] == "back" and not a.no_hold:
-            # 槽位 = 后段的 max_num_seqs：清单里写的优先，没写就用代理报的（vLLM 默认 256）
-            slots = int(c.get("max_num_seqs") or info.get("max_num_seqs") or 0) or None
+            # 槽位 = 后段的 max_num_seqs：清单里写的优先，没写就用代理报的（vLLM 默认 256）；
+            # --back-slots N：每条后段 path 同时最多 N 条（1 = 一条 path 只跑一个请求），满了新请求在前段等
+            slots = (a.back_slots or int(c.get("max_num_seqs") or info.get("max_num_seqs") or 0)) or None
         engines.append(Engine(c["name"], c["role"], cl, task=c.get("task"), slots=slots,
                               batch_wait_ms=float(info.get("batch_wait_ms") or 0)))
     fe = [e for e in engines if e.role == "front"]
@@ -500,6 +501,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stream-timeout", type=float, default=3600.0,
                     help="一条请求两次产出之间最多等多久（秒）。离线满载时请求会在后段引擎里排很久的队，"
                          "首 token 之前可能几分钟没有动静")
+    ap.add_argument("--back-slots", type=int, default=0,
+                    help="每条后段 path 同时最多几条（1 = 一条 path 只跑一个请求；同类 path 都满时新请求在前段等，"
+                         "哪条先空出来就先给哪条）。0 = 用后段的 max_num_seqs。和 --no-hold 不能一起用")
     ap.add_argument("--front-slots", type=int, default=0,
                     help="每个前段同时最多几条（0 = 不限）。比如 1：每个前段只服务一条请求，不管它是哪一类，"
                          "都满时新请求在网关里排队，有前段做完一条再进")
@@ -533,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--tau-hi", type=float, default=None)
     g.add_argument("--tau-lo", type=float, default=0.40)
     a = ap.parse_args(argv)
+    if a.back_slots and a.no_hold:
+        ap.error("--back-slots 要靠 hold（满了在前段等）：不能和 --no-hold 一起用")
     try:
         return asyncio.run(_amain(a))
     except KeyboardInterrupt:

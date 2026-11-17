@@ -1438,3 +1438,36 @@ def test_bind_speed_uses_per_level_step_ms() -> None:
         assert co2._pick(r).name == "new"
     finally:
         loop.close()
+
+
+def test_one_per_path_earliest_free_and_arrival_order() -> None:
+    """每条后段 path 只跑一条（slots=1，hold）+ least-free：4 条同类请求、两条 path 都空 →
+    最早到的两条先上（最早到的给最早空出来的 path），剩下两条按到网关的先后等；
+    哪条 path 先做完，等着的里最早到的就给它。"""
+    from vllm.p2p.tiered import Engine, TieredCoordinator, _Req
+
+    fast, slow = (Engine("fast", "back", None, task="t", slots=1),
+                  Engine("slow", "back", None, task="t", slots=1))
+    fast.t_free, slow.t_free = 1.0, 2.0              # fast 先空出来
+    co = TieredCoordinator(Engine("f", "front", None), [fast, slow], bind="least-free", hold=True)
+    now = [10.0]
+    co.clock = lambda: now[0]
+    loop = asyncio.new_event_loop()
+    try:
+        rs = [_Req(f"r{i}", [1], 4, "t", loop) for i in range(4)]
+        for i, r in enumerate(rs):
+            r.t_gw_in = float(i)                     # r0 最早到网关
+        # 前段算完的顺序和到达顺序不一样：r1、r0、r3、r2
+        got = {r.rid: co.bind_decision(r) for r in (rs[1], rs[0], rs[3], rs[2])}
+        assert got["r1"] is fast and got["r0"] is slow   # 两条 path 都空：先算完的先上
+        assert got["r3"] is None and got["r2"] is None
+        assert [w.rid for w in co._waiting] == ["r2", "r3"]   # 等的按到网关的先后排
+        assert fast.inflight == slow.inflight == 1
+        now[0] = 20.0
+        slow.release_one(now[0])                     # slow 先做完
+        plan = co.drain_plan()
+        assert [(r.rid, b.name) for r, b in plan] == [("r2", "slow")]
+        fast.release_one(25.0)
+        assert [(r.rid, b.name) for r, b in co.drain_plan()] == [("r3", "fast")]
+    finally:
+        loop.close()
