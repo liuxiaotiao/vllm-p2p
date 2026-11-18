@@ -1049,6 +1049,56 @@ def compare(sim: Mapping, real: Mapping, score: str = "all") -> tuple[list[str],
 TABLE_KEYS = ("输出 tok/s", "TPOT 均值", "TPOT p90", "TTFT p50", "TTFT 均值")
 
 
+def scheme_metrics(doc: Mapping) -> dict:
+    """一份结果（真机或模拟）的方案级指标：两种吞吐、TPOT、TTFT、每个 task 的速度、每条 path 的条数、在前段等后段。
+    稳态吞吐 = 最后一条请求提交之前生成的 token ÷ 那段时间（闭环一直满着的那段，不受最后几条长请求的尾巴影响）；
+    全程吞吐 = 全部 token ÷ 到最后一条做完；task 速度 = 这类任务的 token ÷ 它们的 decode 时间（按 token 加权）。"""
+    rows = doc.get("requests") or []
+    km = key_metrics(doc)
+    tok, dec, n_ch = defaultdict(int), defaultdict(float), defaultdict(int)
+    times, waits = [], []
+    for r in rows:
+        tk = r.get("true_task") or r.get("task") or "?"
+        tok[tk] += max(0, int(r.get("n_generated") or 0) - 1)
+        dec[tk] += float(r.get("decode_ms") or 0) / 1e3
+        n_ch[(r.get("channel") or "?").replace("back-", "")] += 1
+        t = float(r["t_submit_s"]) + float(r["prefill_ms"]) / 1e3
+        times.append(t)
+        for x in r.get("token_ms") or []:
+            t += float(x) / 1e3
+            times.append(t)
+        waits.append(float((r.get("tiered") or {}).get("wait_back_ms") or 0))
+    t_end = max((float(r["t_done_s"]) for r in rows), default=0.0)
+    t_sub = max((float(r["t_submit_s"]) for r in rows), default=0.0)
+    waits.sort()
+    return {"稳态 tok/s": (sum(1 for t in times if t <= t_sub) / t_sub) if t_sub > 0 else None,
+            "全程 tok/s": (len(times) / t_end) if t_end > 0 else None,
+            "TPOT 均值": km["TPOT 均值"], "TTFT p50": km["TTFT p50"],
+            "task": {k: (tok[k] / dec[k] if dec[k] > 0 else None) for k in sorted(tok)},
+            "path": dict(sorted(n_ch.items())),
+            "等后段条数": sum(1 for w in waits if w > 0),
+            "等后段 p90 ms": waits[int(0.9 * (len(waits) - 1))] if waits else None}
+
+
+def schemes_table(runs: Sequence[tuple[str, Mapping]]) -> tuple[list[str], list[dict]]:
+    """几个方案的模拟（或真机）结果并排：一行一个方案。"""
+    recs = [(label, scheme_metrics(doc)) for label, doc in runs]
+    tasks = sorted({t for _, m in recs for t in m["task"]})
+    f = lambda v, d=1: "—" if v is None else f"{v:.{d}f}"
+    head = ["方案", "稳态 tok/s", "全程 tok/s", "TPOT 均值 ms", "TTFT p50 ms", *[f"{t} tok/s" for t in tasks],
+            "等后段条数", "等后段 p90 s"]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for label, m in recs:
+        lines.append("| " + " | ".join([label, f(m["稳态 tok/s"]), f(m["全程 tok/s"]), f(m["TPOT 均值"]),
+                                        f(m["TTFT p50"], 0), *[f(m["task"].get(t)) for t in tasks],
+                                        str(m["等后段条数"]),
+                                        f(None if m["等后段 p90 ms"] is None else m["等后段 p90 ms"] / 1e3)]) + " |")
+    lines += ["", "每条 path 接了几条请求："]
+    for label, m in recs:
+        lines.append(f"- {label}：" + "，".join(f"{k} {v}" for k, v in m["path"].items()))
+    return lines, [{"label": label, **m} for label, m in recs]
+
+
 def summary_table(runs: Sequence[tuple[str, Mapping, Mapping]]) -> tuple[list[str], list[dict]]:
     """若干组（标签, 真机结果, 模拟结果）→ 汇总表（markdown 行）+ 每组的数（JSON 用）。
     每组：条数、墙钟、平均生成长度，关键指标与各后段 TPOT、TTFT 各段 p50 的 真机 / 模拟 / 误差。"""
@@ -1659,6 +1709,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     dt.add_argument("--by", choices=("true_task", "channel"), default="true_task",
                     help="分组：true_task = 按请求类别（默认）；channel = 按通道 / 后段")
     dt.add_argument("--md", default=None, help="另存到这个 .md")
+    sc = sub.add_parser("schemes", help="几个方案的模拟（或真机）结果并排：两种吞吐、TPOT、TTFT、各 task 速度、各 path 条数")
+    sc.add_argument("runs", nargs="+", metavar="标签=结果.json")
+    sc.add_argument("--md", default=None, help="表另存到这个 .md")
+    sc.add_argument("--json", default=None, help="数另存到这个 .json")
     t = sub.add_parser("table", help="几组「真机 + 模拟」并排出一张汇总表（markdown，可另存 JSON）")
     t.add_argument("runs", nargs="+", metavar="标签=真机.json,模拟.json")
     t.add_argument("--md", default=None, help="表另存到这个 .md")
@@ -1673,6 +1727,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n".join(lines))
         if a.md:
             Path(a.md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return 0
+
+    if a.cmd == "schemes":
+        runs = []
+        for spec in a.runs:
+            label, _, fp = spec.partition("=")
+            if not (label and fp):
+                raise SystemExit(f"写成 标签=结果.json，给的是 {spec!r}")
+            runs.append((label, json.loads(Path(fp).read_text(encoding="utf-8"))))
+        lines, recs = schemes_table(runs)
+        print("\n".join(lines))
+        if a.md:
+            Path(a.md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if a.json:
+            Path(a.json).write_text(json.dumps(recs, ensure_ascii=False, indent=1), encoding="utf-8")
         return 0
 
     if a.cmd == "table":

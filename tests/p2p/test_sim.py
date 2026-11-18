@@ -754,3 +754,20 @@ def test_back_slots_one_request_per_path(world) -> None:
             c += d
             assert c <= 1
     assert any((r["tiered"].get("wait_back_ms") or 0) > 0 for r in doc["requests"])
+
+
+def test_schemes_cli_side_by_side(world, tmp_path) -> None:
+    """sim schemes：几份结果并排，一行一个方案，带两种吞吐和各 path 条数。"""
+    real = fake_real(world["stages"], n=12)
+    a = setup(world, real, inflight=2, back_slots=1)
+    b = setup(world, real, inflight=4)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a))
+    pb.write_text(json.dumps(b))
+    md, js = tmp_path / "t.md", tmp_path / "t.json"
+    assert S.main(["schemes", f"甲={pa}", f"乙={pb}", "--md", str(md), "--json", str(js)]) == 0
+    text = md.read_text()
+    assert "| 甲 |" in text and "| 乙 |" in text and "稳态 tok/s" in text
+    recs = json.loads(js.read_text())
+    assert [r["label"] for r in recs] == ["甲", "乙"]
+    assert sum(recs[0]["path"].values()) == 12 and recs[0]["稳态 tok/s"] > 0
