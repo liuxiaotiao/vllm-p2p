@@ -157,6 +157,8 @@ class AgentBridge:
         self.held: dict[str, list] = {}
         self._peers: dict[str, object] = {}
         self.direct = False             # 协调器握手时说的：它会不会下发直连路由
+        # 引擎里还没结束的请求（经本代理 add 进去的）：新协调器握手时清掉上一个留下的
+        self.live: set[str] = set()
 
     async def _err(self, msg: str) -> None:
         if self.peer is not None:
@@ -178,6 +180,7 @@ class AgentBridge:
             [K_UTIL, *self.enc.encode((method, [items]))], copy=False)
 
     def _drop(self, rid: str) -> None:
+        self.live.discard(rid)
         self.routes.pop(rid, None)
         self.n_prompt.pop(rid, None)
         self.held.pop(rid, None)
@@ -208,10 +211,19 @@ class AgentBridge:
                     self.peer = sender
                     hello = json.loads(bytes(body[0])) if body else {}
                     self.direct = bool(hello.get("direct"))
+                    # 新协调器：上一个（被杀 / 断开）留在引擎里的请求永远不会有人来收尾了 ——
+                    # 它们占着槽位，后段还会每步为它们白等凑批窗口。全部中止。
+                    left = sorted(self.live)
+                    for rid in left:
+                        self._drop(rid)
+                    if left:
+                        await self.client.abort_requests_async(left)
+                    self.info["aborted_leftover"] = len(left)
                     await self.sock.send_multipart(
                         [self.peer, K_INFO, json.dumps(self.info).encode("utf-8")])
                 elif kind == K_ADD:
                     req = self.dec_req.decode(body)
+                    self.live.add(req.request_id)
                     self.t_in[req.request_id] = time.perf_counter()
                     if req.prompt_token_ids is not None:
                         self.n_prompt[req.request_id] = len(req.prompt_token_ids)

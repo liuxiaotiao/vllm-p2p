@@ -426,6 +426,8 @@ async def _amain(a) -> int:
         print(f"  {c['name']:<20} {c['role']:<5} task={c.get('task') or '—':<10} "
               f"层 {info.get('layers')}  PP={info.get('pp')}  max_num_seqs {info.get('max_num_seqs')}"
               f"  {c['zmq']}", flush=True)
+        if info.get("aborted_leftover"):
+            print(f"    ↳ 清掉了上一个网关留在 {c['name']} 里的 {info['aborted_leftover']} 条请求", flush=True)
         slots = None
         if c["role"] == "back" and not a.no_hold:
             # 槽位 = 后段的 max_num_seqs：清单里写的优先，没写就用代理报的（vLLM 默认 256）；

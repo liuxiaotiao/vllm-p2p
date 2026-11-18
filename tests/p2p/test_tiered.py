@@ -1471,3 +1471,72 @@ def test_one_per_path_earliest_free_and_arrival_order() -> None:
         assert [(r.rid, b.name) for r, b in co.drain_plan()] == [("r3", "fast")]
     finally:
         loop.close()
+
+
+def test_back_batch_wait_ignores_stale_leftover(configs) -> None:
+    """b 的 hidden 一直不来（上一个网关被杀后留下的请求）：头 P2P_STALE_S 秒照常等，之后不再为它等；
+    它的 hidden 一到又恢复正常。"""
+    from vllm.p2p.stage import pack_rows
+    from vllm.v1.core.sched.scheduler import P2P_STALE_S
+
+    s = _back_two_decoding(configs, 8.0)
+    s.p2p_feed([pack_rows("a", 4, torch.ones(1, W, dtype=torch.float16))])
+    t0 = s._p2p_t_ready["a"]
+    assert s.p2p_hold_s(t0) > 0                                # b 刚开始「在路上」：等
+    assert s._p2p_t_missing["b"] == t0
+    late = t0 + P2P_STALE_S + 0.5
+    s._p2p_t_last_end = late                                   # 一步刚结束，窗口本该还开着
+    s._p2p_t_ready["a"] = late
+    assert s.p2p_hold_s(late) == 0                             # b 太久没来：不等它
+    assert s.p2p_stale_ids(late) == ["b"]
+    s.p2p_feed([pack_rows("b", 4, torch.ones(1, W, dtype=torch.float16))])
+    assert "b" not in s._p2p_t_missing and s.p2p_stale_ids(late) == []
+
+
+def test_agent_aborts_leftover_requests_on_new_coordinator() -> None:
+    """网关被杀后重起：代理在新网关握手时把上一个留在引擎里的请求全部中止，并在 info 里报条数。"""
+    pytest.importorskip("zmq")
+    from vllm.p2p.remote import AgentBridge, RemoteClient
+    from vllm.p2p.tiered import _core_request
+
+    class Core:
+        def __init__(self):
+            self.added, self.aborted = [], []
+
+        async def add_request_async(self, req):
+            self.added.append(req.request_id)
+
+        async def abort_requests_async(self, ids):
+            self.aborted.extend(ids)
+
+        async def get_output_async(self):
+            await asyncio.sleep(3600)
+
+    async def go():
+        core = Core()
+        port = 27500 + random.Random().randrange(1500)
+        br = AgentBridge(core, f"tcp://127.0.0.1:{port}", {"name": "b", "role": "back"})
+        task = asyncio.get_running_loop().create_task(br.run())
+        try:
+            c1 = RemoteClient(f"tcp://127.0.0.1:{port}")
+            assert (await c1.connect(timeout=10))["aborted_leftover"] == 0
+            for rid in ("x", "y"):
+                await c1.add_request_async(_core_request(
+                    rid, prompt=[1, 2, 3], embeds=None, max_tokens=4, eos=None, logprobs=0,
+                    ignore_eos=True, stop_ids=(), arrival=0.0))
+            await c1.abort_requests_async(["y"])
+            for _ in range(100):
+                if core.added == ["x", "y"] and core.aborted == ["y"]:
+                    break
+                await asyncio.sleep(0.02)
+            assert br.live == {"x"}
+            c1.shutdown()                                      # 网关被杀
+            c2 = RemoteClient(f"tcp://127.0.0.1:{port}")
+            info = await c2.connect(timeout=10)
+            assert info["aborted_leftover"] == 1 and core.aborted == ["y", "x"] and not br.live
+            c2.shutdown()
+        finally:
+            task.cancel()
+            br.sock.close(0)
+
+    asyncio.run(go())

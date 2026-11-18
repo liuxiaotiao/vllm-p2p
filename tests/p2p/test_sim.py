@@ -771,3 +771,16 @@ def test_schemes_cli_side_by_side(world, tmp_path) -> None:
     recs = json.loads(js.read_text())
     assert [r["label"] for r in recs] == ["甲", "乙"]
     assert sum(recs[0]["path"].values()) == 12 and recs[0]["稳态 tok/s"] > 0
+
+
+def test_back_pp_cross_by_site_pair() -> None:
+    """跨网段的 PP 另加按「哪两个网段」分开：有这一对用这一对的，没有用 back_pp_cross_ms；同网段不加。"""
+    net = S.Net(ip={"a": "192.168.1.2", "b": "192.168.1.3", "c": "192.168.3.2", "d": "192.168.4.2"},
+                back_pp_hop_ms=1.0, back_pp_cross_ms=2.0, back_pp_cross_site_ms={"1-3": 5.0})
+    assert net.site_pair("a", "b") is None and net.site_pair("c", "a") == "1-3"
+    assert net.pp_hop_between("back", "a", "b") == 1.0
+    assert net.pp_hop_between("back", "c", "a") == 6.0             # 1-3：这一对的
+    assert net.pp_hop_between("back", "c", "d") == 3.0             # 3-4：没有，用默认
+    assert net.pp_hop_between("front", "c", "a") == net.pp_hop_ms  # 只管后段
+    p, n = S.apply_calib({"net": {"back_pp_cross_site_ms": {"3-4": 9.0}}}, S.Params(), S.Net(ip=net.ip))
+    assert n.back_pp_cross_site_ms == {"3-4": 9.0}

@@ -230,6 +230,9 @@ class Net:
     pp_hop_ms: float = 0.3                 # 多机 PP 每次传输（段间 hidden / 调度下发 / 结果回传）的固定开销
     back_pp_hop_ms: float | None = None    # 分段部署后段的；None = 同 pp_hop_ms
     back_pp_cross_ms: float = 0.0          # 分段部署后段的 PP 传输跨网段时另加（标定出来的；见 calib）
+    # 按「哪两个网段之间」分开的跨网段另加（键 = 两个网段号小的在前，如 "1-3" = 192.168.1.x ↔ 192.168.3.x）；
+    # 没有这一对的用 back_pp_cross_ms。站点之间远近不一样（rutg↔prin 近，到 wash / mich 远）
+    back_pp_cross_site_ms: dict = field(default_factory=dict)
     agent_node_ms: dict = field(default_factory=dict)   # 某台机器上的代理收 / 发一条消息另加（CPU 慢、被引擎抢 CPU）
 
     def one_way(self, a: str | None, b: str | None) -> float:
@@ -273,11 +276,24 @@ class Net:
         ia, ib = self.ip.get(a, ""), self.ip.get(b, "")
         return bool(ia and ib) and ia.rsplit(".", 1)[0] != ib.rsplit(".", 1)[0]
 
+    def site_pair(self, a: str, b: str) -> str | None:
+        """a、b 所在网段（IP 第三段）的一对，小的在前；同网段或不知道 IP = None。"""
+        ia, ib = self.ip.get(a, ""), self.ip.get(b, "")
+        if not (ia and ib):
+            return None
+        sa, sb = ia.rsplit(".", 1)[0].rsplit(".", 1)[-1], ib.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+        if sa == sb:
+            return None
+        lo, hi = sorted((sa, sb), key=lambda x: (len(x), x))
+        return f"{lo}-{hi}"
+
     def pp_hop_between(self, role: str, a: str, b: str) -> float:
-        """PP 一次传输的软件开销：pp_hop_for(role)，分段后段跨网段时再加 back_pp_cross_ms。"""
+        """PP 一次传输的软件开销：pp_hop_for(role)，分段后段跨网段时再加 back_pp_cross_site_ms[这一对]
+        （没有这一对就加 back_pp_cross_ms）。"""
         h = self.pp_hop_for(role)
-        if role == "back" and self.back_pp_cross_ms and self.cross(a, b):
-            h += self.back_pp_cross_ms
+        if role == "back" and self.cross(a, b):
+            pair = self.site_pair(a, b)
+            h += self.back_pp_cross_site_ms.get(pair, self.back_pp_cross_ms) if pair else self.back_pp_cross_ms
         return h
 
     def pp_hop_for(self, role: str) -> float:
@@ -1250,7 +1266,7 @@ def fit(make: Callable[..., dict], real: Mapping, params: Params, hop_ms: float,
 CALIB_PARAMS = ("dec_scale", "pf_gpu_scale", "stats_ms", "front_fixed_ms", "back_fixed_ms",
                 "pf_fixed_front_ms", "pf_fixed_back_ms", "pf_token_front_ms", "pf_token_back_ms",
                 "pf_fixed_per", "pf_scale", "pf_fixed_ms", "gw_client_ms")
-CALIB_NET = ("back_pp_hop_ms", "back_pp_cross_ms", "agent_node_ms")
+CALIB_NET = ("back_pp_hop_ms", "back_pp_cross_ms", "back_pp_cross_site_ms", "agent_node_ms")
 
 
 def apply_calib(cal: Mapping, params: Params, net: Net) -> tuple[Params, Net]:
@@ -1399,6 +1415,10 @@ def calibrate(deps: Sequence[tuple[str, Mapping, Sim, Mapping[str, list[dict]]]]
     backs_pp = [e for _, e, d, _ in engs if e.role == "back" and len(e.nodes) > 1]
     cross = {any(e.sim.net.cross(e.nodes[i], e.nodes[(i + 1) % len(e.nodes)]) for i in range(len(e.nodes)))
              for e in backs_pp}
+    # 数据里出现过的「跨哪两个网段」：两种以上时按对分开拟合（站点之间远近不同）
+    pairs = sorted({pr for e in backs_pp for i in range(len(e.nodes))
+                    for pr in [e.sim.net.site_pair(e.nodes[i], e.nodes[(i + 1) % len(e.nodes)])]
+                    if pr and e.sim.net.cross(e.nodes[i], e.nodes[(i + 1) % len(e.nodes)])})
 
     dec_knobs = [_Knob(f"dec_scale[{k}]", "scale", 1.0, lambda v, k=k: every_map("dec_scale", k, v))
                  for k in keys if any(f"{e.role}:{g.gpu}" == k and d for _, e, d, _ in engs for g in e.gpus)]
@@ -1411,7 +1431,14 @@ def calibrate(deps: Sequence[tuple[str, Mapping, Sim, Mapping[str, list[dict]]]]
         bh = sims[0].net.back_pp_hop_ms
         dec_knobs.append(_Knob("back_pp_hop_ms", "ms", bh if bh is not None else sims[0].net.pp_hop_ms,
                                lambda v: every_net("back_pp_hop_ms", v)))
-        if cross == {True, False}:
+        if cross == {True, False} and len(pairs) >= 2:
+            for s_ in sims:
+                s_.net.back_pp_cross_site_ms = {}
+            for pr in pairs:
+                dec_knobs.append(_Knob(f"back_pp_cross_site_ms[{pr}]", "ms", 1.0,
+                                       lambda v, pr=pr: [s_.net.back_pp_cross_site_ms.__setitem__(pr, v)
+                                                         for s_ in sims]))
+        elif cross == {True, False}:
             dec_knobs.append(_Knob("back_pp_cross_ms", "ms", 1.0, lambda v: every_net("back_pp_cross_ms", v)))
     pf_knobs = [_Knob(f"pf_gpu_scale[{k}]", "scale", 1.0, lambda v, k=k: every_map("pf_gpu_scale", k, v))
                 for k in keys if any(f"{e.role}:{g.gpu}" == k and pp for _, e, _, pp in engs for g in e.gpus)]
@@ -1471,6 +1498,9 @@ def calibrate(deps: Sequence[tuple[str, Mapping, Sim, Mapping[str, list[dict]]]]
     log(f"每步用时的相对误差（均方根，对数）：decode {before['decode']:.3f} → {after['decode']:.3f}，"
         f"prefill {before['prefill']:.3f} → {after['prefill']:.3f}")
     p, n = sims[0].params, sims[0].net
+    if n.back_pp_cross_site_ms:                       # 没见过的那几对网段：用拟合出来的各对的中位数
+        n.back_pp_cross_ms = round(sorted(n.back_pp_cross_site_ms.values())[
+            len(n.back_pp_cross_site_ms) // 2], 4)
     return {
         "params": {"dec_scale": dict(p.dec_scale), "pf_gpu_scale": dict(p.pf_gpu_scale),
                    "stats_ms": p.stats_ms, "front_fixed_ms": p.front_fixed_ms, "back_fixed_ms": p.back_fixed_ms,
@@ -1478,7 +1508,8 @@ def calibrate(deps: Sequence[tuple[str, Mapping, Sim, Mapping[str, list[dict]]]]
                    "pf_token_front_ms": p.pf_token_front_ms, "pf_token_back_ms": p.pf_token_back_ms,
                    "pf_fixed_per": "stage", "pf_scale": 1.0, "pf_fixed_ms": 0.0,
                    **({"gw_client_ms": gw_client_ms} if gw_client_ms is not None else {})},
-        "net": {"back_pp_hop_ms": n.back_pp_hop_ms, "back_pp_cross_ms": n.back_pp_cross_ms},
+        "net": {"back_pp_hop_ms": n.back_pp_hop_ms, "back_pp_cross_ms": n.back_pp_cross_ms,
+                "back_pp_cross_site_ms": dict(n.back_pp_cross_site_ms)},
         "fit": {"knobs": out, "rms_log_before": before, "rms_log_after": after,
                 "deploys": [label for label, *_ in deps],
                 "engines": [{"deploy": label, "engine": e.name, "gpus": [g.gpu for g in e.gpus],

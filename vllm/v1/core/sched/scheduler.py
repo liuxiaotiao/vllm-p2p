@@ -62,6 +62,9 @@ from vllm.p2p import stage as p2p_stage
 
 logger = init_logger(__name__)
 
+# 后段凑批等待：「hidden 在路上」超过这么多秒的请求不再等（残留请求）
+P2P_STALE_S = 2.0
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -1494,6 +1497,9 @@ class Scheduler(SchedulerInterface):
         bw = getattr(mc.hf_config, "p2p_batch_wait_ms", 0) if mc is not None else 0
         self.p2p_batch_wait_ms: float = float(bw or 0) if self.p2p_role == "back" else 0.0
         self._p2p_t_ready: dict[str, float] = {}     # 请求这一步的输入到齐的时刻
+        # 请求「token 已采出、hidden 还在路上」是从什么时候起的：超过 P2P_STALE_S 还没到的不再等它
+        # （上一个协调器被杀后留在引擎里的请求，hidden 永远不会来 —— 不然每一步都白等一个窗口）
+        self._p2p_t_missing: dict[str, float] = {}
         self._p2p_t_last_end = 0.0                   # 上一步结束（update_from_output）的时刻
         self.p2p_hold_n = 0                          # 等过的次数 / 总时长（ms），统计用
         self.p2p_hold_ms = 0.0
@@ -1537,6 +1543,7 @@ class Scheduler(SchedulerInterface):
             if self.p2p_batch_wait_ms > 0 and request.p2p_ready <= request.num_computed_tokens:
                 self._p2p_t_ready.setdefault(req_id, time.perf_counter())
             request.p2p_ready = max(request.p2p_ready, pos + rows.shape[0])
+            self._p2p_t_missing.pop(req_id, None)
             self._p2p_pending.setdefault(req_id, []).append((pos, rows))
             n += 1
         return n
@@ -1547,6 +1554,13 @@ class Scheduler(SchedulerInterface):
             raise RuntimeError("p2p_set_batch_wait 只能发给后段引擎")
         old, self.p2p_batch_wait_ms = self.p2p_batch_wait_ms, max(0.0, float(ms))
         return old
+
+    def p2p_stale_ids(self, now: float | None = None) -> list[str]:
+        """「token 已采出、hidden 超过 P2P_STALE_S 还没到」的请求（多半是上一个协调器留下的）。"""
+        now = time.perf_counter() if now is None else now
+        return [rid for rid, t in self._p2p_t_missing.items()
+                if now - t > P2P_STALE_S and rid in self.requests
+                and not self.requests[rid].is_finished()]
 
     def p2p_hold_s(self, now: float | None = None) -> float:
         """后段凑批等待：现在该再等多少秒才开下一步（0 = 现在就算）。
@@ -1578,7 +1592,9 @@ class Scheduler(SchedulerInterface):
                 if first is None or t < first:
                     first = t
             elif req.num_tokens > done:                      # token 已采出、hidden 还在路上
-                missing = True
+                t0 = self._p2p_t_missing.setdefault(req.request_id, now)
+                if now - t0 <= P2P_STALE_S:                  # 太久没来的（残留请求）不等
+                    missing = True
         if first is None or not missing:
             return 0.0
         return max(0.0, max(first, self._p2p_t_last_end) + w / 1e3 - now)
@@ -1662,6 +1678,8 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self._p2p_t_ready:
             self._p2p_t_ready.pop(request_id, None)
+        if self._p2p_t_missing:
+            self._p2p_t_missing.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
