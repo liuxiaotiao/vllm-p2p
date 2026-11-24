@@ -125,10 +125,21 @@ def make_lr_classify(*, lr_model: str, l0: int, n_experts: int, tasks: Mapping[s
 
     from vllm.p2p.identifier import verdict_wire
 
-    clf = LRClassifier.load(lr_model, l0=int(l0), n_experts=int(n_experts), priors=dict(tasks),
-                            class_map=lr_classes, features=lr_features,
-                            feature_fn=lr_feature_fn, tau_hi=tau_hi, tau_lo=tau_lo,
-                            dense_layers=dense_layers)
+    import inspect
+
+    kw = dict(l0=int(l0), n_experts=int(n_experts), priors=dict(tasks), class_map=lr_classes,
+              features=lr_features, feature_fn=lr_feature_fn, tau_hi=tau_hi, tau_lo=tau_lo)
+    # dense_layers 只有较新的 LRClassifier.load 认；集群上的 p2p-framework 不认时不传，
+    # 但装完要核对：识别器用到的层里不能有稠密层（那层没有路由，前段交不出它的统计）
+    if dense_layers and "dense_layers" in inspect.signature(LRClassifier.load).parameters:
+        kw["dense_layers"] = list(dense_layers)
+    clf = LRClassifier.load(lr_model, **kw)
+    bad = sorted(int(l) - 1 for l in getattr(clf, "layers", ()) if int(l) - 1 in set(dense_layers))
+    if bad:
+        raise ValueError(
+            f"识别器要用第 {bad} 层（0-based）的统计，但那是稠密层、没有路由 —— 选择器文件里没写层号时，"
+            "这版 p2p-framework 把「前 n 层」当成从第 0 层数起。给选择器文件加上 layers / layer_ids，"
+            "或用 --lr-features 指定层")
     E = int(n_experts)
 
     def classify(feat: Mapping, info: Mapping) -> dict:
