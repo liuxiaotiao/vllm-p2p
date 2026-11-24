@@ -2,7 +2,7 @@
 
 网关（`vllm/p2p/tiered_gateway.py --mode lr|shadow`）、A4 识别服务、`bench.py --lr-model` 都从这里取。
 `--lr-model` 写文件名即可（`.npz` 可省）；不写时网关按 stages.json 的模型族取默认
-（见 `vllm/p2p/selectors.py`）。选择器旁边的 `<名字>.features.json` 会被自动当作特征口径用
+（见 `vllm/p2p/lr_selectors.py`）。选择器旁边的 `<名字>.features.json` 会被自动当作特征口径用
 （没给 `--lr-features` 时）。
 
 | 文件 | 模型 | 特征 |

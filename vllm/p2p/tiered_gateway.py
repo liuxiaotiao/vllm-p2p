@@ -458,7 +458,7 @@ async def _amain(a) -> int:
         from vllm.p2p.identifier import parse_tasks, use_p2p_framework
 
         use_p2p_framework(a.p2p_framework)
-        from vllm.p2p import selectors as _sel
+        from vllm.p2p import lr_selectors as _sel
         try:
             lr_model = (_sel.resolve(a.lr_model) if a.lr_model
                         else _sel.default_for(sj.get("family")))
@@ -555,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--lr-model", default=None,
                    help="前段出口的 task 选择器：路径，或本仓库 selector/ 下的文件名。默认按模型族："
                         "Qwen3-30B selector_body_L2_cmw_params.npz，GLM-4.7-Flash "
-                        "task_clf_glm47flash_L1L2_meanw.npz（见 vllm/p2p/selectors.py）")
+                        "task_clf_glm47flash_L1L2_meanw.npz（见 vllm/p2p/lr_selectors.py）")
     g.add_argument("--tasks", default=None,
                    help="部署的 task 与先验，如 gsm8k=1,mbpp=1（默认 = 后段的 task，先验各 1）")
     g.add_argument("--lr-classes", default=None)

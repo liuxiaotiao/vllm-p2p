@@ -974,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.lr_model:
             from p2pmoe.runtime.lr_classifier import LRClassifier
 
-            from vllm.p2p import selectors as _sel
+            from vllm.p2p import lr_selectors as _sel
             lr_path = _sel.resolve(a.lr_model)              # 路径，或本仓库 selector/ 下的文件名
             side = _sel.sidecar_features(lr_path)
             clf = LRClassifier.load(str(lr_path), l0=int(cj["l0"]),
