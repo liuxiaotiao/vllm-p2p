@@ -223,7 +223,10 @@ class Glm4MoeLitePartialForCausalLM(_g.Glm4MoeLiteForCausalLM):
             raise ValueError(f"hf_overrides 的 p2p_stage 有误：{e}") from e
         st = _pp.make_route_stats(config, n_experts=int(config.n_routed_experts),
                                   top_k=int(config.num_experts_per_tok),
-                                  norm_topk=bool(config.norm_topk_prob), scoring="sigmoid")
+                                  norm_topk=bool(config.norm_topk_prob), scoring="sigmoid",
+                                  # LR 特征 / 画像的门控质量 × 1.8，与 HF probe（训 LR 的数据）同口径
+                                  weight_scale=float(getattr(config, "routed_scaling_factor", 1.0)
+                                                     or 1.0))
         _p2p_stats.set_collector(st)
         with _PartialBlocks(), _pp.stage_layers(_g, stage):
             super().__init__(vllm_config=vllm_config, prefix=prefix)

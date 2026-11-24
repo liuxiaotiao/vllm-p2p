@@ -210,7 +210,7 @@ def new_seen() -> dict[int, set]:
 
 # --------------------------------------------------------------------------- #
 def make_route_stats(config, *, n_experts: int, top_k: int, norm_topk: bool,
-                     scoring: str) -> "_p2p_stats.RouteStats | None":
+                     scoring: str, weight_scale: float = 1.0) -> "_p2p_stats.RouteStats | None":
     """hf_overrides 里有 ``p2p_stats`` 才建（A5 统计钩子 / B-1 前段的 LR 特征）。"""
     raw = getattr(config, "p2p_stats", None)
     if not raw:
@@ -222,7 +222,7 @@ def make_route_stats(config, *, n_experts: int, top_k: int, norm_topk: bool,
         pp_rank=get_pp_group().rank_in_group,
         emit_lr=bool(raw.get("emit_lr", False)), write=bool(raw.get("write", True)),
         prefill_only=bool(raw.get("prefill_only", False)), scoring=scoring,
-        profile=bool(raw.get("profile", False)))
+        profile=bool(raw.get("profile", False)), weight_scale=weight_scale)
 
 
 def allocate_route_stats(st, vllm_config) -> None:

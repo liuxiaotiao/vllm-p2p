@@ -225,3 +225,33 @@ def test_profile_counts_full_prompt_and_decode(tmp_path) -> None:
         assert w["t"] == 3 and sum(w["c"]) == 3 * K
     with pytest.raises(ValueError, match="prefill_only"):
         S.RouteStats(n_experts=E, top_k=K, norm_topk=True, profile=True, prefill_only=True)
+
+
+def test_weight_scale_only_scales_lr_and_profile_mass(tmp_path) -> None:
+    """GLM：LR 特征与画像的门控质量 × routed_scaling_factor（与 HF probe 同口径），miss_mass 不变。"""
+    rng = np.random.default_rng(3)
+    la = rng.standard_normal((6, len(LAYERS), E)).astype(np.float32)
+    recs = []
+    for scale in (1.0, 1.8):
+        d = tmp_path / str(scale)
+        st = S.RouteStats(n_experts=E, top_k=K, norm_topk=True, lr_layers=(3, 4, 5), channel="p",
+                          pp_rank=0, out_dir=str(d), profile=True, weight_scale=scale)
+        for l, res in LAYERS.items():
+            st.register_layer(l, res)
+        st.allocate(256, "cpu")
+        reqs = {"a": req(4, "A", "0:4")}
+        step(st, {"a": la[:4]}, {"a": np.arange(4)}, reqs)
+        for j in range(4, 6):
+            step(st, {"a": la[j:j + 1]}, {"a": np.arange(j, j + 1)}, reqs)
+        st.finish(["a"])
+        recs.append(json.loads((d / "p_pp0.jsonl").read_text().splitlines()[0]))
+    a, b = recs
+    for l in ("4", "5", "6"):
+        assert np.allclose(np.array(b["lr_layers"][l]["w"]), 1.8 * np.array(a["lr_layers"][l]["w"]),
+                           atol=1e-4)
+        assert b["lr_layers"][l]["c"] == a["lr_layers"][l]["c"]
+    for ph in ("prefill", "decode"):
+        la_, lb_ = a["profile"][ph]["layers"], b["profile"][ph]["layers"]
+        for l in la_:
+            assert np.allclose(lb_[l]["w"], 1.8 * np.array(la_[l]["w"]), atol=1e-4)
+    assert a["prefill"]["miss_mass"] == b["prefill"]["miss_mass"]

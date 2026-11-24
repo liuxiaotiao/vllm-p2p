@@ -123,7 +123,8 @@ class RouteStats:
     def __init__(self, *, n_experts: int, top_k: int, norm_topk: bool,
                  lr_layers: Sequence[int] = (), channel: str = "", pp_rank: int = 0,
                  out_dir: str | None = None, emit_lr: bool = False, write: bool = True,
-                 prefill_only: bool = False, scoring: str = "softmax", profile: bool = False):
+                 prefill_only: bool = False, scoring: str = "softmax", profile: bool = False,
+                 weight_scale: float = 1.0):
         self.E = int(n_experts)
         self.k = int(top_k)
         self.norm_topk = bool(norm_topk)
@@ -131,6 +132,11 @@ class RouteStats:
             raise ValueError(f"路由打分只认 softmax / sigmoid，给的是 {scoring!r}")
         # softmax：Qwen3-MoE / Qwen3-Next；sigmoid（+ 纠偏 bias 只用于挑专家）：GLM-4.7-Flash / DeepSeek-V3
         self.scoring = scoring
+        # LR 特征与画像里的「门控质量」乘的系数：GLM-4.7-Flash 是 routed_scaling_factor = 1.8 ——
+        # 真正乘到专家输出上的系数是「重归一后的 sigmoid × 1.8」，HF 上 moe_prefill_probe 记的 wsum
+        # 就是这个口径（每 token 4 个权重之和 1.8），用它训的 LR（meanw = wsum / counts）在线上要同一口径。
+        # miss_mass 不乘：它一直按「每 token 权重和为 1」报
+        self.weight_scale = float(weight_scale)
         self.lr_layers = sorted({int(x) for x in lr_layers})
         self.channel = channel or "vllm"
         self.pp_rank = int(pp_rank)
@@ -288,7 +294,8 @@ class RouteStats:
         for li in range(L):
             e = ids[:, li, :].reshape(-1)
             cnt[li] += np.bincount(e, minlength=E)[:E]
-            mas[li] += np.bincount(e, weights=ws[:, li, :].reshape(-1).astype(np.float64),
+            mas[li] += np.bincount(e, weights=ws[:, li, :].reshape(-1).astype(np.float64)
+                                   * self.weight_scale,
                                    minlength=E)[:E]
         acc.prof[f"{phase}_tok"] += int(ids.shape[0])
 
@@ -328,7 +335,8 @@ class RouteStats:
             cnt = acc.lr_count.setdefault(l, np.zeros(self.E, np.int64))
             mas = acc.lr_mass.setdefault(l, np.zeros(self.E, np.float64))
             np.add.at(cnt, ids[:, li, :].reshape(-1), 1)
-            np.add.at(mas, ids[:, li, :].reshape(-1), ws[:, li, :].reshape(-1).astype(np.float64))
+            np.add.at(mas, ids[:, li, :].reshape(-1),
+                      ws[:, li, :].reshape(-1).astype(np.float64) * self.weight_scale)
             acc.lr_tok[l] = acc.lr_tok.get(l, 0) + int(ids.shape[0])
 
     # -- B-1 前段：prompt 算完 → LR 特征 ------------------------------------- #
