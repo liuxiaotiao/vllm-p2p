@@ -70,7 +70,11 @@ def sigmoid_bias_topk(gating_output: torch.Tensor, bias: torch.Tensor | None, to
     scores = gating_output.float().sigmoid()
     choice = scores if bias is None else scores + bias.float().unsqueeze(0)
     k = min(int(topk), scores.shape[-1])
-    ids = torch.topk(choice, k=k, dim=-1, sorted=False)[1]
+    # sorted=True：按得分从高到低排、次序确定。sorted=False 时 CUDA 上同一组专家的排列次序
+    # 不保证每次相同，FusedMoE 按这个次序把各专家的输出相加 —— fp16 下次序一变结果就差几个 ulp，
+    # 同一请求两次跑出来不逐位相同（对拍里「开统计钩子不改输出」就是被它绊倒的）。
+    # 原生 GLM 的 fused_grouped_topk 也是按得分降序输出
+    ids = torch.topk(choice, k=k, dim=-1, sorted=True)[1]
     w = scores.gather(-1, ids)
     if renormalize:
         w = w / w.sum(dim=-1, keepdim=True)

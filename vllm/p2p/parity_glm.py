@@ -309,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             f.unlink()
     runs: dict[str, dict] = {}
     for name, ov in (("stock", None), ("partial-full", full_ov), ("partial-sub", part_ov),
-                     ("partial-stats", stats_ov)):
+                     ("partial-sub-again", part_ov), ("partial-stats", stats_ov)):
         print(f"  vLLM {name} …", flush=True)
         runs[name] = _run(ckpt, a, wd / f"{name}.json", overrides=ov,
                           stats_dir=stats_dir if name == "partial-stats" else None)
@@ -372,6 +372,11 @@ def main(argv: list[str] | None = None) -> int:
                        f"max |Δlogprob| {tp:.4f}（阈值 噪声底 {fl:.4f} + {tol:g}）"))
     else:
         print("  （这张卡没有 FlashAttention：prefill 本来就走纯 torch，噪声底里已经含着它）")
+
+    # 3b. 部分专家路径自己可复现（同样的输入跑两次逐位相同）—— 不可复现时下面两项的失败没有意义
+    again = all(x["tokens"] == y["tokens"] and cmp_steps(x["steps"], y["steps"])["max_lp_diff"] == 0.0
+                for x, y in zip(P("partial-sub"), P("partial-sub-again")))
+    checks.append(("部分专家路径可复现（同样输入跑两次逐位相同）", again, "partial-sub 跑两遍"))
 
     # 4. 统计钩子
     same = all(x["tokens"] == y["tokens"] and cmp_steps(x["steps"], y["steps"])["max_lp_diff"] <= 1e-5
