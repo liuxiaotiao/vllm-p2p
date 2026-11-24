@@ -288,8 +288,10 @@ def make_app(co, *, stages: Mapping[str, Mapping], tokenizer, mode: str = "oracl
                     rec["shadow"] = v
 
         try:
+            # body 区间只在识别器只数 body 时交给前段：前段拿到 body 就只统计 body 里的 token；
+            # 按整条 prompt 训的识别器（GLM 的 task_clf_glm47flash_L1L2_meanw，tokens=all）要整条的统计
             async for ev in co.stream(ids, max_tokens, task=task, rid=pid, timeout=stream_timeout,
-                                      body=body_ranges):
+                                      body=body_ranges if needs_body else None):
                 kind = ev[0]
                 if kind == "req":
                     req = ev[1]
