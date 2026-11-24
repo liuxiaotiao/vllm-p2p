@@ -115,7 +115,7 @@ class IncrementalDetok:
 def make_lr_classify(*, lr_model: str, l0: int, n_experts: int, tasks: Mapping[str, float],
                      lr_classes: str | None = None, lr_features: str | None = None,
                      lr_feature_fn: str | None = None, tau_hi: float | None = None,
-                     tau_lo: float = 0.40):
+                     tau_lo: float = 0.40, dense_layers=()):
     """→ (classify, clf)。`classify(feat, info)`：前段交出的 {层号(1-based): LayerStat 线上格式}
     → 与 A4 识别服务同格式的判定（task / conf / zone / scores / raw / label …）。
     要先把 p2p-framework 放上 sys.path（`identifier.use_p2p_framework`）。"""
@@ -127,7 +127,8 @@ def make_lr_classify(*, lr_model: str, l0: int, n_experts: int, tasks: Mapping[s
 
     clf = LRClassifier.load(lr_model, l0=int(l0), n_experts=int(n_experts), priors=dict(tasks),
                             class_map=lr_classes, features=lr_features,
-                            feature_fn=lr_feature_fn, tau_hi=tau_hi, tau_lo=tau_lo)
+                            feature_fn=lr_feature_fn, tau_hi=tau_hi, tau_lo=tau_lo,
+                            dense_layers=dense_layers)
     E = int(n_experts)
 
     def classify(feat: Mapping, info: Mapping) -> dict:
@@ -451,7 +452,9 @@ async def _amain(a) -> int:
         classify, clf = make_lr_classify(
             lr_model=a.lr_model, l0=int(sj["l0"]), n_experts=_n_experts(sj, a.model_dir),
             tasks=tasks, lr_classes=a.lr_classes, lr_features=a.lr_features,
-            lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo)
+            lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo,
+            # GLM：选择器只写了「前 n 层」时跳过稠密的第 0 层（stages.json 记着稠密层，0-based）
+            dense_layers=sj.get("dense_layers") or ())
         ident_desc = f"前段出口 LR（{Path(a.lr_model).name}）"
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
     co = TieredCoordinator(fe, be, bind=a.bind, eos=eos, stop_ids=stop_ids, ignore_eos=False,
