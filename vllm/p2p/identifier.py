@@ -6,7 +6,7 @@
     /home/ubuntu/venvs/vllm-p2p/bin/python /home/ubuntu/vllm-p2p/vllm/p2p/identifier.py \\
         --p2p-framework /home/ubuntu/p2p-framework \\
         --model-dir /home/ubuntu/p2p-framework/weights-q3-30b \\
-        --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz \\
+        --lr-model /home/ubuntu/vllm-p2p/selector/selector_body_L8_params.npz \\
         --tasks gsm8k=1,mbpp=1,no_robots=1 --l0 8 --device cuda:0 --port 8100
 
     （一般用 `python3 vllm/p2p/launch.py ident start …` 远程拉起，见 launch.py。）

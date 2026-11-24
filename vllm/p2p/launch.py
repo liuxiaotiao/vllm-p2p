@@ -459,7 +459,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--src", default="/home/ubuntu/vllm-p2p", help="节点上 vllm-p2p 源码目录")
     g.add_argument("--p2p-framework", default="/home/ubuntu/p2p-framework")
     g.add_argument("--lr-model",
-                   default="/home/ubuntu/p2p-framework/selector/selector_body_L8_params.npz")
+                   default="/home/ubuntu/vllm-p2p/selector/selector_body_L8_params.npz",
+                   help="节点上的路径（选择器随 vllm-p2p 仓库的 selector/ 一起推到节点）")
     g.add_argument("--tasks", default=None, help="默认 = 通道里出现的 task，先验各 1")
     g.add_argument("--ident-args", default="", help="原样追加给 identifier.py 的参数")
     a = ap.parse_args(argv)

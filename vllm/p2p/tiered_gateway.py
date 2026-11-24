@@ -30,7 +30,7 @@
 * `shadow`：按 `p2p_task` 绑定，同时记下前段出口识别的结果（量准确率、不影响路由）。
 
     python vllm/p2p/tiered_gateway.py --stages … --model-dir … --mode lr \
-        --lr-model /home/ubuntu/p2p-framework/selector/selector_body_L2_cmw_params.npz
+        --lr-model selector_body_L2_cmw_params.npz      # 本仓库 selector/ 下；不写按模型族取默认
 
 默认选择器（11-16 起）是 selector_body_L2_cmw：前 2 层的 counts 份额 + 平均门控权重（前段只需 ≥ 2 层；
 特征口径 `prefill_counts_body+meanw` 由 p2p-framework 的 LRClassifier 从文件里读）。旧的 8 层 counts
@@ -458,17 +458,25 @@ async def _amain(a) -> int:
         from vllm.p2p.identifier import parse_tasks, use_p2p_framework
 
         use_p2p_framework(a.p2p_framework)
+        from vllm.p2p import selectors as _sel
+        try:
+            lr_model = (_sel.resolve(a.lr_model) if a.lr_model
+                        else _sel.default_for(sj.get("family")))
+        except FileNotFoundError as e:
+            raise SystemExit(f"✗ {e}") from None
+        lr_features = a.lr_features or _sel.sidecar_features(lr_model)
+        lr_features = str(lr_features) if lr_features else None
         have = sorted({b.task for b in be if b.task})
         tasks = parse_tasks(a.tasks) if a.tasks else {u: 1.0 for u in have}
         if set(tasks) - set(have):
             raise SystemExit(f"--tasks 里 {sorted(set(tasks) - set(have))} 没有后段（有的是 {have}）")
         classify, clf = make_lr_classify(
-            lr_model=a.lr_model, l0=int(sj["l0"]), n_experts=_n_experts(sj, a.model_dir),
-            tasks=tasks, lr_classes=a.lr_classes, lr_features=a.lr_features,
+            lr_model=str(lr_model), l0=int(sj["l0"]), n_experts=_n_experts(sj, a.model_dir),
+            tasks=tasks, lr_classes=a.lr_classes, lr_features=lr_features,
             lr_feature_fn=a.lr_feature_fn, tau_hi=a.tau_hi, tau_lo=a.tau_lo,
             # GLM：选择器只写了「前 n 层」时跳过稠密的第 0 层（stages.json 记着稠密层，0-based）
             dense_layers=sj.get("dense_layers") or ())
-        ident_desc = f"前段出口 LR（{Path(a.lr_model).name}）"
+        ident_desc = f"前段出口 LR（{lr_model.name}" + (f" + {Path(lr_features).name}" if lr_features else "") + "）"
         print(f"前段出口识别：{clf.describe()}；部署的 task 与先验 {tasks}", flush=True)
     co = TieredCoordinator(fe, be, bind=a.bind, eos=eos, stop_ids=stop_ids, ignore_eos=False,
                            front_pick=a.front_pick, direct=not a.via_coordinator,
@@ -544,13 +552,15 @@ def main(argv: list[str] | None = None) -> int:
                          "shadow：按 p2p_task 绑，只记识别结果")
     g = ap.add_argument_group("前段出口识别（--mode lr / shadow）")
     g.add_argument("--p2p-framework", default=None, help="p2p-framework 源码目录（默认自动找）")
-    g.add_argument("--lr-model",
-                   default="/home/ubuntu/p2p-framework/selector/selector_body_L2_cmw_params.npz",
-                   help="前段出口的 task 选择器（默认：前 2 层 counts 份额 + 平均权重）")
+    g.add_argument("--lr-model", default=None,
+                   help="前段出口的 task 选择器：路径，或本仓库 selector/ 下的文件名。默认按模型族："
+                        "Qwen3-30B selector_body_L2_cmw_params.npz，GLM-4.7-Flash "
+                        "task_clf_glm47flash_L1L2_meanw.npz（见 vllm/p2p/selectors.py）")
     g.add_argument("--tasks", default=None,
                    help="部署的 task 与先验，如 gsm8k=1,mbpp=1（默认 = 后段的 task，先验各 1）")
     g.add_argument("--lr-classes", default=None)
-    g.add_argument("--lr-features", default=None)
+    g.add_argument("--lr-features", default=None,
+                   help="特征口径 JSON（默认：选择器旁边的 <名字>.features.json，有就用）")
     g.add_argument("--lr-feature-fn", default=None)
     g.add_argument("--tau-hi", type=float, default=None)
     g.add_argument("--tau-lo", type=float, default=0.40)

@@ -1,0 +1,2 @@
+{"layers": [1, 2], "layer_base": 0, "stats": ["mean_weight"], "normalize": "none",
+ "tokens": "all", "layout": "layer_major"}

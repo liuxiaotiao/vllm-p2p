@@ -974,9 +974,13 @@ def main(argv: list[str] | None = None) -> int:
         if a.lr_model:
             from p2pmoe.runtime.lr_classifier import LRClassifier
 
-            clf = LRClassifier.load(a.lr_model, l0=int(cj["l0"]),
+            from vllm.p2p import selectors as _sel
+            lr_path = _sel.resolve(a.lr_model)              # 路径，或本仓库 selector/ 下的文件名
+            side = _sel.sidecar_features(lr_path)
+            clf = LRClassifier.load(str(lr_path), l0=int(cj["l0"]),
                                     n_experts=int(cj.get("n_experts") or 128),
-                                    priors={u: 1.0 for u in tasks}, class_map=a.lr_classes)
+                                    priors={u: 1.0 for u in tasks}, class_map=a.lr_classes,
+                                    features=str(side) if side else None)
             a5 = a5_check(rows, gwr, clf)
             log.info("  A5 核对（钩子特征 → LR vs 识别服务）：%s", a5)
         for r in rows:
