@@ -122,3 +122,24 @@ def test_compare_same_channel_pairs() -> None:
     b = [{"case_id": "x", "channel": "back-gsm8k-0"}, {"case_id": "y", "channel": "back-gsm8k-0"}]
     kept, dropped = same_channel(list(zip(a, b)))
     assert [x["case_id"] for x, _ in kept] == ["x"] and dropped == 1
+
+
+def test_batched_tokens_and_back_kv_quota():
+    """--max-num-batched-tokens 进所有分段命令；--back-kv-cache-gib 只进后段，换成字节。"""
+    import inspect
+    from vllm.p2p import stages as S
+    src = inspect.getsource(S.agent_command)
+    assert "--kv-cache-memory-bytes" in src and "--max-num-batched-tokens" in src
+    cmd = S.agent_command(python="/v/bin/python", name="back-x", model_dir="/m", role="back",
+                          layers=(2, 47), task="t", nodes=["N1", "N2"], rank=0, master="h",
+                          master_port=1, partition=[22, 23], dtype="half", max_model_len=4096,
+                          gpu_mem=0.95, max_num_seqs=8, attention_backend=None, port=8300,
+                          overrides={}, max_num_batched_tokens=2048,
+                          kv_cache_bytes=int(0.5 * 2**30))
+    assert "--max-num-batched-tokens 2048" in cmd and f"--kv-cache-memory-bytes {2**29}" in cmd
+    front = S.agent_command(python="/v/bin/python", name="front-x", model_dir="/m", role="front",
+                            layers=(0, 2), task=None, nodes=["N1"], rank=0, master="h",
+                            master_port=1, partition=None, dtype="half", max_model_len=4096,
+                            gpu_mem=0.88, max_num_seqs=64, attention_backend=None, port=8300,
+                            overrides={}, max_num_batched_tokens=2048)
+    assert "--kv-cache-memory-bytes" not in front

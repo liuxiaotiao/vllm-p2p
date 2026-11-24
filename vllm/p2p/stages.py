@@ -60,7 +60,8 @@ def agent_command(*, python: str, name: str, model_dir: str, role: str, layers: 
                   master_port: int, partition: Sequence[int] | None, dtype: str,
                   max_model_len: int, gpu_mem: float, max_num_seqs: int | None,
                   attention_backend: str | None, port: int, overrides: Mapping,
-                  eager: bool = False) -> str:
+                  eager: bool = False, max_num_batched_tokens: int | None = None,
+                  kv_cache_bytes: int | None = None) -> str:
     args = [python, "-m", "vllm.p2p.stage_agent",
             "--served-model-name", name, "--model", model_dir, "--role", role,
             "--layers", f"{int(layers[0])},{int(layers[1])}"]
@@ -76,6 +77,11 @@ def agent_command(*, python: str, name: str, model_dir: str, role: str, layers: 
              "--gpu-memory-utilization", f"{gpu_mem:g}"]
     if max_num_seqs:
         args += ["--max-num-seqs", str(max_num_seqs)]
+    if max_num_batched_tokens:
+        args += ["--max-num-batched-tokens", str(int(max_num_batched_tokens))]
+    if kv_cache_bytes:
+        # 直接给 KV 定额：跳过按 --gpu-memory-utilization 推算（那条路要求权重+激活 ≤ 比例×总显存）
+        args += ["--kv-cache-memory-bytes", str(int(kv_cache_bytes))]
     if attention_backend:
         args += ["--attention-backend", attention_backend]
     if eager:
@@ -93,7 +99,9 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                          port: int = 8300, master_port: int = 29600,
                          overrides_of=None, eager: bool = False, front_lr: bool = True,
                          step_trace: str | None = None,
-                         back_batch_wait_ms: float = 0.0) -> dict:
+                         back_batch_wait_ms: float = 0.0,
+                         max_num_batched_tokens: int | None = None,
+                         back_kv_cache_gib: float | None = None) -> dict:
     """channels.json 的内容 → stages.json 的内容。`overrides_of(channel) -> dict` 读通道的
     hf_overrides（默认读 channel["overrides"] 指的文件）。"""
     l0, n_layers, model_dir = int(cj["l0"]), int(cj["n_layers"]), cj["model_dir"]
@@ -155,7 +163,7 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                     master_port=master_port, partition=None, dtype=c["dtype"],
                     max_model_len=mml, gpu_mem=fgm, max_num_seqs=front_max_num_seqs,
                     attention_backend=c.get("attention_backend"), port=port, overrides=fov,
-                    eager=eager)}],
+                    eager=eager, max_num_batched_tokens=max_num_batched_tokens)}],
             }
         else:
             fronts[fnode]["from_channels"].append(c["name"])
@@ -171,12 +179,14 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
         else:
             bov.pop("p2p_batch_wait_ms", None)
         master = hosts[bnodes[0]]
+        bkv = int(back_kv_cache_gib * 2**30) if back_kv_cache_gib else None
         backs.append({
             "name": bname, "role": "back", "task": c["task"], "nodes": bnodes,
             "layers": [l0, n_layers], "partition": part[1:], "dtype": c["dtype"],
             "gpu_mem": {v: gm.get(v, 0.9) for v in bnodes},
             "max_num_seqs": c.get("max_num_seqs"),
             "batch_wait_ms": float(back_batch_wait_ms or 0),
+            "kv_cache_gib": back_kv_cache_gib,
             "api": f"http://{master}:{port}/v1", "zmq": f"tcp://{master}:{port + 1}",
             "from_channels": [c["name"]],
             "commands": [{"node": v, "host": hosts[v], "cmd": agent_command(
@@ -185,7 +195,8 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                 master_port=master_port, partition=part[1:], dtype=c["dtype"],
                 max_model_len=mml, gpu_mem=gm.get(v, 0.9), max_num_seqs=c.get("max_num_seqs"),
                 attention_backend=c.get("attention_backend"), port=port, overrides=bov,
-                eager=eager)} for k, v in enumerate(bnodes)],
+                eager=eager, max_num_batched_tokens=max_num_batched_tokens,
+                kv_cache_bytes=bkv)} for k, v in enumerate(bnodes)],
         })
 
     fl = list(fronts.values())
@@ -224,6 +235,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="后段凑批等待：引擎能开算时，若还有正在跑的请求的 hidden 在路上，最多等 W ms 让它并进"
                          "同一步（0 = 关，默认）。要 ≥ 一个前段来回（B1 实测约 6–8 ms）才有用，小了反而更慢；"
                          "运行中可用网关 POST /p2p/batch_wait 改")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=None, metavar="N",
+                    help="所有分段引擎每步最多算多少 token（长 prompt 分块 prefill）。也定了启动时"
+                         "试跑的激活峰值：后段权重把卡占满时调小（如 2048）能省出几百 MB")
+    ap.add_argument("--back-kv-cache-gib", type=float, default=None, metavar="G",
+                    help="后段每张卡的 KV 直接定额 G GiB，不按 --gpu-mem 推算（权重贴着显存上限时用；"
+                         "要 ≥ 一条 max_model_len 请求在该级的 KV）")
     ap.add_argument("--no-front-lr", action="store_true",
                     help="前段不开识别统计（只能 oracle；默认开，lr / shadow 模式要它）")
     a = ap.parse_args(argv)
@@ -235,7 +252,9 @@ def main(argv: list[str] | None = None) -> int:
                                   front_gpu_mem=a.front_gpu_mem, port=a.port,
                                   master_port=a.master_port, eager=a.eager,
                                   front_lr=not a.no_front_lr, step_trace=a.step_trace,
-                                  back_batch_wait_ms=a.back_batch_wait_ms)
+                                  back_batch_wait_ms=a.back_batch_wait_ms,
+                                  max_num_batched_tokens=a.max_num_batched_tokens,
+                                  back_kv_cache_gib=a.back_kv_cache_gib)
     except (ValueError, OSError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
