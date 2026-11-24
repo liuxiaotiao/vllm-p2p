@@ -48,7 +48,9 @@ def build_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--max-num-seqs", type=int, default=None)
     ap.add_argument("--max-num-batched-tokens", type=int, default=None)
     ap.add_argument("--kv-cache-memory-bytes", type=int, default=None)
-    ap.add_argument("--attention-backend", default="TRITON_ATTN")
+    ap.add_argument("--attention-backend", default=None,
+                    help="默认按 overrides 里的架构认模型族（Qwen 系 TRITON_ATTN、GLM-4.7-Flash TRITON_MLA）；"
+                         "给 auto 交给 vLLM 自选")
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--port", type=int, default=8300, help="HTTP 端口；ZMQ 用它 + 1")
     ap.add_argument("--hf-overrides", required=True, help="JSON（本程序再加 p2p_stage）")
@@ -76,9 +78,22 @@ def build_engine_args(a: argparse.Namespace):
         kw["max_num_batched_tokens"] = a.max_num_batched_tokens
     if a.kv_cache_memory_bytes:
         kw["kv_cache_memory_bytes"] = a.kv_cache_memory_bytes
-    if a.attention_backend:
-        kw["attention_backend"] = a.attention_backend
+    backend = a.attention_backend
+    if backend is None:
+        backend = default_backend(ov.get("architectures"))
+    if backend and backend != "auto":
+        kw["attention_backend"] = backend
     return EngineArgs(**kw)
+
+
+def default_backend(architectures) -> str:
+    """按 hf_overrides 的 architectures 认模型族，取它的默认注意力后端；认不出来是 TRITON_ATTN（老行为）。"""
+    from vllm.p2p import models
+    archs = set(architectures or ())
+    for f in models.FAMILIES.values():
+        if archs & {f.arch, f.stock_arch}:
+            return f.attention_backend
+    return "TRITON_ATTN"
 
 
 def run_headless(a: argparse.Namespace) -> int:

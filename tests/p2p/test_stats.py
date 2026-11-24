@@ -191,3 +191,37 @@ def test_front_emits_lr_once_when_prompt_completes(tmp_path) -> None:
     assert st._acc["a"].upto == upto
     st.finish(["a"])
     assert not (tmp_path / "f_pp0.jsonl").exists()      # write=False
+
+
+def test_profile_counts_full_prompt_and_decode(tmp_path) -> None:
+    """画像模式：每层的整条 prompt / decode 计数与质量（moe_probe.py 拼 *_persample.npz 用的）。"""
+    rng = np.random.default_rng(1)
+    st = S.RouteStats(n_experts=E, top_k=K, norm_topk=True, lr_layers=(3, 4, 5), channel="p",
+                      pp_rank=0, out_dir=str(tmp_path), profile=True)
+    for l, res in LAYERS.items():
+        st.register_layer(l, res)
+    st.allocate(256, "cpu")
+    L = len(LAYERS)
+    reqs = {"a": req(6, "A", "2:5")}
+    la = rng.standard_normal((9, L, E)).astype(np.float32)
+    step(st, {"a": la[:6]}, {"a": np.arange(6)}, reqs)
+    for j in range(6, 9):
+        step(st, {"a": la[j:j + 1]}, {"a": np.arange(j, j + 1)}, reqs)
+    st.finish(["a"])
+    r = json.loads((tmp_path / "p_pp0.jsonl").read_text().splitlines()[0])
+    ti, tw = brute(la)
+    prof = r["profile"]
+    assert prof["prefill"]["t"] == 6 and prof["decode"]["t"] == 3
+    for slot, l in enumerate(LAYERS):
+        for name, sl in (("prefill", slice(0, 6)), ("decode", slice(6, 9))):
+            got = prof[name]["layers"][str(l + 1)]
+            cnt = np.bincount(ti[sl, slot, :].reshape(-1), minlength=E)
+            mas = np.bincount(ti[sl, slot, :].reshape(-1), weights=tw[sl, slot, :].reshape(-1),
+                              minlength=E)
+            assert got["c"] == cnt.tolist()
+            assert np.allclose(got["w"], mas, atol=1e-4)
+        # body 计数（LR 口径）仍只数 2:5
+        w = r["lr_layers"][str(l + 1)]
+        assert w["t"] == 3 and sum(w["c"]) == 3 * K
+    with pytest.raises(ValueError, match="prefill_only"):
+        S.RouteStats(n_experts=E, top_k=K, norm_topk=True, profile=True, prefill_only=True)

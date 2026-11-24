@@ -43,6 +43,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+
+def _load_models():
+    """模型族表（`models.py`，同样是纯 Python）。控制机上可能没装 torch —— 那时 ``import vllm`` 会失败
+    （``vllm/__init__`` 要 torch），就按文件路径直接加载这个兄弟文件。"""
+    try:
+        from vllm.p2p import models
+        return models
+    except ImportError:
+        import importlib.util
+        name = "_vllm_p2p_models"
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("models.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+
+_models = _load_models()
+
 __all__ = [
     "ARCH", "Stage", "Channel", "HostInfo", "LayoutError",
     "load_plan", "pair_static", "channels_from_plan", "parse_hosts",
@@ -51,7 +72,7 @@ __all__ = [
 ]
 
 ARCH = "Qwen3MoePartialForCausalLM"
-"""部分专家模型的架构名（`vllm/model_executor/models/registry.py` 里登记的就是它）。"""
+"""Qwen3-MoE 的部分专家架构名（默认模型族；别的模型族见 `vllm/p2p/models.py`）。"""
 
 # 不支持 bf16 的卡（算力 < 8.0）。vLLM 0.14 在这些卡上直接拒绝 bf16
 # （platforms/cuda.py: check_if_supports_dtype），而一个流水线实例只有一种 dtype ——
@@ -95,6 +116,10 @@ class Channel:
     stages: tuple[Stage, ...]
     n_layers: int
     n_experts: int
+    arch: str = ARCH
+    """部分专家 + 分段的架构名（按模型族，见 `vllm/p2p/models.py`）。"""
+    dense: frozenset = frozenset()
+    """没有路由专家的层（**1-based**；GLM-4.7-Flash 的第 1 层）。不进 p2p_layer_experts、不算驻留比例。"""
 
     @property
     def nodes(self) -> list[str]:
@@ -116,8 +141,9 @@ class Channel:
         return out
 
     def partial_layers(self) -> dict[int, tuple[int, ...]]:
-        """只列**没装全**的层（1-based）。装全的层按原生 Qwen3-MoE 构造。"""
-        return {l: es for l, es in self.layer_experts().items() if len(es) < self.n_experts}
+        """只列**没装全**的 MoE 层（1-based）。装全的层、稠密层按原生构造。"""
+        return {l: es for l, es in self.layer_experts().items()
+                if l not in self.dense and len(es) < self.n_experts}
 
     def hf_overrides(self, *, miss_policy: str = "local_topk",
                      stats: Mapping | None = None) -> dict:
@@ -126,7 +152,7 @@ class Channel:
         `stats`：开 A5 统计钩子（`vllm/p2p/stats.py`），如 `{"lr_layers": [0, …, 7]}`。
         不给 = 不开，模型前向与没有钩子时逐位相同。"""
         d = {
-            "architectures": [ARCH],
+            "architectures": [self.arch],
             "p2p_layer_experts": {str(l - 1): list(es)
                                   for l, es in sorted(self.partial_layers().items())},
             "p2p_miss_policy": miss_policy,
@@ -137,8 +163,8 @@ class Channel:
         return d
 
     def resident_fraction(self) -> float:
-        le = self.layer_experts()
-        return sum(len(v) for v in le.values()) / (len(le) * self.n_experts)
+        le = {l: v for l, v in self.layer_experts().items() if l not in self.dense}
+        return sum(len(v) for v in le.values()) / (len(le) * self.n_experts) if le else 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -310,11 +336,16 @@ def channels_from_plan(
     n_layers: int | None = None,
     n_experts: int | None = None,
     shared_front: bool = False,
+    arch: str = ARCH,
+    dense: "Sequence[int] | frozenset" = (),
 ) -> list[Channel]:
     """把清单 + 配对翻成通道。会核对：层区间首尾相接、覆盖 1..L、专家 id 合法。
     `wired` 是 pair_static 的 {前段: (后段, task)}，或 pair_shared 的 [(前段, 后段, task)]。
-    `shared_front`：允许几条通道共用同一个前段节点（只给分段部署 stages.py 用：每个前段节点一个前段引擎）。"""
+    `shared_front`：允许几条通道共用同一个前段节点（只给分段部署 stages.py 用：每个前段节点一个前段引擎）。
+    `arch` / `dense`：模型族的部分专家架构名、稠密层（**1-based**）—— 稠密层在清单里的专家列表可以为空，
+    给了也不用。"""
     L, E = _model_shape(plan, n_layers, n_experts)
+    dense = frozenset(int(x) for x in dense)
     plans = {p["node"]: p for p in plan["nodes"]}
     segs = plan["segments"]
 
@@ -326,7 +357,10 @@ def channels_from_plan(
                 raise LayoutError(f"段 {sid} 的节点 {v} 在清单的 nodes 里没有计划")
             le: dict[int, tuple[int, ...]] = {}
             for ld in p["layers"]:
-                es = tuple(sorted(int(e) for e in ld["experts"]))
+                es = tuple(sorted(int(e) for e in (ld.get("experts") or ())))
+                if int(ld["layer"]) in dense:
+                    le[int(ld["layer"])] = ()
+                    continue
                 if not es:
                     raise LayoutError(f"{v} 第 {ld['layer']} 层的驻留专家集为空")
                 if len(set(es)) != len(es):
@@ -360,7 +394,7 @@ def channels_from_plan(
         k = counter.get(task, 0)
         counter[task] = k + 1
         chans.append(Channel(name=f"{task}-{k}", task=task, front=f, back=b,
-                             stages=tuple(st), n_layers=L, n_experts=E))
+                             stages=tuple(st), n_layers=L, n_experts=E, arch=arch, dense=dense))
     if shared_front:
         fnodes = {s.node for c in chans for s in c.stages if s.role == "front"}
         used = [s.node for c in chans for s in c.stages if s.role != "front"]
@@ -579,14 +613,20 @@ def parse_channel_int(items: Sequence[str], flag: str = "--max-num-seqs-channel"
     return out
 
 
+def stage_moe_avg(s: Stage, dense: "frozenset | Sequence[int]" = ()) -> float | None:
+    """本级 MoE 层（去掉稠密层）的平均驻留专家数；本级全是稠密层时返回 None。"""
+    es = [len(e) for l, e in s.layer_experts.items() if l not in dense]
+    return sum(es) / len(es) if es else None
+
+
 def describe(ch: Channel, dtype: str = "", forced: Sequence[str] = ()) -> str:
-    segs = "  →  ".join(
-        f"{s.node}:{s.lo}–{s.hi}"
-        + ("" if s.role == "front" and all(len(e) == ch.n_experts
-                                           for e in s.layer_experts.values())
-           else f"（层均 {sum(len(e) for e in s.layer_experts.values()) / s.n_layers:.1f}"
-                f"/{ch.n_experts}）")
-        for s in ch.stages)
+    def one(s: Stage) -> str:
+        avg = stage_moe_avg(s, ch.dense)
+        full = avg is None or all(len(e) == ch.n_experts for l, e in s.layer_experts.items()
+                                  if l not in ch.dense)
+        return f"{s.node}:{s.lo}–{s.hi}" + ("" if s.role == "front" and full
+                                            else f"（层均 {avg or 0:.1f}/{ch.n_experts}）")
+    segs = "  →  ".join(one(s) for s in ch.stages)
     tail = f"  dtype={dtype}" + (f"（因 {','.join(forced)} 不支持 bf16）" if forced else "")
     return (f"{ch.name:<12} {ch.front}×{ch.back}  PP={ch.partition_env}\n"
             f"    {segs}\n    驻留 {ch.resident_fraction():.1%} 的专家{tail if dtype else ''}")
@@ -614,9 +654,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dtype", default="half", choices=("half", "bfloat16", "auto"),
                     help="默认 half：**所有通道统一 fp16**，与本框架的对照组（DTYPE=float16）"
                          "同一精度才公平。auto：按卡型判，有 sm75 卡的通道 half、其余 bfloat16")
-    ap.add_argument("--attention-backend", default="TRITON_ATTN",
-                    help="所有通道统一的注意力后端（默认 TRITON_ATTN，sm75 唯一能用的）；"
-                         "给空串则交给 vLLM 自选（各通道可能不同）")
+    ap.add_argument("--attention-backend", default=None,
+                    help="所有通道统一的注意力后端（默认按模型族：Qwen 系 TRITON_ATTN、GLM-4.7-Flash "
+                         "TRITON_MLA —— 都是 sm75 上能用的）；给空串则交给 vLLM 自选（各通道可能不同）")
+    ap.add_argument("--model-family", default=None, choices=sorted(_models.FAMILIES),
+                    help="模型族（默认按本机 --model-dir/config.json 认；读不到 config 时是 qwen3_moe）")
     ap.add_argument("--vllm-bin", default="vllm")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--master-port", type=int, default=29500)
@@ -639,6 +681,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stats", action="store_true",
                     help="开 A5 统计钩子：逐请求的全量路由 top-k、后段 miss、前 L₀ 层 LR 特征，"
                          "落到各节点的 $VLLM_P2P_STATS_DIR（默认 /tmp/p2p_stats）")
+    ap.add_argument("--stats-profile", action="store_true",
+                    help="画像统计（moe_probe.py 用）：所有 MoE 层的 body 计数 + 整条 prompt / decode 的逐层"
+                         "逐专家计数，写进每条请求的记录。隐含 --stats；只在全专家的采集通道上开")
     ap.add_argument("--lr-layers", default=None,
                     help="--stats 时按 body token 聚合哪些层（0-based，逗号分隔）；默认前 L₀ 层")
     ap.add_argument("--n-layers", type=int, default=None)
@@ -647,14 +692,41 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = load_plan(args.plan)
     wiring = json.loads(args.wiring.read_text(encoding="utf-8")) if args.wiring else None
+    try:
+        cfg = _models.load_config(args.model_dir)
+        m = _MODEL_TAG.search(str(plan.get("model", "")))
+        by_shape = _models.family_by_shape(*(int(m.group(1)), int(m.group(3)))) if m else None
+        fam = (_models.family_by_name(args.model_family) if args.model_family
+               else _models.family_of(cfg) if cfg is not None
+               else _models.family_by_name(str(plan["family"])) if plan.get("family")
+               else by_shape or _models.DEFAULT_FAMILY)
+        if cfg is None and not args.model_family and by_shape is not None:
+            print(f"读不到 {args.model_dir}/config.json：按清单的形状 {m.group(0)} 认作 {fam.name}"
+                  "（不对就给 --model-family）")
+        if cfg is not None and args.model_family and _models.family_of(cfg) is not fam:
+            raise ValueError(f"--model-family {fam.name} 与 {args.model_dir}/config.json"
+                             f"（{_models.family_of(cfg).name}）不符")
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if args.attention_backend is None:
+        args.attention_backend = fam.attention_backend
+    if fam.name == "qwen3_next" and args.prefix_caching:
+        print("✗ Qwen3-Next 不支持前缀缓存（线性注意力的状态没法按前缀复用）—— 去掉 --prefix-caching",
+              file=sys.stderr)
+        return 2
+    # 稠密层（1-based）：有 config 按 config，没有按模型族的默认
+    dense = (frozenset(l + 1 for l in _models.dense_layers(cfg)) if cfg is not None
+             else frozenset(l + 1 for l in fam.default_dense))
     if (args.n_layers is None or args.n_experts is None) and not _MODEL_TAG.search(str(plan.get("model", ""))):
         # 手动清单的 model 字段是模型名、没有「48L-…-E128」：本机有 --model-dir 的 config.json 时从它读
-        cfg_path = Path(str(args.model_dir)) / "config.json"
-        if cfg_path.is_file():
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if cfg is not None:
             args.n_layers = args.n_layers or int(cfg["num_hidden_layers"])
-            args.n_experts = args.n_experts or int(cfg["num_experts"])
-            print(f"清单里没有层数 / 专家数：按 {cfg_path} 取 {args.n_layers} 层 × {args.n_experts} 专家")
+            args.n_experts = args.n_experts or _models.n_experts_of(cfg)
+            print(f"清单里没有层数 / 专家数：按 {args.model_dir}/config.json 取 "
+                  f"{args.n_layers} 层 × {args.n_experts} 专家")
+    print(f"模型族 {fam.name}（{fam.note}）：架构 {fam.arch}，注意力后端 {args.attention_backend or 'vLLM 自选'}"
+          + (f"，稠密层 {sorted(dense)}（1-based）" if dense else ""))
     if wiring is None and not plan.get("pairings") and manual_wiring(plan) is not None:
         print(f"清单没有组合矩阵：按段名编号配对 {manual_wiring(plan)}（手动放置的清单）")
     shared = args.shared_front or (len(front_segments(plan)) == 1 and len(back_segments(plan)) > 1)
@@ -664,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         wired = pair_shared(plan, wiring) if shared else pair_static(plan, wiring)
         chans = channels_from_plan(plan, wired, n_layers=args.n_layers, n_experts=args.n_experts,
-                                   shared_front=shared)
+                                   shared_front=shared, arch=fam.arch, dense=dense)
     except LayoutError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
@@ -692,10 +764,22 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     stats = None
+    if args.stats_profile:
+        args.stats = True
+        if args.lr_layers is None:
+            args.lr_layers = ",".join(str(l) for l in range(int(chans[0].n_layers if chans else 0))
+                                      if l + 1 not in dense)
     if args.stats:
+        # 默认前 L₀ 层里的 MoE 层（0-based；稠密层没有路由，不进 LR 特征）
         lr = ([int(x) for x in args.lr_layers.split(",") if x.strip()]
-              if args.lr_layers else list(range(int(plan["l0"]))))
+              if args.lr_layers else [l for l in range(int(plan["l0"])) if l + 1 not in dense])
+        bad_lr = sorted(l for l in lr if l + 1 in dense)
+        if bad_lr:
+            print(f"✗ --lr-layers 里的 {bad_lr}（0-based）是稠密层，没有路由可统计", file=sys.stderr)
+            return 2
         stats = {"lr_layers": lr}
+        if args.stats_profile:
+            stats["profile"] = True
 
     args.out.mkdir(parents=True, exist_ok=True)
     # 命令是 ssh 到各节点后在家目录下执行的：相对路径会落到 ~/ 下面、读不到 overrides。
@@ -728,8 +812,8 @@ def main(argv: list[str] | None = None) -> int:
                  "max_num_seqs": mns.get(ch.name, args.max_num_seqs),
                  "stats": stats,
                  "stages": [{"node": s.node, "role": s.role, "layers": [s.lo, s.hi],
-                             "n_experts": round(sum(len(e) for e in s.layer_experts.values())
-                                                / s.n_layers, 1)} for s in ch.stages]}
+                             "n_experts": round(stage_moe_avg(s, ch.dense) or 0, 1)}
+                            for s in ch.stages]}
         if hosts:
             cmds = serve_commands(ch, hosts, model_dir=args.model_dir,
                                   overrides_path=f"{remote}/{ov.name}", dtype=dtype,
@@ -758,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps({"plan": str(args.plan), "l0": plan["l0"], "shared_front": bool(shared),
                     "n_layers": chans[0].n_layers if chans else None,
                     "n_experts": chans[0].n_experts if chans else None,
+                    "family": fam.name, "arch": fam.arch,
+                    "dense_layers": sorted(l - 1 for l in dense),     # 0-based
                     "model_dir": args.model_dir, "channels": summary},
                    ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已写 {args.out}/channels.json")

@@ -368,7 +368,9 @@ class Qwen3MoePartialForCausalLM(_q.Qwen3MoeForCausalLM):
             pp_rank=get_pp_group().rank_in_group,
             # B-1 前段：prompt 算完时把 LR 特征随输出交给协调器（不落盘、decode 步不拷贝）
             emit_lr=bool(raw.get("emit_lr", False)), write=bool(raw.get("write", True)),
-            prefill_only=bool(raw.get("prefill_only", False)))
+            prefill_only=bool(raw.get("prefill_only", False)),
+            # 画像（moe_probe.py）：逐层的全量 prefill / decode 计数，写进每条请求的记录
+            profile=bool(raw.get("profile", False)))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if isinstance(self.lm_head, PPMissingLayer):

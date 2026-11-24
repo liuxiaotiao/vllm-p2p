@@ -467,6 +467,18 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         extras={"tiny-random": "tiny-random/qwen3-next-moe"},
         min_transformers_version="4.56.3",
     ),
+    "Qwen3NextPartialForCausalLM": _HfExamplesInfo(
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        hf_overrides={"architectures": ["Qwen3NextPartialForCausalLM"]},
+        min_transformers_version="4.56.3",
+    ),
+    # GLM-4.7-Flash（从 vLLM 0.15 移植；config 由 vllm/transformers_utils/configs/glm4_moe_lite.py 提供）
+    "Glm4MoeLiteForCausalLM": _HfExamplesInfo("zai-org/GLM-4.7-Flash", is_available_online=False),
+    "Glm4MoeLitePartialForCausalLM": _HfExamplesInfo(
+        "zai-org/GLM-4.7-Flash",
+        hf_overrides={"architectures": ["Glm4MoeLitePartialForCausalLM"]},
+        is_available_online=False,
+    ),
     "RWForCausalLM": _HfExamplesInfo("tiiuae/falcon-40b"),
     "SeedOssForCausalLM": _HfExamplesInfo(
         "ByteDance-Seed/Seed-OSS-36B-Instruct",

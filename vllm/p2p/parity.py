@@ -6,6 +6,8 @@
     python -m vllm.p2p.parity                       # fp16 + TRITON_ATTN（实验口径）
     python -m vllm.p2p.parity --dtype bfloat16      # 仅 A30，做参照
     python -m vllm.p2p.parity --p2p-framework /path/to/p2p-framework
+    python -m vllm.p2p.parity --family glm4_moe_lite   # GLM-4.7-Flash（见 parity_glm.py）
+    python -m vllm.p2p.parity --family qwen3_next      # Qwen3-Next（混合层 + 共享专家，参考同样在 p2p-framework）
 
 参考实现与微型 checkpoint 生成器都来自 p2p-framework（`p2pmoe.runtime.torch_model`、
 `p2pmoe.sim.fake_checkpoint`）—— 它就是要对齐的标准，不在 vLLM 里另写一份。默认找
@@ -94,6 +96,45 @@ PARTIAL = {2: [1, 4, 6, 9, 11, 14], 3: [0, 7, 13]}
 STATS_LR_LAYERS = [0, 1]
 STATS_BODY = "1:5"
 
+# Qwen3-Next：同样的尺寸量级，混合层（0–2 层 Gated DeltaNet、第 3 层全注意力）+ 带门的共享专家。
+# 被裁的两层一层是线性注意力、一层是全注意力，两种层上的部分专家都验到
+PARITY_CFG_NEXT = {
+    "architectures": ["Qwen3NextForCausalLM"],
+    "model_type": "qwen3_next",
+    "num_hidden_layers": 4,
+    "full_attention_interval": 4,
+    "num_experts": 16,
+    "num_experts_per_tok": 4,
+    "shared_expert_intermediate_size": 128,
+    "hidden_size": 256,
+    "moe_intermediate_size": 128,
+    "intermediate_size": 512,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_value_head_dim": 64,
+    "linear_key_head_dim": 64,
+    "linear_conv_kernel_dim": 4,
+    "vocab_size": 512,
+    "max_position_embeddings": 4096,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 1000000.0,
+    "partial_rotary_factor": 0.25,
+    "norm_topk_prob": True,
+    "tie_word_embeddings": False,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
+    "hidden_act": "silu",
+    "bos_token_id": 0,
+    "eos_token_id": 2,
+}
+FAMILY = {
+    "qwen3_moe": {"cfg": PARITY_CFG, "arch": ARCH},
+    "qwen3_next": {"cfg": PARITY_CFG_NEXT, "arch": "Qwen3NextPartialForCausalLM"},
+}
+
 PROMPTS = [
     [5, 17, 99, 230, 41, 8, 300, 12],
     [400, 3, 3, 3, 77, 501, 260, 33, 90, 120, 7, 16, 44, 200, 311, 15],
@@ -177,18 +218,34 @@ class _Ref:
     def __init__(self, ckpt: Path, layer_experts_0b: dict[int, list[int]], device: str):
         import torch
 
-        from p2pmoe.runtime.torch_model import TorchModelConfig, TorchSegmentModel
-        from p2pmoe.runtime.weights import KeyPlan, SelectiveLoader, WeightIndex, qwen_moe_keys
+        from p2pmoe.runtime.weights import KeyPlan, SelectiveLoader, WeightIndex
 
         cfg = json.loads((ckpt / "config.json").read_text(encoding="utf-8"))
-        mc = TorchModelConfig.from_hf(cfg)
-        E = mc.n_experts
-        le = {l + 1: list(layer_experts_0b.get(l, range(E))) for l in range(mc.n_layers)}
-        keys = qwen_moe_keys(KeyPlan(layer_experts=le, with_embed=True, with_lm_head=True))
+        if cfg.get("model_type") == "qwen3_next":
+            # p2p-framework 的 Qwen3-Next 执行层（混合层 + 共享专家），契约与 TorchSegmentModel 相同
+            from p2pmoe.runtime.qwen3_next import NextModelConfig, TorchNextSegmentModel
+            from p2pmoe.runtime.weights import qwen3_next_keys
+
+            mc = NextModelConfig.from_hf(cfg)
+            le = {l + 1: list(layer_experts_0b.get(l, range(mc.n_experts)))
+                  for l in range(mc.n_layers)}
+            keys = qwen3_next_keys(KeyPlan(layer_experts=le, with_embed=True, with_lm_head=True),
+                                   layer_types=list(mc.layer_types),
+                                   shared_expert=mc.shared_intermediate > 0)
+            Model = TorchNextSegmentModel
+        else:
+            from p2pmoe.runtime.torch_model import TorchModelConfig, TorchSegmentModel
+            from p2pmoe.runtime.weights import qwen_moe_keys
+
+            mc = TorchModelConfig.from_hf(cfg)
+            le = {l + 1: list(layer_experts_0b.get(l, range(mc.n_experts)))
+                  for l in range(mc.n_layers)}
+            keys = qwen_moe_keys(KeyPlan(layer_experts=le, with_embed=True, with_lm_head=True))
+            Model = TorchSegmentModel
         tensors, rep = SelectiveLoader(WeightIndex(ckpt)).load(keys, device=device,
                                                               dtype=mc.torch_dtype)
         assert not rep.missing, rep.missing[:3]
-        self.m = TorchSegmentModel(mc, le, tensors, device=device, miss_policy="local_topk")
+        self.m = Model(mc, le, tensors, device=device, miss_policy="local_topk")
         self.torch = torch
 
     def stats(self, ids: list[int], body: tuple[int, int]) -> tuple[dict, int, int]:
@@ -242,9 +299,17 @@ def _first_divergence(x: list[int], y: list[int]) -> int | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+    argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "_vllm":
         return _vllm_child(argv[1:])
+    fam = argparse.ArgumentParser(add_help=False)
+    fam.add_argument("--family", default="qwen3_moe",
+                     choices=("qwen3_moe", "glm4_moe_lite", "qwen3_next"))
+    fa, argv = fam.parse_known_args(argv)
+    if fa.family == "glm4_moe_lite":
+        # GLM 的对拍不需要 p2p-framework（参考 = 原生 + 改 bias 的 checkpoint），见 parity_glm.py
+        from vllm.p2p import parity_glm
+        return parity_glm.main(argv)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dtype", default="half", choices=("half", "bfloat16"),
                     help="默认 half：对照实验统一 fp16（VLLM_MIGRATION.md 第 3 节）")
@@ -267,18 +332,25 @@ def main(argv: list[str] | None = None) -> int:
 
     wd = a.workdir or Path(tempfile.mkdtemp(prefix="p2p_parity_"))
     ckpt = wd / "ckpt"
+    family = FAMILY[fa.family]
+    arch = family["arch"]
     if not (ckpt / "config.json").exists():
-        from p2pmoe.sim.fake_checkpoint import write_fake_checkpoint
+        from p2pmoe.sim.fake_checkpoint import write_fake_checkpoint, write_fake_next_checkpoint
 
-        cfg = dict(PARITY_CFG, torch_dtype="bfloat16" if a.dtype == "bfloat16" else "float16")
-        write_fake_checkpoint(ckpt, cfg, seed=11)
+        cfg = dict(family["cfg"], torch_dtype="bfloat16" if a.dtype == "bfloat16" else "float16")
+        if fa.family == "qwen3_next":
+            write_fake_next_checkpoint(ckpt, cfg, seed=11)
+        else:
+            write_fake_checkpoint(ckpt, cfg, seed=11)
+    elif json.loads((ckpt / "config.json").read_text())["model_type"] != family["cfg"]["model_type"]:
+        raise SystemExit(f"{ckpt} 是别的模型的 checkpoint —— 换一个 --workdir")
     print(f"参考实现: {p2p}")
     print(f"checkpoint: {ckpt}  dtype={a.dtype}  attention={a.attention_backend or 'auto'}"
           f"  tokens={a.tokens}"
           f"{'  (eager)' if a.eager else ''}")
 
-    full_ov = {"architectures": [ARCH], "p2p_layer_experts": {}}
-    part_ov = {"architectures": [ARCH],
+    full_ov = {"architectures": [arch], "p2p_layer_experts": {}}
+    part_ov = {"architectures": [arch],
                "p2p_layer_experts": {str(k): v for k, v in PARTIAL.items()}}
     stats_ov = dict(part_ov, p2p_stats={"lr_layers": STATS_LR_LAYERS}, p2p_channel="parity")
     stats_dir = wd / "stats"
@@ -307,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         if same_tok else math.inf
     checks.append(("部分专家模型全装 ≡ vLLM 原生（逐 token）", same_tok and d_pf <= 1e-5,
                    f"max |Δlogprob| = {d_pf:.2e}"))
-    checks.append(("部分专家模型确实被选用", runs["partial-sub"]["arch"] == [ARCH],
+    checks.append(("部分专家模型确实被选用", runs["partial-sub"]["arch"] == [arch],
                    f"architectures = {runs['partial-sub']['arch']}"))
 
     # 2. 噪声底：原生 vLLM vs p2p-framework 全装；3. 部分专家：vLLM vs p2p-framework

@@ -145,7 +145,7 @@ def _n_experts(sj: Mapping, model_dir: str | Path) -> int:
     if sj.get("n_experts"):
         return int(sj["n_experts"])
     cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
-    return int(cfg["num_experts"])
+    return int(cfg.get("num_experts") or cfg["n_routed_experts"])      # Qwen 系 / GLM
 
 
 def _finish_reason(f: str | None) -> str | None:

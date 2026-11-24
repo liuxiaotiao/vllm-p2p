@@ -454,6 +454,19 @@ def use_flashinfer_prefill() -> bool:
     )
 
 
+def use_torch_prefill() -> bool:
+    """没有 FlashAttention 的卡（compute capability < 8.0，Turing：T4 / RTX 6000）上，
+    MLA 的 prefill 改走纯 torch（``torch_prefill.py``）。``VLLM_P2P_MLA_TORCH_PREFILL=1`` 可在任何卡上强制。"""
+    import os
+
+    if os.environ.get("VLLM_P2P_MLA_TORCH_PREFILL", "") == "1":
+        return True
+    if not current_platform.is_cuda():
+        return False
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap[0] < 8
+
+
 def use_cudnn_prefill() -> bool:
     from vllm.config import get_current_vllm_config
 
@@ -1315,7 +1328,12 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        if use_flashinfer_prefill():
+        if use_torch_prefill():
+            logger.info_once("MLA prefill 走纯 torch 回退（这张卡没有 FlashAttention）")
+            self._run_prefill_context_chunk = self._run_prefill_context_chunk_torch
+            self._run_prefill_new_tokens = self._run_prefill_new_tokens_torch
+            self._pad_v = False
+        elif use_flashinfer_prefill():
             logger.debug_once("Using FlashInfer prefill for MLA")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fi
@@ -1421,6 +1439,35 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             softmax_scale=self.scale,
             causal=True,
             return_softmax_lse=return_softmax_lse,
+        )
+
+    def _run_prefill_new_tokens_torch(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
+        from vllm.v1.attention.backends.mla.torch_prefill import torch_varlen_attention
+
+        return torch_varlen_attention(
+            q, k, v,
+            cu_seqlens_q=prefill.query_start_loc,
+            cu_seqlens_k=prefill.query_start_loc,
+            softmax_scale=self.scale,
+            causal=True,
+            return_softmax_lse=return_softmax_lse,
+        )
+
+    def _run_prefill_context_chunk_torch(
+        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
+    ):
+        from vllm.v1.attention.backends.mla.torch_prefill import torch_varlen_attention
+
+        assert prefill.chunked_context is not None
+        return torch_varlen_attention(
+            q, k, v,
+            cu_seqlens_q=prefill.query_start_loc,
+            cu_seqlens_k=prefill.chunked_context.cu_seq_lens[chunk_idx],
+            softmax_scale=self.scale,
+            causal=False,  # Context is unmasked
+            return_softmax_lse=True,
         )
 
     def _run_prefill_new_tokens_fi(

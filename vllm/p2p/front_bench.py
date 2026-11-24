@@ -486,18 +486,27 @@ def _front_engine(model_dir: str, *, layers: int, stats: bool, a, trace: Path, m
     from vllm.v1.engine.core_client import EngineCoreClient
     from vllm.v1.executor import Executor
 
+    from vllm.p2p import models
+    cfg_json = models.load_config(model_dir)
+    fam = models.family_of(cfg_json)
     # 与 stages.py 给前段的 hf_overrides 相同（全专家、前段出口识别统计）
-    ov: dict = {"architectures": [ARCH], "p2p_layer_experts": {}, "p2p_channel": "front-bench",
+    ov: dict = {"architectures": [fam.arch], "p2p_layer_experts": {}, "p2p_channel": "front-bench",
                 "p2p_stage": {"role": "front", "layers": [0, int(layers)]}}
+    dense: frozenset = models.dense_layers(cfg_json) if cfg_json is not None else frozenset()
+    if fam.name == "glm4_moe_lite" and not a.real_weights:
+        # 随机权重时把 GLM 的稠密第 0 层也换成 MoE 层：L₀ 层 / 1 层相减求「每层」要求层是同一种
+        ov.update(first_k_dense_replace=0, num_nextn_predict_layers=0)
+        dense = frozenset()
     if stats:
-        ov["p2p_stats"] = {"lr_layers": list(range(int(layers))), "emit_lr": True, "write": False,
-                           "prefill_only": True}
+        ov["p2p_stats"] = {"lr_layers": [l for l in range(int(layers)) if l not in dense],
+                           "emit_lr": True, "write": False, "prefill_only": True}
     kw = dict(model=model_dir, dtype=a.dtype, hf_overrides=ov, skip_tokenizer_init=True,
               enable_prompt_embeds=False, async_scheduling=False, enable_prefix_caching=False,
               gpu_memory_utilization=a.gpu_mem, max_model_len=mml, max_num_seqs=a.max_num_seqs,
               enforce_eager=a.eager, seed=0, load_format="auto" if a.real_weights else "dummy")
-    if a.attention_backend:
-        kw["attention_backend"] = a.attention_backend
+    backend = a.attention_backend or fam.attention_backend
+    if backend != "auto":
+        kw["attention_backend"] = backend
     cfg = EngineArgs(**kw).create_engine_config(UsageContext.ENGINE_CONTEXT)
     trace.parent.mkdir(parents=True, exist_ok=True)
     if trace.exists():
@@ -623,7 +632,9 @@ def _prepare_dummy_dir(src: Path, dst: Path) -> Path:
 async def _run_async(a) -> dict:
     cfg = json.loads((Path(a.model_dir) / "config.json").read_text(encoding="utf-8"))
     vocab, hidden = int(cfg["vocab_size"]), int(cfg["hidden_size"])
-    E, K = int(cfg["num_experts"]), int(cfg["num_experts_per_tok"])
+    from vllm.p2p import models
+    E, K = models.n_experts_of(cfg), models.top_k_of(cfg)
+    a.attention_backend = a.attention_backend or models.family_of(cfg).attention_backend
     conc, prefill = _ints(a.conc), _ints(a.prefill) if a.prefill else []
     backs = parse_back_ms(a.back_ms)
     mml = max([*prefill, a.prompt_len]) + max(a.tokens, 512) + 256   # 后台 decode 每条最多 512 个
@@ -1032,7 +1043,8 @@ def add_run_args(ap, *, cluster: bool = False) -> None:
     ap.add_argument("--gpu-mem", type=float, default=0.5)
     ap.add_argument("--max-num-seqs", type=int, default=16)
     ap.add_argument("--dtype", default="half")
-    ap.add_argument("--attention-backend", default="TRITON_ATTN")
+    ap.add_argument("--attention-backend", default=None,
+                    help="默认按模型族（Qwen 系 TRITON_ATTN、GLM-4.7-Flash TRITON_MLA）；auto = vLLM 自选")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--timeout", type=float, default=120.0, help="等一位 hidden 最多几秒")
     ap.add_argument("--real-weights", action="store_true", help="读 checkpoint（默认随机权重，起得快）")

@@ -29,8 +29,9 @@ A30 4 ms / RTX 6000 15 ms / T4 26 ms（8 层）—— 卡型之间差 3.7–6.5 
 「batch B 条请求、上下文 C 个 token 时，一步 decode 的耗时」与「长 P 的 prompt 一次 prefill 的耗时」
 （C、P 默认都是 128, 256, …, 1024，`--lengths 起:止:步长`），
 两次相减除以层数差 = **一层**的耗时。embed、lm_head、采样、调度这些与层数无关的开销在相减时抵掉了。
-kernel 与部署时相同：`Qwen3MoePartialForCausalLM`（每层只建 E 个专家，`--experts` 可量几档）、
-fp16、TRITON_ATTN、CUDA Graph（`--eager` 关掉）。每个配置在单独的子进程里起引擎。
+kernel 与部署时相同：按 config 的模型族用部分专家架构（`Qwen3MoePartialForCausalLM` /
+`Glm4MoeLitePartialForCausalLM`，每层只建 E 个专家，`--experts` 可量几档）、
+fp16、模型族的注意力后端（TRITON_ATTN / TRITON_MLA）、CUDA Graph（`--eager` 关掉）。每个配置在单独的子进程里起引擎。
 
 * decode 一步：先发 B 条长 C 的随机 prompt 只生成 1 个 token（= prefill + 1 步），再发同样的
   B 条生成 1+K 个，两者之差 / K = 一步 decode（上下文从 C 涨到 C+K，取的是这一段的平均）。
@@ -184,9 +185,18 @@ def mem_probe(worker) -> dict:
         experts = getattr(mlp, "experts", None)
         w13 = getattr(experts, "w13_weight", None)
         n_exp = int(w13.shape[0]) if w13 is not None else 0
-        tot, ex, rt = _bytes(lay), _bytes(experts), _bytes(getattr(mlp, "gate", None))
+        # 共享专家（GLM / Qwen3-Next）单独记：SharedFusedMoE 把它挂在 experts._shared_experts 下，
+        # 不拆开的话会算进「路由专家」里，规划器按驻留专家数缩放时就多缩了
+        shared = [m for m in (getattr(mlp, "shared_experts", None),
+                              getattr(mlp, "shared_expert", None),
+                              getattr(mlp, "shared_expert_gate", None)) if m is not None]
+        sh_ids = {id(p) for m in shared for p in m.parameters()}
+        tot, rt = _bytes(lay), _bytes(getattr(mlp, "gate", None))
+        ex = (sum(p.numel() * p.element_size() for p in experts.parameters() if id(p) not in sh_ids)
+              if experts is not None else 0)
+        sh = sum(_bytes(m) for m in shared)
         layers.append({"idx": i, "bytes": tot, "experts_bytes": ex, "router_bytes": rt,
-                       "attn_norm_bytes": tot - ex - rt, "n_experts": n_exp})
+                       "shared_bytes": sh, "attn_norm_bytes": tot - ex - rt - sh, "n_experts": n_exp})
     params = _bytes(model)
     cc = getattr(worker, "cache_config", None) or getattr(mr, "cache_config", None)
     blocks = int(getattr(cc, "num_gpu_blocks", 0) or 0)
@@ -224,6 +234,7 @@ def summarise_memory(runs: Sequence[Mapping]) -> dict:
             "w": sum(l["bytes"] for l in ls) / n / MiB,
             "attn": sum(l["attn_norm_bytes"] for l in ls) / n / MiB,
             "router": sum(l["router_bytes"] for l in ls) / n / MiB,
+            "shared": sum(l.get("shared_bytes", 0) for l in ls) / n / MiB,
             "exp": sum(l["experts_bytes"] for l in ls) / n / MiB,
             "per_exp": (sum(l["experts_bytes"] for l in ls) / max(sum(l["n_experts"] for l in ls), 1) / MiB),
             "n_exp": sum(l["n_experts"] for l in ls) / n,
@@ -242,6 +253,7 @@ def summarise_memory(runs: Sequence[Mapping]) -> dict:
         "weight_mib_per_layer": med([p["w"] for p in per]),
         "attn_norm_mib_per_layer": med([p["attn"] for p in per]),
         "router_mib_per_layer": med([p["router"] for p in per]),
+        "shared_experts_mib_per_layer": med([p["shared"] for p in per]),
         "experts_mib_per_layer": med([p["exp"] for p in per]),
         "mib_per_expert": med([p["per_exp"] for p in per]),
         "non_layer_weight_mib": med([p["nonlayer"] for p in per]),
@@ -442,11 +454,31 @@ def _prepare_model_dir(src: Path, dst: Path) -> Path:
     return dst
 
 
-def _overrides(n_layers: int, n_experts: int, total_experts: int) -> dict:
-    ov = {"architectures": [ARCH], "num_hidden_layers": int(n_layers), "p2p_channel": "layer-bench"}
-    if n_experts < total_experts:
+def _overrides(n_layers: int, n_experts: int, total_experts: int | None = None,
+               cfg: Mapping | None = None) -> dict:
+    """引擎的 hf_overrides：按模型族的部分专家架构、只建 ``n_layers`` 层、每层驻留前 ``n_experts`` 个。
+
+    GLM-4.7-Flash 的第 0 层是稠密层：量的是 **MoE 层**，所以把 ``first_k_dense_replace`` 改成 0
+    （随机权重，层的形状只看 config）—— 否则 2 层与 6 层里各有一层稠密，相减虽然抵掉了，但 2 层那次
+    只有 1 个 MoE 层，B=1 的小数更容易被噪声盖住。"""
+    from vllm.p2p import models
+    fam = models.family_of(cfg) if cfg is not None else models.DEFAULT_FAMILY
+    total = int(total_experts if total_experts is not None else models.n_experts_of(cfg))
+    ov = {"architectures": [fam.arch], "num_hidden_layers": int(n_layers), "p2p_channel": "layer-bench"}
+    if fam.name == "glm4_moe_lite":
+        ov["first_k_dense_replace"] = 0
+        ov["num_nextn_predict_layers"] = 0
+    if n_experts < total:
         ov["p2p_layer_experts"] = {str(l): list(range(n_experts)) for l in range(n_layers)}
     return ov
+
+
+def family_defaults(cfg: Mapping) -> tuple[list[int], str]:
+    """按 config 的模型族给默认：专家档 [全装, 一半]、注意力后端。"""
+    from vllm.p2p import models
+    fam = models.family_of(cfg)
+    E = models.n_experts_of(cfg)
+    return [E, E // 2], fam.attention_backend
 
 
 def _time_generate(llm, prompts, sp) -> float:
@@ -506,7 +538,7 @@ def _worker(argv: Sequence[str]) -> int:
     ap.add_argument("--repeats", type=int, required=True)
     ap.add_argument("--gpu-mem", type=float, required=True)
     ap.add_argument("--dtype", default="half")
-    ap.add_argument("--attention-backend", default="TRITON_ATTN")
+    ap.add_argument("--attention-backend", default="TRITON_ATTN", help="auto = vLLM 自选")
     ap.add_argument("--eager", action="store_true")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
@@ -521,7 +553,7 @@ def _worker(argv: Sequence[str]) -> int:
     contexts = [int(x) for x in a.contexts.split(",") if x]
     mml = max([max(contexts) + a.decode_steps + 8, *(p + 8 for p in prefill)])
     kw = dict(model=a.model_dir, dtype=a.dtype, load_format="dummy", skip_tokenizer_init=True,
-              hf_overrides=_overrides(a.layers, a.experts, int(cfg["num_experts"])),
+              hf_overrides=_overrides(a.layers, a.experts, cfg=cfg),
               max_model_len=mml, max_num_seqs=max(batches), gpu_memory_utilization=a.gpu_mem,
               # B 条的 prefill 一步做完，不和 decode 混在同一步里（显存账里的峰值也就按这个算）
               max_num_batched_tokens=max(mml, max(batches) * max(contexts)),
@@ -529,7 +561,7 @@ def _worker(argv: Sequence[str]) -> int:
               # 与分段引擎相同（stage_agent 关了异步调度）；也让一步 = CPU + GPU 串行，
               # 层数相减才能干净地只剩 GPU 上那几层
               async_scheduling=False)
-    if a.attention_backend:
+    if a.attention_backend and a.attention_backend != "auto":
         kw["attention_backend"] = a.attention_backend
     t0 = time.perf_counter()
     llm = LLM(**kw)
@@ -573,12 +605,17 @@ def cmd_run(a) -> int:
               "量出来的数不准。先停掉（launch.py … stop all），或 --force", file=sys.stderr)
         return 3
     layers = [int(x) for x in a.layers.split(",")]
-    experts = [int(x) for x in a.experts.split(",")]
     prefill = parse_lengths(a.prefill or a.lengths)
     contexts = parse_lengths(a.contexts or a.lengths)
     cfg = json.loads((Path(a.model_dir) / "config.json").read_text(encoding="utf-8"))
-    total_e = int(cfg["num_experts"])
-    if any(e > total_e or e < int(cfg["num_experts_per_tok"]) for e in experts):
+    from vllm.p2p import models
+    total_e = models.n_experts_of(cfg)
+    def_experts, def_backend = family_defaults(cfg)
+    experts = [int(x) for x in a.experts.split(",")] if a.experts else def_experts
+    a.attention_backend = a.attention_backend or def_backend
+    if a.ref_experts is None:
+        a.ref_experts = total_e
+    if any(e > total_e or e < models.top_k_of(cfg) for e in experts):
         raise SystemExit(f"--experts 要在 [{cfg['num_experts_per_tok']}, {total_e}] 之间")
     node = a.node or os.environ.get("P2P_NODE") or os.uname().nodename
     print(f"[layer_bench] {node}：{info.get('gpu')}，层数 {layers} × 专家 {experts}，batch {a.batches}，"
@@ -698,10 +735,15 @@ def pick_nodes(hosts: Mapping[str, tuple[str, str]], want: str | None) -> list[s
 
 def remote_command(node: str, a) -> str:
     args = ["run", "--model-dir", a.model_dir, "--node", node, "--out", f"/tmp/layer_bench_{node}.json",
-            "--layers", a.layers, "--experts", a.experts, "--batches", a.batches,
+            "--layers", a.layers, "--batches", a.batches,
             "--lengths", a.lengths, "--decode-steps", str(a.decode_steps),
             "--repeats", str(a.repeats), "--gpu-mem", str(a.gpu_mem), "--ref-batch", str(a.ref_batch),
-            "--ref-experts", str(a.ref_experts), "--ref-context", str(a.ref_context)]
+            "--ref-context", str(a.ref_context)]
+    # 专家档、参考专家数、注意力后端不给就由节点按 config 的模型族定
+    if a.experts:
+        args += ["--experts", a.experts]
+    if a.ref_experts is not None:
+        args += ["--ref-experts", str(a.ref_experts)]
     if a.prefill:
         args += ["--prefill", a.prefill]
     if a.contexts:
@@ -812,8 +854,8 @@ def _common(ap) -> None:
                     help="取 config.json 的目录（只读 config，不读权重）")
     ap.add_argument("--layers", default=",".join(map(str, DEFAULT_LAYERS)),
                     help="起几次引擎、各几层（至少两种；层多了 T4 显存不够）")
-    ap.add_argument("--experts", default=",".join(map(str, DEFAULT_EXPERTS)),
-                    help="每层驻留几个专家（128 = 前段全装；后段一般 55–95）")
+    ap.add_argument("--experts", default=None,
+                    help="每层驻留几个专家，逗号分隔（默认 全装,一半：Qwen3-30B 128,64、GLM-4.7-Flash 64,32）")
     ap.add_argument("--batches", default=",".join(map(str, DEFAULT_BATCHES)),
                     help="decode 时同时几条请求")
     ap.add_argument("--lengths", default=DEFAULT_LENGTHS,
@@ -825,7 +867,8 @@ def _common(ap) -> None:
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--eager", action="store_true", help="不用 CUDA Graph（部署时是用的）")
     ap.add_argument("--ref-batch", type=int, default=1, help="summary.ms_per_layer 取哪个 batch")
-    ap.add_argument("--ref-experts", type=int, default=128, help="summary.ms_per_layer 取哪档专家数")
+    ap.add_argument("--ref-experts", type=int, default=None,
+                    help="summary.ms_per_layer 取哪档专家数（默认全装）")
     ap.add_argument("--ref-context", default="mean",
                     help="summary.ms_per_layer 取哪个上下文长度；mean = 各长度均值（默认）")
     ap.add_argument("--force", action="store_true", help="卡上有别的进程也照量")
@@ -844,7 +887,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--node", default=None, help="节点名（默认主机名）")
     r.add_argument("--out", required=True)
     r.add_argument("--dtype", default="half")
-    r.add_argument("--attention-backend", default="TRITON_ATTN")
+    r.add_argument("--attention-backend", default=None,
+                   help="默认按模型族（Qwen 系 TRITON_ATTN、GLM-4.7-Flash TRITON_MLA）；auto = vLLM 自选")
     r.add_argument("--max-used-mb", type=float, default=1024, help="卡上已占超过这么多就拒绝量")
     r.add_argument("--verbose", action="store_true", help="把子进程的 vLLM 日志也打出来")
 

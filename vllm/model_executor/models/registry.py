@@ -112,6 +112,7 @@ _TEXT_GENERATION_MODELS = {
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),
+    "Glm4MoeLiteForCausalLM": ("glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
     "GptOssForCausalLM": ("gpt_oss", "GptOssForCausalLM"),
     "GPT2LMHeadModel": ("gpt2", "GPT2LMHeadModel"),
     "GPTBigCodeForCausalLM": ("gpt_bigcode", "GPTBigCodeForCausalLM"),
@@ -185,6 +186,8 @@ _TEXT_GENERATION_MODELS = {
     "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
     # P2P 移植：每层只装指定专家的 Qwen3-MoE（配置经 --hf-overrides 下发，见 vllm/p2p/）
     "Qwen3MoePartialForCausalLM": ("qwen3_moe_partial", "Qwen3MoePartialForCausalLM"),
+    "Glm4MoeLitePartialForCausalLM": ("glm4_moe_lite_partial", "Glm4MoeLitePartialForCausalLM"),
+    "Qwen3NextPartialForCausalLM": ("qwen3_next_partial", "Qwen3NextPartialForCausalLM"),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "SeedOssForCausalLM": ("seed_oss", "SeedOssForCausalLM"),
     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),

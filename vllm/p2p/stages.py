@@ -128,12 +128,16 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
         fnode = c["nodes"][0]
         if fnode not in fronts:
             fname = f"front-{fnode}"
-            fov = {"architectures": [ARCH], "p2p_layer_experts": {}, "p2p_channel": fname,
+            # 架构名随通道的 overrides（layout.py 按模型族写的）；老的 overrides 没有这个键 = Qwen3-MoE
+            fov = {"architectures": list(ov.get("architectures") or [ARCH]),
+                   "p2p_layer_experts": {}, "p2p_channel": fname,
                    "p2p_miss_policy": ov.get("p2p_miss_policy", "local_topk")}
             if front_lr:
                 # 前段出口识别：prompt 算完时交出前 L₀ 层（只数 body token）的逐层路由计数，
                 # 协调器跑 LR 决定绑哪个后段。只统计 prefill、不落盘
-                lr = (ov.get("p2p_stats") or {}).get("lr_layers") or list(range(l0))
+                dense = {int(x) for x in cj.get("dense_layers") or ()}
+                lr = ((ov.get("p2p_stats") or {}).get("lr_layers")
+                      or [l for l in range(l0) if l not in dense])
                 fov["p2p_stats"] = {"lr_layers": [int(x) for x in lr], "emit_lr": True,
                                     "write": False, "prefill_only": True}
             elif ov.get("p2p_stats") is not None:
@@ -194,6 +198,8 @@ def stages_from_channels(cj: Mapping, *, only: Sequence[str] | None = None,
                 x["cmd"] = f"VLLM_P2P_STEP_TRACE={shlex.quote(path)} {x['cmd']}"
     return {"kind": "tiered", "plan": cj.get("plan"), "l0": l0, "n_layers": n_layers,
             "n_experts": cj.get("n_experts"), "model_dir": model_dir,
+            "family": cj.get("family", "qwen3_moe"), "arch": cj.get("arch", ARCH),
+            "dense_layers": list(cj.get("dense_layers") or []),
             "fronts": [f["name"] for f in fl], "backs": [b["name"] for b in backs],
             # 叫 channels 是为了 launch.py / bench.py 原样能读
             "channels": fl + backs}

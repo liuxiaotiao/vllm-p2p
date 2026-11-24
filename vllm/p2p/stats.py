@@ -113,6 +113,8 @@ class _Acc:
     lr_tok: dict[int, int] = field(default_factory=dict)
     lr_sent: bool = False
     """B-1 前段：这条请求的 LR 特征已经交出去了（只交一次）。"""
+    # 画像（profile）：本级每层 × 每专家，整条 prompt / decode 的 top-k 次数与门控质量
+    prof: dict | None = None
 
 
 class RouteStats:
@@ -121,10 +123,14 @@ class RouteStats:
     def __init__(self, *, n_experts: int, top_k: int, norm_topk: bool,
                  lr_layers: Sequence[int] = (), channel: str = "", pp_rank: int = 0,
                  out_dir: str | None = None, emit_lr: bool = False, write: bool = True,
-                 prefill_only: bool = False):
+                 prefill_only: bool = False, scoring: str = "softmax", profile: bool = False):
         self.E = int(n_experts)
         self.k = int(top_k)
         self.norm_topk = bool(norm_topk)
+        if scoring not in ("softmax", "sigmoid"):
+            raise ValueError(f"路由打分只认 softmax / sigmoid，给的是 {scoring!r}")
+        # softmax：Qwen3-MoE / Qwen3-Next；sigmoid（+ 纠偏 bias 只用于挑专家）：GLM-4.7-Flash / DeepSeek-V3
+        self.scoring = scoring
         self.lr_layers = sorted({int(x) for x in lr_layers})
         self.channel = channel or "vllm"
         self.pp_rank = int(pp_rank)
@@ -141,6 +147,11 @@ class RouteStats:
         self.emit_lr = bool(emit_lr)          # B-1 前段：prompt 算完时交出 LR 特征（take_lr）
         self.write = bool(write)              # 请求结束时写 JSONL
         self.prefill_only = bool(prefill_only)  # 只统计 prompt 位置（decode 步不拷贝）
+        # 画像：每条请求、本级每层的全量 top-k 计数（整条 prompt 与 decode 分开），给 moe_probe.py
+        # 拼成 p2p-framework 的 *_prefill_persample.npz / *_expert_activation.csv
+        self.profile = bool(profile)
+        if self.profile and self.prefill_only:
+            raise ValueError("p2p_stats.profile 要 decode 的计数，不能同时 prefill_only")
 
     # -- 构造期：模型逐层登记 ------------------------------------------------ #
     def register_layer(self, layer: int, resident: Sequence[int] | None) -> int:
@@ -165,13 +176,21 @@ class RouteStats:
         self._res_table = np.stack(self._resident) if self._resident else np.ones((1, self.E), bool)
 
     # -- 前向里（自定义算子的实现调它）--------------------------------------- #
-    def capture(self, slot: int, router_logits) -> None:
+    def capture(self, slot: int, router_logits, bias=None) -> None:
+        """全量路由的 top-k：softmax 时按概率挑、权重即概率；sigmoid 时按「sigmoid + bias」挑、
+        权重取不带 bias 的 sigmoid（与模型自己的路由同一套口径）。之后按 norm_topk 重归一。"""
         import torch
 
         if self.topi is None:
             return
-        probs = torch.softmax(router_logits.float(), dim=-1)
-        w, i = torch.topk(probs, self.k, dim=-1)
+        if self.scoring == "sigmoid":
+            probs = torch.sigmoid(router_logits.float())
+            choice = probs if bias is None else probs + bias.float().unsqueeze(0)
+            i = torch.topk(choice, self.k, dim=-1)[1]
+            w = probs.gather(-1, i)
+        else:
+            probs = torch.softmax(router_logits.float(), dim=-1)
+            w, i = torch.topk(probs, self.k, dim=-1)
         if self.norm_topk:
             w = w / w.sum(-1, keepdim=True).clamp_min(1e-20)
         n = min(int(router_logits.shape[0]), self.capacity)
@@ -247,12 +266,44 @@ class RouteStats:
             acc.pre_miss_mass += float(miss_mass[pre].sum())
             acc.layer_miss_pre += miss_any[pre].sum(0)
             self._lr(acc, ids[pre], ws[pre], pos[pre])
+            if self.profile:
+                self._prof(acc, "pre", ids[pre], ws[pre])
         if dec.any() and not self.prefill_only:
             acc.dec_tok_layer += int(dec.sum()) * L
             acc.dec_miss_tl += int(miss_any[dec].sum())
             acc.dec_miss_mass += float(miss_mass[dec].sum())
             acc.layer_miss_dec += miss_any[dec].sum(0)
             acc.dec_miss_seq.extend(int(x) for x in miss_any[dec].sum(1))
+            if self.profile:
+                self._prof(acc, "dec", ids[dec], ws[dec])
+
+    def _prof(self, acc: _Acc, phase: str, ids: np.ndarray, ws: np.ndarray) -> None:
+        """画像：本级每层的 top-k 次数与门控质量（不分 body，整条 prompt / 全部 decode token）。"""
+        L, E = len(self.layers), self.E
+        if acc.prof is None:
+            acc.prof = {f"{p}_{k}": (np.zeros((L, E), np.int64) if k == "cnt" else
+                                    np.zeros((L, E), np.float64) if k == "mass" else 0)
+                        for p in ("pre", "dec") for k in ("cnt", "mass", "tok")}
+        cnt, mas = acc.prof[f"{phase}_cnt"], acc.prof[f"{phase}_mass"]
+        for li in range(L):
+            e = ids[:, li, :].reshape(-1)
+            cnt[li] += np.bincount(e, minlength=E)[:E]
+            mas[li] += np.bincount(e, weights=ws[:, li, :].reshape(-1).astype(np.float64),
+                                   minlength=E)[:E]
+        acc.prof[f"{phase}_tok"] += int(ids.shape[0])
+
+    def _prof_wire(self, acc: _Acc) -> dict:
+        """{"prefill"|"decode": {"t": token 数, "layers": {1-based 层: {"c": [E], "w": [E]}}}}。"""
+        if acc.prof is None:
+            return {}
+        out = {}
+        for p, name in (("pre", "prefill"), ("dec", "decode")):
+            c, w = acc.prof[f"{p}_cnt"], acc.prof[f"{p}_mass"]
+            out[name] = {"t": int(acc.prof[f"{p}_tok"]),
+                         "layers": {str(l + 1): {"c": c[li].astype(int).tolist(),
+                                                 "w": [round(float(x), 5) for x in w[li]]}
+                                    for li, l in enumerate(self.layers)}}
+        return out
 
     def _lr(self, acc: _Acc, ids: np.ndarray, ws: np.ndarray, pos: np.ndarray) -> None:
         """前 L₀ 层：只数 body token 的 top-k 次数与门控质量（= LayerStat）。"""
@@ -336,6 +387,7 @@ class RouteStats:
             "layer_miss": {"prefill": acc.layer_miss_pre.tolist(),
                            "decode": acc.layer_miss_dec.tolist()},
             "decode_miss_seq": acc.dec_miss_seq,
+            **({"profile": self._prof_wire(acc)} if self.profile else {}),
             **({"lr_layers": lr, "body": [list(x) for x in acc.body] if masked else None}
                if lr else {}),
         }
