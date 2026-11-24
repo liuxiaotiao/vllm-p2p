@@ -40,6 +40,24 @@ is_hip_ = current_platform.is_rocm()
 
 logger = logging.getLogger(__name__)
 
+
+_SMALL_SMEM: bool | None = None
+
+
+def _small_smem() -> bool:
+    """P2P 移植：Turing（T4 / RTX 6000，sm75）每个 block 最多 64 KB 共享内存，MLA 的分组 decode kernel
+    （kv_lora 512 + rope 64，默认 BLOCK_N=32、两级流水）要 100 KB，编译就报 out of resource。
+    这类卡上改用 BLOCK_N=16、单级流水（约 52 KB）。sm80 及以上不变。"""
+    global _SMALL_SMEM
+    if _SMALL_SMEM is None:
+        try:
+            cap = current_platform.get_device_capability()
+            _SMALL_SMEM = (not is_hip_ and cap is not None
+                           and (cap.major, cap.minor) < (8, 0))
+        except Exception:  # noqa: BLE001
+            _SMALL_SMEM = False
+    return _SMALL_SMEM
+
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
 if version.parse(triton.__version__) < version.parse("3.2.0"):
@@ -424,6 +442,11 @@ def _decode_grouped_att_m_fwd(
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:
         BLOCK = 16
+    small_smem = _small_smem() and Lk >= 288
+    if small_smem:
+        # 还放不下时可用环境变量再调小（不用改代码）：VLLM_P2P_MLA_DECODE_BLOCK=8
+        import os
+        BLOCK = int(os.environ.get("VLLM_P2P_MLA_DECODE_BLOCK", "16"))
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -453,6 +476,8 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+    if small_smem:
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
