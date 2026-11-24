@@ -423,6 +423,182 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+@triton.jit
+def _fwd_grouped_kernel_stage1_small(
+    Q,
+    K_Buffer,
+    V_Buffer,
+    sm_scale,
+    Req_to_tokens,
+    B_Seqlen,
+    Att_Out,
+    stride_req_to_tokens_b,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    DV_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """P2P 移植：``_fwd_grouped_kernel_stage1`` 的小共享内存版（Turing，每 block 64 KB）。
+
+    算的东西完全相同，只是把两个大 tile 拆小：q·kᵀ 沿 head 维按 ``D_CHUNK`` 分块累加（不再一次
+    装下 [BLOCK_H, 512] 与 [512, BLOCK_N]）；p·v 的输出维拆成 ``DV_SPLITS`` 份、由 grid 第 2 维上
+    不同的 program 各算一份（每份重算一遍 qk —— decode 时 qk 很便宜）。所有 program 的 softmax
+    统计量相同，lse 只由第 0 份写。stage 2 不变。"""
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+    pid2 = tl.program_id(2)
+    split_kv_id = pid2 // DV_SPLITS
+    dv_id = pid2 % DV_SPLITS
+
+    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_dc = tl.arange(0, D_CHUNK)
+    offs_dv = dv_id * BLOCK_DV + tl.arange(0, BLOCK_DV)
+    mask_dv = offs_dv < Lv
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_req_idx = cur_batch
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        mask_dpe = offs_dpe < Lk
+        off_qpe = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        )
+        qpe = tl.load(
+            Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+        )
+
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < split_kv_end
+            kv_page_number = tl.load(
+                Req_to_tokens
+                + stride_req_to_tokens_b * cur_batch_req_idx
+                + offs_n // PAGE_SIZE,
+                mask=mask_n,
+                other=0,
+            )
+            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+            for d0 in tl.static_range(0, BLOCK_DMODEL, D_CHUNK):
+                offs_d = d0 + offs_dc
+                mask_d = offs_d < Lk
+                q = tl.load(
+                    Q
+                    + cur_batch * stride_qbs
+                    + cur_head[:, None] * stride_qh
+                    + offs_d[None, :],
+                    mask=(mask_h[:, None]) & (mask_d[None, :]),
+                    other=0.0,
+                )
+                k = tl.load(
+                    K_Buffer
+                    + kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None],
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
+                qk += tl.dot(q, k.to(q.dtype))
+            if BLOCK_DPE > 0:
+                offs_buf_kpe = (
+                    kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(
+                    K_Buffer + offs_buf_kpe,
+                    mask=(mask_n[None, :]) & (mask_dpe[:, None]),
+                    other=0.0,
+                )
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            qk = tl.where(mask_h[:, None] & (mask_n[None, :]), qk, float("-inf"))
+
+            offs_buf_v = (
+                kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Buffer + offs_buf_v,
+                mask=(mask_n[:, None]) & (mask_dv[None, :]),
+                other=0.0,
+            )
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        offs_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head[:, None] * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+
+        tl.store(
+            Att_Out + offs_mid_o,
+            acc / e_sum[:, None],
+            mask=(mask_h[:, None]) & (mask_dv[None, :]),
+        )
+
+        offs_mid_o_1 = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + split_kv_id * stride_mid_os
+            + Lv
+        )
+
+        if dv_id == 0:
+            tl.store(
+                Att_Out + offs_mid_o_1,
+                e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -444,7 +620,7 @@ def _decode_grouped_att_m_fwd(
         BLOCK = 16
     small_smem = _small_smem() and Lk >= 288
     if small_smem:
-        # 还放不下时可用环境变量再调小（不用改代码）：VLLM_P2P_MLA_DECODE_BLOCK=8
+        # tl.dot 要求每维 ≥ 16，所以 BLOCK_N 最小 16；共享内存靠下面的小 tile 版 kernel 省
         import os
         BLOCK = int(os.environ.get("VLLM_P2P_MLA_DECODE_BLOCK", "16"))
 
@@ -477,6 +653,47 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+    if small_smem and BLOCK_DPE > 0:
+        # Turing：拆小 tile 的那一版（见 _fwd_grouped_kernel_stage1_small）
+        DV_SPLITS = 2 if BLOCK_DV >= 256 else 1
+        _fwd_grouped_kernel_stage1_small[
+            (grid[0], grid[1], NUM_KV_SPLITS * DV_SPLITS)
+        ](
+            q,
+            k_buffer,
+            v_buffer,
+            sm_scale,
+            Req_to_tokens,
+            B_Seqlen,
+            att_out,
+            Req_to_tokens.stride(0),
+            q.stride(0),
+            q.stride(1),
+            k_buffer.stride(-3),
+            k_buffer.stride(-2),
+            v_buffer.stride(-3),
+            v_buffer.stride(-2),
+            att_out.stride(0),
+            att_out.stride(1),
+            att_out.stride(2),
+            kv_group_num=kv_group_num,
+            q_head_num=head_num,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DPE=BLOCK_DPE,
+            D_CHUNK=64,
+            BLOCK_DV=BLOCK_DV // DV_SPLITS,
+            DV_SPLITS=DV_SPLITS,
+            BLOCK_N=BLOCK,
+            BLOCK_H=BLOCK_H,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            PAGE_SIZE=page_size,
+            logit_cap=logit_cap,
+            num_warps=4,
+            num_stages=1,
+            Lk=Lk,
+            Lv=Lv,
+        )
+        return
     if small_smem:
         num_stages = 1
 
