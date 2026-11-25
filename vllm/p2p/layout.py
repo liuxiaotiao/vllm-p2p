@@ -69,6 +69,7 @@ __all__ = [
     "load_plan", "pair_static", "channels_from_plan", "parse_hosts",
     "parse_layer_experts", "localize_expert_name", "expert_key", "channel_dtype",
     "parse_gpu_mem_node",
+    "resolve_hosts",
 ]
 
 ARCH = "Qwen3MoePartialForCausalLM"
@@ -417,6 +418,26 @@ class HostInfo:
     """hosts.txt 行尾注释里的第一个词（「# A30 24GB」→ A30）。只用来判 dtype。"""
 
 
+def resolve_hosts(path: str | Path, plan: str | Path | None = None) -> Path:
+    """hosts 清单的路径。相对路径（`use_plan.sh` 给的 `task/hosts_….txt` 就是相对 p2p-framework
+    根目录的）在当前目录找不到时，依次相对方案文件所在目录的各级上层再找。"""
+    p = Path(path)
+    if p.exists() or p.is_absolute():
+        if not p.exists():
+            raise LayoutError(f"找不到 hosts 清单 {p}")
+        return p
+    tried = [Path.cwd() / p]
+    if plan is not None:
+        for d in Path(plan).resolve().parents:
+            q = d / p
+            if q.exists():
+                print(f"hosts 清单按方案所在目录解析为 {q}")
+                return q
+            tried.append(q)
+    raise LayoutError(f"找不到 hosts 清单 {path}（试过 {', '.join(map(str, tried[:4]))}…）"
+                      " —— 给绝对路径，如 /home/ubuntu/p2p-framework/task/hosts.txt")
+
+
 def parse_hosts(path: str | Path) -> dict[str, HostInfo]:
     """`task/hosts.txt`：`节点id  地址[:端口]  [附加参数]  [# 卡型 …]`。
 
@@ -740,7 +761,11 @@ def main(argv: list[str] | None = None) -> int:
     except LayoutError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2
-    hosts = parse_hosts(args.hosts) if args.hosts else {}
+    try:
+        hosts = parse_hosts(resolve_hosts(args.hosts, args.plan)) if args.hosts else {}
+    except LayoutError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
     sm75 = [x.strip() for x in args.sm75.split(",") if x.strip()]
     try:
         gmn = parse_gpu_mem_node(args.gpu_mem_node)

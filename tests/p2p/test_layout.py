@@ -479,3 +479,21 @@ def test_shared_front_end_to_end_to_stages(plan, tmp_path) -> None:
     front = next(c for c in st["channels"] if c["role"] == "front")
     assert front["name"] == "front-N01"
     assert {c["task"] for c in st["channels"] if c["role"] == "back"} == {"gsm8k", "mbpp", "no_robots"}
+
+
+def test_resolve_hosts_relative_to_plan(tmp_path, monkeypatch):
+    """use_plan.sh 给的 HOSTS 是相对 p2p-framework 根目录的；在别的目录跑 layout 也要找得到。"""
+    import pytest
+    from vllm.p2p.layout import LayoutError, resolve_hosts
+    root = tmp_path / "pf"
+    (root / "task").mkdir(parents=True)
+    (root / "glm47flash").mkdir()
+    h = root / "task" / "hosts_x.txt"
+    h.write_text("N01 10.0.0.1\n")
+    plan = root / "glm47flash" / "plan.json"
+    plan.write_text("{}")
+    monkeypatch.chdir(tmp_path)
+    assert resolve_hosts("task/hosts_x.txt", plan) == h
+    assert resolve_hosts(str(h), plan) == h
+    with pytest.raises(LayoutError):
+        resolve_hosts("task/nope.txt", plan)
