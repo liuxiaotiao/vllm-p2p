@@ -847,6 +847,14 @@ def task_caps_of(real: Mapping | None, loop: str = "auto") -> dict[str, int] | N
     return None
 
 
+def global_inflight_of(real: Mapping | None) -> int:
+    """真机是 bench --saturate 全局闭环跑的（gateway any 模式的整条流水线就是这样）→ 它的总在途；否则 0。"""
+    sat = ((real or {}).get("run") or {}).get("saturate") or {}
+    if sat.get("by") == "global":
+        return int(sum(int(v) for v in (sat.get("caps") or {}).values()) or 0)
+    return 0
+
+
 def _req_index(rid: Any) -> int:
     m = re.search(r"(\d+)$", str(rid or ""))
     return int(m.group(1)) if m else 0
@@ -1673,7 +1681,7 @@ def fit_agent_nodes(stages: Mapping, *, perf, net: Net, node_gpu, params: Params
     前段每个 token 收发各一次，前段一忙，这点开销还会被排队放大。"""
     run = real.get("run") or {}
     per_front = int(run.get("per_front") or 0)
-    inflight = int(run.get("inflight") or 0)
+    inflight = int(run.get("inflight") or 0) or global_inflight_of(real)
     bw = run.get("batch_wait_ms")
     if isinstance(bw, Mapping):                       # bench 记的是每个后段一项：取最常见的那个
         vals = [float(v) for v in bw.values() if v is not None]
@@ -1954,7 +1962,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if pf_scale is not None:
             p = Params(**{**p.as_dict(), "pf_scale": pf_scale})
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
-                       per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
+                       per_front=a.per_front, inflight=a.inflight or global_inflight_of(real),
+                       front_slots=a.front_slots,
                        hold=not a.no_hold, front_pick=a.front_pick, bind=a.bind, back_slots=a.back_slots, steps=steps, real=real,
                        label=a.label or f"sim {a.cmd}", a_mode=a.a_mode,
                        task_caps=task_caps_of(real, a.loop))

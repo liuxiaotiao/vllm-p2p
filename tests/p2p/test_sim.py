@@ -822,3 +822,9 @@ def test_sim_saturate_window_matches_bench_rules(world) -> None:
     assert 0 < sat["window_inflight_mean"] <= 4.0001 and sat["window_tok_per_s"] > 0
     m = RD.round_metrics(doc, "steady")
     assert m["n"] == sat["n_steady"] and m["out_tok_per_s"] == sat["window_tok_per_s"]
+
+
+def test_global_inflight_from_saturate():
+    assert S.global_inflight_of({"run": {"saturate": {"by": "global", "caps": {"None": 4}}}}) == 4
+    assert S.global_inflight_of({"run": {"saturate": {"by": "task", "caps": {"gsm8k": 2}}}}) == 0
+    assert S.global_inflight_of(None) == 0
