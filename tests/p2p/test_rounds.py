@@ -33,6 +33,7 @@ def test_round_metrics_and_aggregate(tmp_path, capsys):
     assert agg["tpot_p50_ms"]["mean"] == 75.0 and agg["tpot_p50_ms"]["n"] == 2
     for k, s in (("a", 1.0), ("b", 2.0)):
         (tmp_path / f"x_{k}.json").write_text(json.dumps(_res(s)))
+    (tmp_path / "x_rounds.json").write_text(json.dumps({"g": {}}))   # 汇总文件被通配匹配到：跳过
     out = tmp_path / "agg.json"
     assert R.main(["--group", f"g={tmp_path}/x_*.json", "--out", str(out)]) == 0
     d = json.loads(out.read_text())

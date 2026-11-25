@@ -140,9 +140,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         per = []
         for f in files:
-            m = round_metrics(json.loads(Path(f).read_text(encoding="utf-8")))
+            d = json.loads(Path(f).read_text(encoding="utf-8"))
+            if not d.get("requests"):
+                # 通配常会把本脚本自己的汇总（…_rounds.json 之类）也匹配进来：跳过，说一声
+                print(f"  跳过 {f}：不是一轮 bench 结果（没有 requests）", file=sys.stderr)
+                continue
+            m = round_metrics(d)
             m["file"] = f
             per.append(m)
+        if not per:
+            print(f"✗ {name}：匹配到的文件里没有一份是 bench 结果", file=sys.stderr)
+            return 2
+        files = [m["file"] for m in per]
         result[name] = {"rounds": per, "summary": aggregate(
             [{k: v for k, v in m.items() if k != "file"} for m in per])}
         print(f"{name}：{len(files)} 轮  " + "  ".join(Path(f).name for f in files))
