@@ -24,7 +24,7 @@ import json
 import math
 import statistics as st
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -54,21 +54,41 @@ def _tiered(rows: Sequence[Mapping], key: str) -> list[float]:
             if isinstance(r.get("tiered"), Mapping) and r["tiered"].get(key) is not None]
 
 
-def round_metrics(res: Mapping) -> dict:
-    """一轮 bench 结果（results/*.json 的内容）→ 平铺的指标字典。"""
+class NoSteady(ValueError):
+    """这轮不是 bench --saturate 跑的（或满载段为空），没有满载段可比。"""
+
+
+def round_metrics(res: Mapping, phase: str = "all") -> dict:
+    """一轮 bench 结果（results/*.json 的内容）→ 平铺的指标字典。
+
+    phase = all：全部请求，墙钟 = 第一条提交到最后一条完成；
+    phase = steady：只看满载段（bench --saturate 记的 run.saturate）—— 时延类指标只用「满载段内提交
+    并完成」的请求（phase == steady），吞吐用满载窗口内生成的 token ÷ 窗口长（window_tok_per_s，
+    含那段时间里收尾请求生成的 token），请求率 = 满载段请求数 ÷ 窗口长。"""
     rows = list(res.get("requests") or [])
     if not rows:
         raise ValueError("这份结果里没有 requests")
-    t0 = min(float(r["t_submit_s"]) for r in rows)
-    t1 = max(float(r["t_done_s"]) for r in rows)
-    wall = max(t1 - t0, 1e-9)
-    out_tok = sum(int(r.get("n_generated") or 0) for r in rows)
+    sat = (res.get("run") or {}).get("saturate") or {}
+    if phase == "steady":
+        if not sat or not sat.get("window_s"):
+            raise NoSteady("这轮不是 bench --saturate 跑的（没有 run.saturate），没有满载段")
+        n_phase = Counter(r.get("phase") for r in rows)
+        rows = [r for r in rows if r.get("phase") == "steady"]
+        if not rows:
+            raise NoSteady("满载段里没有完整的请求")
+        wall = float(sat["window_s"])
+        out_tok_per_s = float(sat.get("window_tok_per_s") or 0.0)
+    else:
+        t0 = min(float(r["t_submit_s"]) for r in rows)
+        t1 = max(float(r["t_done_s"]) for r in rows)
+        wall = max(t1 - t0, 1e-9)
+        out_tok_per_s = sum(int(r.get("n_generated") or 0) for r in rows) / wall
     ttft = [r["prefill_ms"] for r in rows]
     tpot = [r["per_token_p50_ms"] for r in rows]
     e2e = [r["total_ms"] for r in rows]
     m = {
         "n": len(rows), "failed": len(res.get("failed") or []),
-        "wall_s": wall, "out_tok_per_s": out_tok / wall, "req_per_min": len(rows) / wall * 60,
+        "wall_s": wall, "out_tok_per_s": out_tok_per_s, "req_per_min": len(rows) / wall * 60,
         "ttft_p50_ms": _pct(ttft, .5), "ttft_p90_ms": _pct(ttft, .9),
         "tpot_p50_ms": _pct(tpot, .5), "tpot_p90_ms": _pct(tpot, .9),
         "e2e_p50_ms": _pct(e2e, .5), "e2e_p90_ms": _pct(e2e, .9),
@@ -79,6 +99,12 @@ def round_metrics(res: Mapping) -> dict:
         "bind_p50_ms": _pct(_tiered(rows, "bind_ms"), .5),
         "accuracy": _acc(rows),
     }
+    if sat:
+        m["inflight_target"] = sat.get("target")
+        if sat.get("window_inflight_mean") is not None:
+            m["inflight_mean"] = sat["window_inflight_mean"]
+    if phase == "steady":
+        m.update({f"n_{k}": n_phase.get(k, 0) for k in ("ramp", "steady", "tail")})
     by = defaultdict(list)
     for r in rows:
         by[r.get("true_task") or "?"].append(r)
@@ -110,7 +136,7 @@ def _fmt(a: Mapping | None, k: str) -> str:
         return "—"
     if k.endswith("accuracy"):
         return f"{a['mean'] * 100:.2f}±{a['std'] * 100:.2f}%"
-    if k.endswith(".n") or k in ("n", "failed"):
+    if k.endswith(".n") or k in ("n", "failed", "n_ramp", "n_steady", "n_tail", "inflight_target"):
         return f"{a['mean']:.0f}"
     return f"{a['mean']:.1f}±{a['std']:.1f}"
 
@@ -121,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("files", nargs="*", help="同一个实验的各轮结果（不给 --group 时用）")
     ap.add_argument("--group", action="append", default=[], metavar="名字=通配",
                     help="一组实验，可重复，如 --group lr='results/x_lr_r*.json'（通配要加引号）")
+    ap.add_argument("--phase", choices=("all", "steady"), default="all",
+                    help="all = 全部请求；steady = 只比满载段（bench --saturate 的 run.saturate；"
+                         "吞吐用满载窗口的 window_tok_per_s，时延只用满载段内提交并完成的请求）")
     ap.add_argument("--out", type=Path, default=None, help="把各轮指标与汇总写成 JSON")
     a = ap.parse_args(argv)
     groups: dict[str, list[str]] = {}
@@ -145,7 +174,11 @@ def main(argv: list[str] | None = None) -> int:
                 # 通配常会把本脚本自己的汇总（…_rounds.json 之类）也匹配进来：跳过，说一声
                 print(f"  跳过 {f}：不是一轮 bench 结果（没有 requests）", file=sys.stderr)
                 continue
-            m = round_metrics(d)
+            try:
+                m = round_metrics(d, a.phase)
+            except NoSteady as e:
+                print(f"✗ {name}：{f}：{e}（重跑时加 --saturate；或用 --phase all）", file=sys.stderr)
+                return 2
             m["file"] = f
             per.append(m)
         if not per:
@@ -156,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             [{k: v for k, v in m.items() if k != "file"} for m in per])}
         print(f"{name}：{len(files)} 轮  " + "  ".join(Path(f).name for f in files))
 
+    print(f"口径：{'只看满载段' if a.phase == 'steady' else '全部请求'}")
     names = list(result)
     keys = list(dict.fromkeys(k for n in names for k in result[n]["summary"]))
     w = max(len(k) for k in keys) + 2

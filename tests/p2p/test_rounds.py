@@ -39,3 +39,19 @@ def test_round_metrics_and_aggregate(tmp_path, capsys):
     d = json.loads(out.read_text())
     assert len(d["g"]["rounds"]) == 2 and "tpot_p50_ms" in d["g"]["summary"]
     assert "75.0±35.4" in capsys.readouterr().out
+
+
+def test_steady_phase_uses_saturate_window(capsys):
+    import pytest
+    d = _res(1.0)
+    for r, ph in zip(d["requests"], ["ramp", "steady", "steady", "tail"]):
+        r["phase"] = ph
+    with pytest.raises(R.NoSteady):
+        R.round_metrics(d, "steady")
+    d["run"] = {"saturate": {"window_s": 8.0, "window_tok_per_s": 30.0, "target": 4,
+                             "window_inflight_mean": 3.9}}
+    m = R.round_metrics(d, "steady")
+    assert m["n"] == 2 and m["out_tok_per_s"] == 30.0 and m["wall_s"] == 8.0
+    assert m["req_per_min"] == 2 / 8 * 60 and m["ttft_p50_ms"] == 250.0      # 只用两条 steady 的
+    assert (m["n_ramp"], m["n_steady"], m["n_tail"]) == (1, 2, 1) and m["inflight_mean"] == 3.9
+    assert R.round_metrics(d)["n"] == 4                                    # all 口径不变
