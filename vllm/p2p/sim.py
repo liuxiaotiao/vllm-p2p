@@ -901,11 +901,23 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
         for _ in range(min(inflight, len(queue))):
             release(0.0)
     sim.run()
+    # 满载段（与 bench --saturate --ramp-every 0 同口径）：开头一次填满（t_full = 0）；按类闭环时
+    # 某一类的最后一条一提交就结束（t_end），全局闭环时最后一条提交即结束
+    if task_caps:
+        last = defaultdict(float)
+        for r in queue:
+            last[str(r.true_task)] = max(last[str(r.true_task)], r.t_submit)
+        sat = {"by": "task", "caps": {k: int(v) for k, v in task_caps.items()},
+               "t_end_ms": min(last.values()) if last else 0.0}
+    else:
+        sat = {"by": "global", "caps": {"None": inflight},
+               "t_end_ms": max((r.t_submit for r in queue), default=0.0)}
+    sat["target"] = sum(sat["caps"].values())
     done = [r for r in queue if r.t_done is not None]
     if len(done) < len(queue):
         raise RuntimeError(f"模拟没跑完：{len(done)}/{len(queue)}（有请求卡住 —— 槽位 / 前段设置不一致？）")
     return build_output(sim, queue, stages, inflight=inflight, per_front=per_front, marks=marks,
-                        real=real, label=label, front_slots=front_slots, hold=hold)
+                        real=real, label=label, front_slots=front_slots, hold=hold, saturate=sat)
 
 
 def build_rows(sim: Sim, reqs: Sequence[SimReq], marks: Sequence[int]) -> list[dict]:
@@ -993,8 +1005,46 @@ def run_metrics(rows: Sequence[Mapping], wall_s: float, inflight: int) -> dict:
             "per_request_fallback": ts.request_stats(rows)}
 
 
+def window_tokens(rows: Sequence[Mapping], t_a: float, t_b: float) -> float:
+    """[t_a, t_b] 秒里生成的 token 数（与 bench.window_tokens 同口径：每条的 token 在首 token →
+    最后一个 token 之间均匀摊开，首 token 算在首 token 时刻）。"""
+    tot = 0.0
+    for r in rows:
+        n = int(r.get("n_generated") or 0)
+        if n <= 0:
+            continue
+        tf = float(r["t_submit_s"]) + float(r.get("prefill_ms") or 0) / 1e3
+        td = float(r["t_done_s"])
+        if t_a <= tf <= t_b:
+            tot += 1
+        if n > 1 and td > tf:
+            ov = max(0.0, min(td, t_b) - max(tf, t_a))
+            tot += (n - 1) * ov / (td - tf)
+    return tot
+
+
+def saturate_window(rows: list[dict], sat: Mapping) -> dict:
+    """按满载窗口 [0, t_end] 给每条请求标 phase（ramp / steady / tail，与 bench 同规则），算窗口吞吐、
+    窗口里平均在途。rows 原地加 phase 字段。"""
+    ta, tb = 0.0, float(sat["t_end_ms"]) / 1e3
+    for r in rows:
+        # 开头一次填满的那一批在 bench 里落在 t_full 之前 → ramp（窗口仍从 0 起算它们的 token）
+        r["phase"] = ("ramp" if r["t_submit_s"] <= ta else
+                      "steady" if r["t_done_s"] <= tb else "tail")
+    win = tb - ta
+    wt = window_tokens(rows, ta, tb) if win > 0 else 0.0
+    occ = sum(max(0.0, min(float(r["t_done_s"]), tb) - max(float(r["t_submit_s"]), ta)) for r in rows)
+    return {"by": sat["by"], "caps": dict(sat["caps"]), "target": sat["target"], "per_back": None,
+            "ramp_every": 0, "t_full_s": 0.0, "t_end_s": round(tb, 3), "window_s": round(win, 3),
+            "window_output_tokens": round(wt, 1),
+            "window_tok_per_s": round(wt / win, 3) if win > 0 else None,
+            "window_inflight_mean": round(occ / win, 2) if win > 0 else None,
+            "n_steady": sum(r["phase"] == "steady" for r in rows),
+            "n_phase": {p: sum(r["phase"] == p for r in rows) for p in ("ramp", "steady", "tail")}}
+
+
 def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, label,
-                 front_slots, hold) -> dict:
+                 front_slots, hold, saturate: Mapping | None = None) -> dict:
     ts = _stats_mod()
     rows = build_rows(sim, reqs, marks)
     t0 = min(r.t_submit for r in reqs)
@@ -1019,6 +1069,8 @@ def build_output(sim: Sim, reqs, stages, *, inflight, per_front, marks, real, la
     run["marks_stats"] = ts.mark_stats(rows)
     run["segment_stats"] = ts.segment_stats(rows)
     run["cumulative_stats"] = ts.cumulative_stats(rows)
+    if saturate is not None:
+        run["saturate"] = saturate_window(rows, saturate)
     out["run"] = run
     out["sim"] = {
         "params": sim.params.as_dict(),

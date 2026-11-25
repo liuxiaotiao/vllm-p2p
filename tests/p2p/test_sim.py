@@ -805,3 +805,20 @@ def test_task_closed_loop_matches_saturate_by_task(world) -> None:
         for t, _ in iv:
             assert sum(a <= t < b for a, b in iv) <= k
         assert sum(a == 0.0 for a, _ in iv) == k
+
+
+def test_sim_saturate_window_matches_bench_rules(world) -> None:
+    """模拟结果也带 run.saturate 与逐条 phase：rounds.py --phase steady 能拿真机、模拟同口径比。"""
+    from vllm.p2p import rounds as RD
+    real = fake_real(world["stages"], n=18)
+    caps = {"gsm8k": 2, "mbpp": 1, "no_robots": 1}
+    doc = setup(world, real, task_caps=caps, back_slots=1, bind="least-free")
+    sat = doc["run"]["saturate"]
+    rows = doc["requests"]
+    last = {u: max(r["t_submit_s"] for r in rows if r["true_task"] == u) for u in caps}
+    assert abs(sat["t_end_s"] - min(last.values())) < 2e-3 and sat["target"] == 4
+    assert sum(sat["n_phase"].values()) == 18 and sat["n_phase"]["ramp"] == 4     # 开头填满的 4 条
+    assert all(r["phase"] == "steady" for r in rows if 0 < r["t_submit_s"] and r["t_done_s"] <= sat["t_end_s"])
+    assert 0 < sat["window_inflight_mean"] <= 4.0001 and sat["window_tok_per_s"] > 0
+    m = RD.round_metrics(doc, "steady")
+    assert m["n"] == sat["n_steady"] and m["out_tok_per_s"] == sat["window_tok_per_s"]
