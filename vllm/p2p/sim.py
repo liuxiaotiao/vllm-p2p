@@ -831,6 +831,22 @@ def replay_requests(real: Mapping, stages: Mapping, *, n: int | None = None) -> 
     return out
 
 
+def task_caps_of(real: Mapping | None, loop: str = "auto") -> dict[str, int] | None:
+    """真机结果是 bench --saturate --saturate-by task 跑的（run.saturate.by == "task"）→ 它的每类槽位，
+    模拟按类闭环回放；`loop` = global 强制全局闭环，task 强制按类（真机没记槽位时报错）。"""
+    if loop == "global" or real is None:
+        return None
+    sat = (real.get("run") or {}).get("saturate") or {}
+    caps = {str(k): int(v) for k, v in (sat.get("caps") or {}).items() if k != "None" and int(v) > 0}
+    if sat.get("by") == "task" and caps:
+        if sat.get("ramp_every"):
+            print(f"注意：真机是逐步加压的（每 {sat['ramp_every']} s 加一档），模拟直接满载", file=sys.stderr)
+        return caps
+    if loop == "task":
+        raise SystemExit("回放文件不是 --saturate-by task 跑的（run.saturate 里没有按类的槽位）")
+    return None
+
+
 def _req_index(rid: Any) -> int:
     m = re.search(r"(\d+)$", str(rid or ""))
     return int(m.group(1)) if m else 0
@@ -840,8 +856,14 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
             per_front: int = 0, inflight: int = 0, front_slots: int = 0, hold: bool = True,
             front_pick: str = "least", bind: str = "least", back_slots: int = 0, steps=None,
             marks: Sequence[int] = DEFAULT_MARKS,
-            real: Mapping | None = None, label: str = "", a_mode: str = "any") -> dict:
+            real: Mapping | None = None, label: str = "", a_mode: str = "any",
+            task_caps: Mapping[str, int] | None = None) -> dict:
+    """`task_caps`：按真实 task 各自闭环（同 bench --saturate --saturate-by task --ramp-every 0）——
+    每类同时在途 = 它的槽位数，这类做完一条就补这类的下一条（回放顺序）；不给 = 全局闭环。"""
     full = stages.get("kind") != "tiered"
+    if task_caps:
+        reqs = [r for r in reqs if str(r.true_task) in task_caps]
+        inflight = sum(int(v) for v in task_caps.values())
     if per_front:
         if full:
             raise SystemExit("整条流水线（A）没有前段：用 --inflight（比如 = 通道数，每条流水线一条）")
@@ -851,16 +873,33 @@ def run_sim(stages: Mapping, reqs: Sequence[SimReq], *, perf, net: Net, node_gpu
               front_slots=front_slots or None, hold=hold, front_pick=front_pick, bind=bind, back_slots=back_slots, steps=steps,
               a_mode=a_mode)
     queue = list(reqs)
-    nxt = iter(range(len(queue)))
+    if task_caps:
+        per: dict[str, list[int]] = defaultdict(list)
+        for i, r in enumerate(queue):
+            per[str(r.true_task)].append(i)
+        its = {k: iter(v) for k, v in per.items()}
 
-    def release(t: float) -> None:
-        i = next(nxt, None)
-        if i is not None:
-            sim.submit(queue[i], t)
+        def release_task(k: str, t: float) -> None:
+            i = next(its[k], None)
+            if i is not None:
+                sim.submit(queue[i], t)
 
-    sim.on_finish = lambda r, t: sim.at(t + params.client_ms, lambda tt: release(tt))
-    for _ in range(min(inflight, len(queue))):
-        release(0.0)
+        sim.on_finish = lambda r, t: sim.at(t + params.client_ms,
+                                            lambda tt, k=str(r.true_task): release_task(k, tt))
+        for k in per:
+            for _ in range(int(task_caps[k])):
+                release_task(k, 0.0)
+    else:
+        nxt = iter(range(len(queue)))
+
+        def release(t: float) -> None:
+            i = next(nxt, None)
+            if i is not None:
+                sim.submit(queue[i], t)
+
+        sim.on_finish = lambda r, t: sim.at(t + params.client_ms, lambda tt: release(tt))
+        for _ in range(min(inflight, len(queue))):
+            release(0.0)
     sim.run()
     done = [r for r in queue if r.t_done is not None]
     if len(done) < len(queue):
@@ -1595,7 +1634,8 @@ def fit_agent_nodes(stages: Mapping, *, perf, net: Net, node_gpu, params: Params
     def score(vals: Mapping[str, float]) -> float:
         n2 = Net(**{**net.__dict__, "agent_node_ms": {**net.agent_node_ms, **vals}})
         doc = run_sim(stages, replay_requests(real, stages), perf=perf, net=n2, node_gpu=node_gpu, params=p,
-                      per_front=per_front, inflight=0 if per_front else inflight, steps=steps)
+                      per_front=per_front, inflight=0 if per_front else inflight, steps=steps,
+                      task_caps=task_caps_of(real))
         got = _tpot_by_channel(doc["requests"])
         es = [math.log(got[k] / want[k]) for k in want if k in got and want[k] > 0]
         return sum(e * e for e in es) / max(len(es), 1)
@@ -1641,6 +1681,9 @@ def _common(ap, *, run: bool = True) -> None:
     ap.add_argument("--hidden", type=int, default=2048)
     ap.add_argument("--per-front", type=int, default=0, help="每个前段始终 N 条（同 bench --per-front）")
     ap.add_argument("--inflight", type=int, default=0, help="闭环总在途（不给 --per-front 时）")
+    ap.add_argument("--loop", choices=("auto", "global", "task"), default="auto",
+                    help="请求怎么补：auto（默认）= 回放文件是 bench --saturate-by task 跑的就按类闭环"
+                         "（每类在途 = 真机记的槽位，做完一条补同类下一条），否则全局闭环；global / task 强制")
     ap.add_argument("--front-slots", type=int, default=0, help="同网关 --front-slots（--per-front 时自动）")
     ap.add_argument("--no-hold", action="store_true", help="同网关 --no-hold")
     ap.add_argument("--front-pick", choices=("least", "speed"), default="least")
@@ -1861,7 +1904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_sim(stages, reqs_fn(), perf=perf, net=net, node_gpu=node_gpu, params=p,
                        per_front=a.per_front, inflight=a.inflight, front_slots=a.front_slots,
                        hold=not a.no_hold, front_pick=a.front_pick, bind=a.bind, back_slots=a.back_slots, steps=steps, real=real,
-                       label=a.label or f"sim {a.cmd}", a_mode=a.a_mode)
+                       label=a.label or f"sim {a.cmd}", a_mode=a.a_mode,
+                       task_caps=task_caps_of(real, a.loop))
 
     if a.cmd == "fit":
         print("标定（坐标下降）：")

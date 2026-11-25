@@ -10,7 +10,8 @@ def _res(scale, lr=True):
     for i, (u, ok) in enumerate([("gsm8k", True), ("gsm8k", False), ("mbpp", True), ("mbpp", True)]):
         r = {"true_task": u, "t_submit_s": i * 1.0, "t_done_s": i * 1.0 + 10 * scale,
              "n_generated": 100, "prefill_ms": 100.0 * scale * (i + 1),
-             "per_token_p50_ms": 50.0 * scale, "total_ms": 1000.0 * scale, "wait_front_ms": 0}
+             "per_token_p50_ms": 50.0 * scale, "total_ms": 1000.0 * scale, "wait_front_ms": 0,
+             "tiered": {"front_prefill_ms": 20.0 * scale, "bind_ms": 1.0, "wait_back_ms": 0}}
         if lr:
             r["correct"] = ok
         else:
@@ -26,6 +27,7 @@ def test_round_metrics_and_aggregate(tmp_path, capsys):
     assert abs(m["out_tok_per_s"] - 400 / 13) < 1e-9
     assert m["accuracy"] == 0.75 and m["gsm8k.accuracy"] == 0.5 and m["mbpp.accuracy"] == 1.0
     assert m["ttft_p50_ms"] == 250.0 and m["tpot_p50_ms"] == 50.0
+    assert m["front_prefill_p50_ms"] == 20.0 and m["gsm8k.front_prefill_p50_ms"] == 20.0
     assert R.round_metrics(_res(1.0, lr=False))["accuracy"] == 0.75   # shadow 口径
     agg = R.aggregate([R.round_metrics(_res(1.0)), R.round_metrics(_res(2.0))])
     assert agg["tpot_p50_ms"]["mean"] == 75.0 and agg["tpot_p50_ms"]["n"] == 2

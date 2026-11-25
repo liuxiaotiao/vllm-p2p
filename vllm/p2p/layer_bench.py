@@ -822,6 +822,85 @@ def print_gpu_summary(agg: Mapping) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 理论算力（fp16 Tensor Core 稠密峰值，TFLOPS；规格书值）。只用到卡型之间的比例
+THEORY_TFLOPS = {"A30": 165.0, "RTX6000": 130.5, "T4": 65.0}
+
+
+def _scale_tree(o, k: float):
+    if isinstance(o, Mapping):
+        return {kk: _scale_tree(v, k) for kk, v in o.items()}
+    if isinstance(o, (int, float)) and not isinstance(o, bool):
+        return round(float(o) * k, 6)
+    return o
+
+
+def caps_from_topo(topo: Mapping) -> dict[str, float]:
+    """拓扑里每种卡（nodes 的 role）的理论算力：有 compute_capacity_orig（topo 子命令改写过）用它，
+    否则用 compute_capacity；同卡型取均值。"""
+    by: dict[str, list[float]] = {}
+    for n in topo.get("nodes") or []:
+        c = n.get("compute_capacity_orig", n.get("compute_capacity"))
+        if n.get("role") and c is not None:
+            by.setdefault(gpu_key(n["role"]), []).append(float(c))
+    if not by:
+        raise ValueError("拓扑的 nodes 里没有 role + compute_capacity")
+    return {g: sum(v) / len(v) for g, v in by.items()}
+
+
+def theory_summary(agg: Mapping, caps: Mapping[str, float], ref: str) -> dict:
+    """实测的 summary_by_gpu → 「按理论算力」的同格式表：每种卡的 decode / prefill / 每步开销
+    = 基准卡 `ref` 的实测 × (算力[ref] / 算力[卡])，即只信基准卡的绝对值，卡型之间的快慢全按理论
+    算力比例。显存账（memory）仍用各卡自己的实测（与快慢无关）。"""
+    agg = {gpu_key(g): v for g, v in agg.items()}
+    caps = {gpu_key(g): float(c) for g, c in caps.items()}
+    ref = gpu_key(ref)
+    if ref not in agg:
+        raise ValueError(f"基准卡 {ref} 没有实测（有的是 {sorted(agg)}）")
+    miss = sorted(set(agg) - set(caps)) + ([ref] if ref not in caps else [])
+    if miss:
+        raise ValueError(f"这些卡型没给理论算力：{sorted(set(miss))}（--caps 卡型=值 补上）")
+    base = agg[ref]
+    out = {}
+    for g, v in agg.items():
+        k = caps[ref] / caps[g]
+        out[g] = dict(v,
+                      decode=_scale_tree(base.get("decode") or {}, k),
+                      prefill=_scale_tree(base.get("prefill") or {}, k),
+                      decode_overhead_ms=_scale_tree(base.get("decode_overhead_ms"), k),
+                      ms_per_layer=(round(base["ms_per_layer"] * k, 4)
+                                    if base.get("ms_per_layer") is not None else None),
+                      ms_per_layer_measured=v.get("ms_per_layer"),
+                      theory={"ref": ref, "cap": caps[g], "cap_ref": caps[ref], "scale": round(k, 4)})
+    return out
+
+
+def cmd_theory(a) -> int:
+    agg = json.loads(Path(a.summary).read_text(encoding="utf-8"))
+    try:
+        if a.from_topo:
+            caps = caps_from_topo(json.loads(Path(a.from_topo).read_text(encoding="utf-8")))
+            src = f"拓扑 {a.from_topo} 的 compute_capacity"
+        else:
+            caps = dict(THEORY_TFLOPS)
+            src = "fp16 Tensor 峰值 TFLOPS"
+        for it in a.caps:
+            g, _, v = it.partition("=")
+            caps[gpu_key(g)] = float(v)
+        out = theory_summary(agg, caps, a.ref)
+    except (ValueError, KeyError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"理论算力（{src}），基准卡 {gpu_key(a.ref)} 用实测：")
+    print(f"{'卡型':<10}{'算力':>9}{'倍数':>8}{'理论 ms/层':>12}{'实测 ms/层':>12}")
+    for g, v in sorted(out.items()):
+        t = v["theory"]
+        print(f"{g:<10}{t['cap']:>9g}{t['scale']:>8.3f}{v['ms_per_layer'] or float('nan'):>12.4f}"
+              f"{v['ms_per_layer_measured'] or float('nan'):>12.4f}")
+    print(f"已写 {a.out}（sim 的 --layer-bench 直接用）")
+    return 0
+
+
 def cmd_topo(a) -> int:
     topo = json.loads(Path(a.topo).read_text(encoding="utf-8"))
     results = [json.loads(Path(p).read_text(encoding="utf-8")) for p in a.results]
@@ -918,13 +997,23 @@ def main(argv: list[str] | None = None) -> int:
 
     # 前段（前 L₀ 层、全专家）的实测：vllm/p2p/front_bench.py
     fb = _front_bench()
+    th = sub.add_parser("theory", help="实测表 → 按理论算力比例的同格式表（给 sim 做「理论算力」对照）")
+    th.add_argument("--summary", required=True, help="cluster 写的 summary_by_gpu.json")
+    th.add_argument("--ref", default="A30", help="基准卡：只用它的实测绝对值，其余卡按算力比例换算")
+    th.add_argument("--from-topo", default=None,
+                    help="理论算力取拓扑里各卡型的 compute_capacity（与规划器的 theory 方案同口径）")
+    th.add_argument("--caps", action="append", default=[], metavar="卡型=算力",
+                    help="手动给 / 覆盖某卡型的理论算力，可重复（默认 fp16 Tensor TFLOPS："
+                         + ", ".join(f"{k}={v:g}" for k, v in THEORY_TFLOPS.items()) + "）")
+    th.add_argument("--out", required=True)
     fb.add_run_args(sub.add_parser("front", help="本机 GPU：前段并发单步、prefill、固定开销（front_bench run）"))
     fb.add_run_args(sub.add_parser("front-cluster", help="控制机：每种卡一台跑 front（front_bench cluster）"),
                     cluster=True)
     fb.add_occ_args(sub.add_parser("front-occ", help="控制机：真实运行里前段 / 后段的占用率（front_bench occ）"))
 
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "cluster": cmd_cluster, "topo": cmd_topo, "front": fb.cmd_run,
+    return {"run": cmd_run, "cluster": cmd_cluster, "topo": cmd_topo, "theory": cmd_theory,
+            "front": fb.cmd_run,
             "front-cluster": fb.cmd_cluster, "front-occ": fb.cmd_occ}[a.cmd](a)
 
 

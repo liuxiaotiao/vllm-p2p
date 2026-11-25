@@ -292,3 +292,36 @@ def test_summarise_memory_fits_per_layer_and_fixed() -> None:
     assert m["device_non_kv_mib_fixed"] == pytest.approx(1200 + 900, abs=1)
     assert m["activation_peak_mib_per_layer"] == pytest.approx(2, abs=0.01)
     assert m["activation_peak_mib_fixed"] == pytest.approx(300, abs=1)
+
+
+def test_theory_summary_scales_ref_by_caps(tmp_path):
+    """theory：各卡的 decode / prefill = 基准卡实测 × 算力比；显存账用各卡自己的；sim 能直接读。"""
+    import json
+    import pytest
+    from vllm.p2p import layer_bench as LB
+    from vllm.p2p.sim import load_perf
+    agg = {
+        "A30": {"gpu": "NVIDIA A30", "decode": {"64": {"128": {"1": 0.2, "4": 0.3}}},
+                "prefill": {"64": {"128": 1.0}}, "decode_overhead_ms": {"intercept": 3.0},
+                "memory": {"64": {"layer_bytes": 10}}, "ms_per_layer": 0.2},
+        "T4": {"gpu": "Tesla T4", "decode": {"64": {"128": {"1": 0.9, "4": 1.5}}},
+               "prefill": {"64": {"128": 7.0}}, "decode_overhead_ms": {"intercept": 9.0},
+               "memory": {"64": {"layer_bytes": 11}}, "ms_per_layer": 0.9},
+    }
+    out = LB.theory_summary(agg, {"A30": 165, "T4": 65}, "A30")
+    k = 165 / 65
+    assert out["A30"]["decode"] == agg["A30"]["decode"]
+    assert abs(out["T4"]["decode"]["64"]["128"]["4"] - 0.3 * k) < 1e-5
+    assert abs(out["T4"]["prefill"]["64"]["128"] - 1.0 * k) < 1e-5
+    assert out["T4"]["memory"] == agg["T4"]["memory"] and out["T4"]["ms_per_layer_measured"] == 0.9
+    with pytest.raises(ValueError):
+        LB.theory_summary(agg, {"A30": 165}, "A30")
+    assert LB.caps_from_topo({"nodes": [{"role": "A30", "compute_capacity": 10},
+                                        {"role": "T4", "compute_capacity": 4, "compute_capacity_orig": 3}]}) \
+        == {"A30": 10.0, "T4": 3.0}
+    s = tmp_path / "s.json"
+    s.write_text(json.dumps(agg))
+    o = tmp_path / "t.json"
+    assert LB.main(["theory", "--summary", str(s), "--out", str(o)]) == 0
+    perf = load_perf([o])
+    assert set(perf) == {"A30", "T4"}

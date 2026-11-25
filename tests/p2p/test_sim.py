@@ -784,3 +784,24 @@ def test_back_pp_cross_by_site_pair() -> None:
     assert net.pp_hop_between("front", "c", "a") == net.pp_hop_ms  # 只管后段
     p, n = S.apply_calib({"net": {"back_pp_cross_site_ms": {"3-4": 9.0}}}, S.Params(), S.Net(ip=net.ip))
     assert n.back_pp_cross_site_ms == {"3-4": 9.0}
+
+
+def test_task_closed_loop_matches_saturate_by_task(world) -> None:
+    """bench --saturate-by task 的回放：每类同时在途 = 它的槽位，做完一条补同类下一条；
+    task_caps_of 从 run.saturate 里读，--loop global 时不用。"""
+    real = fake_real(world["stages"], n=18)
+    caps = {"gsm8k": 2, "mbpp": 1, "no_robots": 1}
+    real["run"] = {"saturate": {"by": "task", "caps": caps, "ramp_every": 0}}
+    assert S.task_caps_of(real) == caps and S.task_caps_of(real, "global") is None
+    with pytest.raises(SystemExit):
+        S.task_caps_of({"run": {}}, "task")
+    doc = setup(world, real, task_caps=caps, back_slots=1, bind="least-free")
+    rows = doc["requests"]
+    assert len(rows) == 18
+    for u, k in caps.items():
+        iv = sorted((r["t_submit_s"], r["t_done_s"]) for r in rows if r["true_task"] == u)
+        assert len(iv) == 6
+        # 任一时刻这类在途不超过 k，开头正好 k 条同时提交
+        for t, _ in iv:
+            assert sum(a <= t < b for a, b in iv) <= k
+        assert sum(a == 0.0 for a, _ in iv) == k

@@ -9,6 +9,7 @@
 指标都直接从每轮的 `requests` 逐条记录算（不依赖各版本 run 字段的写法），口径：
 * 墙钟 = 最后一条完成 − 第一条提交；吞吐 = 生成 token 数 / 墙钟；
 * TTFT = 提交到第一个 token（`prefill_ms`，含在前段等后段槽位的时间）；
+* 前段 prefill = 前段算完 prompt（含出口识别）的耗时（分段网关的 `tiered.front_prefill_ms`）；
 * TPOT = 每条请求相邻 token 间隔的中位数（`per_token_p50_ms`），再取各条的 p50；
 * 识别准确率：lr 轮看 `correct`，shadow 轮看 `shadow.task` 与真实 task 是否一致；
 * 逐 task：TTFT p50、TPOT p50、端到端 p50 与条数。
@@ -48,6 +49,11 @@ def _acc(rows: Sequence[Mapping]) -> float | None:
     return sum(sh) / len(sh) if sh else None
 
 
+def _tiered(rows: Sequence[Mapping], key: str) -> list[float]:
+    return [float(r["tiered"][key]) for r in rows
+            if isinstance(r.get("tiered"), Mapping) and r["tiered"].get(key) is not None]
+
+
 def round_metrics(res: Mapping) -> dict:
     """一轮 bench 结果（results/*.json 的内容）→ 平铺的指标字典。"""
     rows = list(res.get("requests") or [])
@@ -67,6 +73,10 @@ def round_metrics(res: Mapping) -> dict:
         "tpot_p50_ms": _pct(tpot, .5), "tpot_p90_ms": _pct(tpot, .9),
         "e2e_p50_ms": _pct(e2e, .5), "e2e_p90_ms": _pct(e2e, .9),
         "wait_front_mean_ms": st.fmean(float(r.get("wait_front_ms") or 0) for r in rows),
+        # 分段网关才有：前段把 prompt 算完（含出口识别）的耗时、TTFT 里减掉它与等后段的剩余部分
+        "front_prefill_p50_ms": _pct(_tiered(rows, "front_prefill_ms"), .5),
+        "front_prefill_p90_ms": _pct(_tiered(rows, "front_prefill_ms"), .9),
+        "bind_p50_ms": _pct(_tiered(rows, "bind_ms"), .5),
         "accuracy": _acc(rows),
     }
     by = defaultdict(list)
@@ -75,6 +85,7 @@ def round_metrics(res: Mapping) -> dict:
     for u, rs in sorted(by.items()):
         m[f"{u}.n"] = len(rs)
         m[f"{u}.ttft_p50_ms"] = _pct([r["prefill_ms"] for r in rs], .5)
+        m[f"{u}.front_prefill_p50_ms"] = _pct(_tiered(rs, "front_prefill_ms"), .5)
         m[f"{u}.tpot_p50_ms"] = _pct([r["per_token_p50_ms"] for r in rs], .5)
         m[f"{u}.e2e_p50_ms"] = _pct([r["total_ms"] for r in rs], .5)
         m[f"{u}.accuracy"] = _acc(rs)
